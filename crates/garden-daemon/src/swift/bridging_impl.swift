@@ -121,7 +121,30 @@ public func garden_virtualizer_configure(
 }
 
 // =====================================================================
-// 4. The Deallocation Function
+// 4. The Start Function
+// =====================================================================
+// TASK: Tell the virtualizer to boot the machine.
+@_cdecl("garden_virtualizer_start")
+public func garden_virtualizer_start(
+    _ instance: UnsafeMutableRawPointer,
+    _ errorOut: UnsafeMutablePointer<UnsafeMutablePointer<NSError>?>?
+) -> Bool {
+    let virtualizer = Unmanaged<GardenVirtualizer>.fromOpaque(instance).takeUnretainedValue()
+    
+    do {
+        try virtualizer.start()
+        return true
+    } catch {
+        let nsError = error as NSError
+        if let out = errorOut {
+            out.pointee = Unmanaged.passRetained(nsError).toOpaque().bindMemory(to: NSError.self, capacity: 1)
+        }
+        return false
+    }
+}
+
+// =====================================================================
+// 5. The Deallocation Function
 // =====================================================================
 // TASK: Rust's `Drop` trait calls this function when it is done with the object.
 @_cdecl("garden_virtualizer_destroy")

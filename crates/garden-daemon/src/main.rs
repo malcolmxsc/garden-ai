@@ -43,6 +43,22 @@ fn main() {
         }
     }
 
-    // As `engine` goes out of scope at the end of `main`, Rust will automatically 
-    // call our `Drop` trait and release the Swift object!
+    // 4. Test Booting the Virtual Machine
+    println!("🚀 Booting the Alpine Linux VM...");
+    match engine.start() {
+        Ok(_) => println!("✅ VM Boot sequence initiated!"),
+        Err(e) => {
+            eprintln!("❌ VM failed to boot: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    println!("🔄 Daemon entering execution loop. Press Ctrl+C to stop.");
+    // 5. The Execution Loop
+    // The Swift Virtualizer runs on background threads managed by macOS.
+    // If our Rust daemon exits here, the main process dies, and the VM dies instantly with it.
+    // We use an infinite loop to keep Process 2 alive indefinitely.
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
 }
