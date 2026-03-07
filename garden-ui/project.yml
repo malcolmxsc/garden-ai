@@ -1,0 +1,28 @@
+name: GardenUI
+options:
+  bundleIdPrefix: ai.garden
+  deploymentTarget:
+    macOS: "14.0"
+  xcodeVersion: "15.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    CODE_SIGN_ENTITLEMENTS: GardenUI/GardenUI.entitlements
+
+targets:
+  GardenUI:
+    type: application
+    platform: macOS
+    sources:
+      - path: GardenUI
+        type: group
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.garden.GardenUI
+        INFOPLIST_KEY_LSUIElement: true  # Menu bar app (no dock icon)
+        CODE_SIGN_ENTITLEMENTS: GardenUI/GardenUI.entitlements
+    entitlements:
+      path: GardenUI/GardenUI.entitlements

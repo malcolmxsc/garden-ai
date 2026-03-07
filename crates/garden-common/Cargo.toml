@@ -1,0 +1,11 @@
+[package]
+name = "garden-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared types, errors, and IPC protocol for Garden AI"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
