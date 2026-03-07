@@ -28,7 +28,13 @@ extern "C" {
         error_out: *mut *mut c_void,
     ) -> bool;
 
-    // 4. The Deallocation Function
+    // 4. The Start Function
+    fn garden_virtualizer_start(
+        instance: *mut c_void,
+        error_out: *mut *mut c_void,
+    ) -> bool;
+
+    // 5. The Deallocation Function
     fn garden_virtualizer_destroy(instance: *mut c_void);
 }
 
@@ -119,6 +125,26 @@ impl Virtualizer {
             }
             let err_msg = unsafe { extract_nserror_description(error_ptr) };
             Err(format!("Apple Hypervisor rejected configuration: {}", err_msg))
+        }
+    }
+
+    pub fn start(&self) -> Result<(), String> {
+        let mut error_ptr: *mut c_void = std::ptr::null_mut();
+
+        // Step 1: Pass the command down the FFI boundary
+        let success = unsafe {
+            garden_virtualizer_start(self.instance, &mut error_ptr)
+        };
+
+        if success {
+            Ok(())
+        } else {
+            // Re-use our NSError extraction logic from before
+            if error_ptr.is_null() {
+                return Err("Failed to start Virtual Machine. (Unknown Error)".into());
+            }
+            let err_msg = unsafe { extract_nserror_description(error_ptr) };
+            Err(format!("Apple Hypervisor failed to boot: {}", err_msg))
         }
     }
 }

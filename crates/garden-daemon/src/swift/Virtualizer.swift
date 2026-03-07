@@ -12,6 +12,7 @@ public class GardenVirtualizer: NSObject {
     // so they stay alive as long as the Virtualizer object exists.
     private var config: VZVirtualMachineConfiguration?
     private var bootloader: VZLinuxBootLoader?
+    private var machine: VZVirtualMachine?
     
     // 2. The override init
     @objc
@@ -92,5 +93,43 @@ public class GardenVirtualizer: NSObject {
         
         // Save the valid configuration to our class
         self.config = config
+    }
+    
+    // =====================================================================
+    // SYNTAX BREAKDOWN: Booting the VM
+    // =====================================================================
+    public func start() throws {
+        guard let config = self.config else {
+            throw NSError(domain: "GardenVirtualizer", code: 2, userInfo: [NSLocalizedDescriptionKey: "Machine not configured."])
+        }
+        
+        // 1. Create the Physical Virtual Machine object using our validated config
+        let machine = VZVirtualMachine(configuration: config)
+        self.machine = machine
+        
+        // 2. We use dispatch groups to handle the async boot process safely
+        let group = DispatchGroup()
+        group.enter()
+        
+        var bootError: Error?
+        
+        // Ask Apple to boot the hypervisor
+        machine.start { result in
+            switch result {
+            case .success:
+                print("✅ [Swift] VZVirtualMachine hardware launched successfully!")
+            case .failure(let error):
+                bootError = error
+            }
+            group.leave()
+        }
+        
+        // Wait for the boot callback to finish before returning
+        group.wait()
+        
+        // If Apple failed to boot it, bounce the error to Rust
+        if let error = bootError {
+            throw error
+        }
     }
 }
