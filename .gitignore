@@ -1,0 +1,38 @@
+# === Rust ===
+/target/
+Cargo.lock
+
+# === Swift / Xcode ===
+garden-ui/build/
+garden-ui/DerivedData/
+garden-ui/**/*.xcuserdata
+garden-ui/**/*.xcworkspace
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# === macOS ===
+.DS_Store
+*.swp
+*.swo
+*~
+
+# === IDE ===
+.idea/
+.vscode/
+*.code-workspace
+
+# === Guest VM binaries (large files — use Git LFS or download separately) ===
+guest/kernel/*.bin
+guest/kernel/bzImage
+guest/rootfs/*.img
+guest/rootfs/*.tar.gz
+
+# === Generated FFI headers ===
+crates/garden-ffi/garden_ffi.h

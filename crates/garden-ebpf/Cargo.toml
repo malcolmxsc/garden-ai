@@ -1,0 +1,19 @@
+[package]
+name = "garden-ebpf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "eBPF security daemon for Garden AI (userspace loader, runs inside guest VM)"
+
+[dependencies]
+garden-common = { path = "../garden-common" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+
+# eBPF dependencies are Linux-only
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { workspace = true }
+aya-log = { workspace = true }

@@ -1,0 +1,15 @@
+[package]
+name = "garden-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MCP (Model Context Protocol) server for Garden AI sandbox"
+
+[dependencies]
+garden-common = { path = "../garden-common" }
+rmcp = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
