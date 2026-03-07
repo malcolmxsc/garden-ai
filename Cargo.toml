@@ -37,6 +37,9 @@ rmcp = { version = "0.15", features = ["server", "macros", "transport-streamable
 # CLI
 clap = { version = "4", features = ["derive"] }
 
+# HTTP Client
+reqwest = { version = "0.12", features = ["stream", "rustls-tls"] }
+
 # eBPF (Linux-only)
 aya = "0.12"
 aya-log = "0.2"

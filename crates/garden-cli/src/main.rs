@@ -1,6 +1,8 @@
 //! Garden AI CLI — The open-source command-line interface.
 //!
 //! Usage:
+//!   garden init
+//!   garden update-kernel
 //!   garden boot [--kernel <path>] [--rootfs <path>]
 //!   garden run <command> [args...]
 //!   garden status
@@ -26,6 +28,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Initializes the workspace and downloads the Alpine Linux kernel
+    Init,
+
+    /// Fetches the latest Alpine kernel and initrd
+    UpdateKernel,
+
     /// Boot a new sandbox VM
     Boot {
         /// Path to the Linux kernel image
@@ -87,6 +95,19 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     match cli.command {
+        Commands::Init => {
+            tracing::info!("🌿 Initializing Garden workspace...");
+            let guest_dir = std::path::Path::new("guest/kernel");
+            tokio::fs::create_dir_all(guest_dir).await?;
+            tracing::info!("Downloading Alpine Linux kernel...");
+            download_alpine().await?;
+            tracing::info!("✅ Workspace initialized securely!");
+        }
+        Commands::UpdateKernel => {
+            tracing::info!("🔄 Fetching the latest Alpine Linux kernel...");
+            download_alpine().await?;
+            tracing::info!("✅ Kernel updated.");
+        }
         Commands::Boot {
             kernel,
             rootfs,
@@ -130,5 +151,39 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+// =====================================================================
+// SYNTAX BREAKDOWN: Async Downloading
+// =====================================================================
+// We use `reqwest` for HTTP. We `.await` the initial connection, check
+// the HTTP status code (e.g. 200 OK vs 404 Not Found) with `error_for_status()`,
+// and then `.await` the actual byte downloading. 
+// Finally, `tokio::fs::write` writes the bytes asynchronously to the SSD.
+async fn download_alpine() -> anyhow::Result<()> {
+    // We target Apple Silicon (Aarch64) Alpine Linux Netboot artifacts
+    let kernel_url = "https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/aarch64/netboot/vmlinuz-virt";
+    let initrd_url = "https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/aarch64/netboot/initramfs-virt";
+
+    let guest_dir = std::path::Path::new("guest/kernel");
+    
+    // 1. Download Kernel
+    let kernel_dest = guest_dir.join("vmlinuz-virt");
+    tracing::info!(" -> Downloading vmlinuz-virt (Kernel)...");
+    download_file(kernel_url, &kernel_dest).await?;
+
+    // 2. Download Initrd
+    let initrd_dest = guest_dir.join("initramfs-virt");
+    tracing::info!(" -> Downloading initramfs-virt (RAM Disk)...");
+    download_file(initrd_url, &initrd_dest).await?;
+
+    Ok(())
+}
+
+async fn download_file(url: &str, dest: &std::path::Path) -> anyhow::Result<()> {
+    let response = reqwest::get(url).await?.error_for_status()?;
+    let content = response.bytes().await?;
+    tokio::fs::write(dest, content).await?;
     Ok(())
 }
