@@ -72,7 +72,56 @@ public func garden_virtualizer_check_hardware(
 }
 
 // =====================================================================
-// 3. The Deallocation Function
+// 3. The Configuration Function
+// =====================================================================
+// TASK: Take raw C data (char*, ints) from Rust, convert them into Safe 
+// Swift objects (String, UInt), and pass them to our class.
+@_cdecl("garden_virtualizer_configure")
+public func garden_virtualizer_configure(
+    _ instance: UnsafeMutableRawPointer,
+    _ kernelPathC: UnsafePointer<CChar>,
+    _ initrdPathC: UnsafePointer<CChar>,
+    _ cpus: UInt32,
+    _ memoryMB: UInt64,
+    _ errorOut: UnsafeMutablePointer<UnsafeMutablePointer<NSError>?>?
+) -> Bool {
+    
+    // =================================================================
+    // SYNTAX BREAKDOWN: C-Strings to Swift Strings
+    // =================================================================
+    // Rust passes strings as `const char*` (null-terminated byte arrays).
+    // Swift cannot naturally use these. `String(cString:)` scans the C-pointer
+    // until it finds the `\0` null-byte, and safely copies the bytes into 
+    // a real, ARC-managed Swift String!
+    let kernelPath = String(cString: kernelPathC)
+    let initrdPath = String(cString: initrdPathC)
+    
+    // Retrieve our Swift instance without modifying the ARC count
+    let virtualizer = Unmanaged<GardenVirtualizer>.fromOpaque(instance).takeUnretainedValue()
+    
+    do {
+        // Attempt to configure the machine! This will trigger `config.validate()`
+        try virtualizer.configure(
+            kernelPath: kernelPath,
+            initrdPath: initrdPath,
+            cpus: UInt(cpus),
+            memoryMB: memoryMB
+        )
+        return true
+        
+    } catch {
+        // If Apple's Hypervisor rejects our config (e.g. Memory > Host RAM),
+        // we bounce the error exactly back to Rust through the double-pointer.
+        let nsError = error as NSError
+        if let out = errorOut {
+            out.pointee = Unmanaged.passRetained(nsError).toOpaque().bindMemory(to: NSError.self, capacity: 1)
+        }
+        return false
+    }
+}
+
+// =====================================================================
+// 4. The Deallocation Function
 // =====================================================================
 // TASK: Rust's `Drop` trait calls this function when it is done with the object.
 @_cdecl("garden_virtualizer_destroy")
