@@ -127,9 +127,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run { command, args } => {
             tracing::info!(command = %command, args = ?args, "Connecting to Micro-VM Agent...");
             
-            // Connect to the TCP listener inside the macOS NAT router (using standard IP)
-            // Note: In Phase 3, this will be replaced with a native Apple vSock listener
-            let mut client = garden_common::ipc::agent_service_client::AgentServiceClient::connect("http://192.168.64.6:10000").await?;
+            // Connect to the daemon's local TCP proxy which forwards to the
+            // guest agent via vSock. No guest IP discovery needed!
+            let mut client = garden_common::ipc::agent_service_client::AgentServiceClient::connect("http://127.0.0.1:10000").await?;
             
             let request = tonic::Request::new(garden_common::ipc::CommandRequest {
                 command,

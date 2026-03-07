@@ -36,7 +36,12 @@ bool garden_virtualizer_start(void* instance, void** error_out);
 // Takes the raw pointer (`instance`) and tells Swift to free the memory.
 void garden_virtualizer_destroy(void* instance);
 
-// 6. The Run Loop
+// 6. The vSock Connect Function
+// Connects to the guest agent over vSock on the given port.
+// Returns the raw file descriptor (or -1 on failure).
+int32_t garden_virtualizer_connect_vsock(void* instance, uint32_t port);
+
+// 7. The Run Loop
 // Apple's Virtualization.framework requires an active macOS RunLoop to process
 // I/O streams (like the serial console). This hands control to the OS.
 void garden_run_loop();

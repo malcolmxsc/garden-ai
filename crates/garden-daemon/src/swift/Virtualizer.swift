@@ -118,6 +118,74 @@ public class GardenVirtualizer: NSObject {
             }
         }
     }
+    
+    // =====================================================================
+    // SYNTAX BREAKDOWN: Stored vSock Connection
+    // =====================================================================
+    // After the VM boots we connect to the guest agent over vSock.
+    // The file descriptor is stored here so Rust can retrieve it via FFI.
+    private var vsockConnection: VZVirtioSocketConnection?
+    private var vsockFd: Int32 = -1
+    
+    // =====================================================================
+    // SYNTAX BREAKDOWN: Connecting to the Guest Agent via vSock
+    // =====================================================================
+    // `VZVirtioSocketDevice.connect(toPort:)` initiates a connection from
+    // the macOS host INTO the Linux guest over vSock. This bypasses TCP/IP
+    // entirely — no IP address, no routing, no DHCP needed.
+    //
+    // The guest agent must be listening on the same port inside the VM.
+    // We use a DispatchSemaphore to block until the async callback fires,
+    // converting Apple's callback-style API into a synchronous return.
+    public func connectToAgent(port: UInt32) -> Int32 {
+        // VZVirtualMachine must be accessed from the main thread only.
+        // When Rust calls us from a background thread, we dispatch
+        // onto the main queue and block here with a semaphore.
+        let semaphore = DispatchSemaphore(value: 0)
+        var resultFd: Int32 = -1
+        
+        DispatchQueue.main.async {
+            guard let machine = self.machine else {
+                print("❌ [Swift] Cannot connect vSock: VM not started")
+                fflush(stdout)
+                semaphore.signal()
+                return
+            }
+            
+            guard let socketDevice = machine.socketDevices.first as? VZVirtioSocketDevice else {
+                print("❌ [Swift] No vSock device found on running VM")
+                fflush(stdout)
+                semaphore.signal()
+                return
+            }
+            
+            socketDevice.connect(toPort: port) { result in
+                switch result {
+                case .success(let connection):
+                    self.vsockConnection = connection
+                    resultFd = connection.fileDescriptor
+                    print("✅ [Swift] vSock connected to guest on port \(port), fd=\(resultFd)")
+                    fflush(stdout)
+                case .failure(let error):
+                    print("❌ [Swift] vSock connection failed: \(error)")
+                    fflush(stdout)
+                    resultFd = -1
+                }
+                semaphore.signal()
+            }
+        }
+        
+        // Wait up to 10 seconds for the connection to complete.
+        let timeout = DispatchTime.now() + .seconds(10)
+        if semaphore.wait(timeout: timeout) == .timedOut {
+            print("❌ [Swift] vSock connection timed out after 10s")
+            fflush(stdout)
+            return -1
+        }
+        
+        self.vsockFd = resultFd
+        return resultFd
+    }
 }
 
 // =====================================================================

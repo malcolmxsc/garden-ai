@@ -37,7 +37,10 @@ extern "C" {
     // 5. The Deallocation Function
     fn garden_virtualizer_destroy(instance: *mut c_void);
 
-    // 6. The Run Loop
+    // 6. The vSock Connect Function
+    fn garden_virtualizer_connect_vsock(instance: *mut c_void, port: u32) -> i32;
+
+    // 7. The Run Loop
     fn garden_run_loop();
 }
 
@@ -47,6 +50,12 @@ extern "C" {
 pub struct Virtualizer {
     instance: *mut c_void,
 }
+
+// SAFETY: The underlying Swift GardenVirtualizer object is safe to access
+// from multiple threads. The connect_vsock FFI call uses DispatchSemaphore
+// internally and does not mutate the Virtualizer's Rust state.
+unsafe impl Send for Virtualizer {}
+unsafe impl Sync for Virtualizer {}
 
 impl Virtualizer {
     pub fn new() -> Result<Self, String> {
@@ -148,6 +157,28 @@ impl Virtualizer {
             }
             let err_msg = unsafe { extract_nserror_description(error_ptr) };
             Err(format!("Apple Hypervisor failed to boot: {}", err_msg))
+        }
+    }
+
+    // =====================================================================
+    // SYNTAX BREAKDOWN: vSock Connection
+    // =====================================================================
+    // This method asks Swift's VZVirtioSocketDevice to open a channel
+    // directly into the Linux Guest. The returned file descriptor is a
+    // standard Unix fd that Rust can wrap in a `TcpStream` (or any
+    // `FromRawFd`-compatible type) for bidirectional byte I/O.
+    //
+    // The port number must match what the guest agent listens on (6000).
+    // Returns the raw fd, or an error if the connection fails.
+    pub fn connect_vsock(&self, port: u32) -> Result<i32, String> {
+        let fd = unsafe {
+            garden_virtualizer_connect_vsock(self.instance, port)
+        };
+        
+        if fd < 0 {
+            Err(format!("vSock connection to port {} failed (fd={})", port, fd))
+        } else {
+            Ok(fd)
         }
     }
 
