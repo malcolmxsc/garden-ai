@@ -155,7 +155,22 @@ public func garden_virtualizer_destroy(_ instance: UnsafeMutableRawPointer) {
 }
 
 // =====================================================================
-// 6. The Run Loop
+// 6. The vSock Connect Function
+// =====================================================================
+// TASK: Connect to the guest agent over vSock and return the raw fd.
+// Rust calls this after the VM is booted and the agent has had time to
+// start listening. Returns -1 on failure.
+@_cdecl("garden_virtualizer_connect_vsock")
+public func garden_virtualizer_connect_vsock(
+    _ instance: UnsafeMutableRawPointer,
+    _ port: UInt32
+) -> Int32 {
+    let virtualizer = Unmanaged<GardenVirtualizer>.fromOpaque(instance).takeUnretainedValue()
+    return virtualizer.connectToAgent(port: port)
+}
+
+// =====================================================================
+// 7. The Run Loop
 // =====================================================================
 @_cdecl("garden_run_loop")
 public func garden_run_loop() {
