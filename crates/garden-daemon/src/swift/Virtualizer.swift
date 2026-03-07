@@ -12,7 +12,6 @@ public class GardenVirtualizer: NSObject {
     }
     
     // 3. Error Handling (throws)
-    @objc
     public func checkHardwareSupport() throws -> Bool {
         // Virtualization.framework check
         guard VZVirtualMachine.isSupported else {
@@ -21,7 +20,7 @@ public class GardenVirtualizer: NSObject {
                 code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "Apple Silicon Virtualization is not supported on this Mac."]
             )
-            throw error // This translates to a catchable error in Objective-C/Rust
+            throw error 
         }
         return true
     }

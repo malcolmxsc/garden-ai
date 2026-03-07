@@ -1,38 +1,40 @@
-use std::ffi::{c_void, CStr};
-use std::os::raw::{c_char, c_int};
+use std::ffi::c_void;
+use std::os::raw::c_char;
 
-// 1. The `extern "C"` block
+// =====================================================================
+// SYNTAX BREAKDOWN: The `extern "C"` Block
+// =====================================================================
+// Here we declare the exact C functions that we defined in `bridging.h`.
+// The Rust compiler will look for these symbols in the `libgarden_swift.a`
+// static library when linking the final executable.
 #[link(name = "garden_swift", kind = "static")]
 extern "C" {
-    // These correspond to the generated Objective-C symbols from our Swift class
-    // We will need to look at the generated header to get the exact Objective-C selector names later,
-    // but here is the conceptual bridge.
+    // 1. the Allocation function
+    fn garden_virtualizer_create() -> *mut c_void;
     
-    // Allocate the class
-    fn OBJC_CLASS_$_GardenVirtualizer() -> *mut c_void;
-    
-    // Call the method
-    fn GardenVirtualizer_checkHardwareSupport(
+    // 2. The Method call
+    fn garden_virtualizer_check_hardware(
         instance: *mut c_void, 
-        error: *mut *mut std::ffi::c_void
+        error_out: *mut *mut std::ffi::c_void
     ) -> bool;
+
+    // 3. The Destructor call
+    fn garden_virtualizer_destroy(instance: *mut c_void);
 }
 
-// 2. The Safe Rust Wrapper
+// =====================================================================
+// SYNTAX BREAKDOWN: The Safe Rust Wrapper
+// =====================================================================
 pub struct Virtualizer {
-    // 3. The raw pointer (Unsafe)
     instance: *mut c_void,
 }
 
 impl Virtualizer {
     pub fn new() -> Result<Self, String> {
-        // 4. `unsafe` block
         unsafe {
-            // In a real Objective-C runtime, allocating an object is more complex 
-            // (e.g., calling `[[GardenVirtualizer alloc] init]`), 
-            // but we will use a C-wrapper function in Swift to make this easier shortly.
-            // For now, assume this function exists.
-            let instance = OBJC_CLASS_$_GardenVirtualizer();
+            // We call our explicit C function which triggers the Swift 
+            // `Unmanaged.passRetained().toOpaque()` logic!
+            let instance = garden_virtualizer_create();
             
             if instance.is_null() {
                 return Err("Failed to allocate GardenVirtualizer".to_string());
@@ -46,11 +48,11 @@ impl Virtualizer {
         let mut error_ptr: *mut c_void = std::ptr::null_mut();
         
         unsafe {
-            // Call the Objective-C method, passing a pointer to our error pointer
-            let is_supported = GardenVirtualizer_checkHardwareSupport(self.instance, &mut error_ptr);
+            // We pass the raw instance pointer to our explicit C method wrapper.
+            // If it throws an error in Swift, it will populate `error_ptr`.
+            let is_supported = garden_virtualizer_check_hardware(self.instance, &mut error_ptr);
             
             if !is_supported {
-               // 5. Handling the FFI Error
                if !error_ptr.is_null() {
                    return Err("Hardware not supported (FFI Error returned)".to_string());
                }
@@ -62,13 +64,17 @@ impl Virtualizer {
     }
 }
 
-// 6. The Drop trait (Destructor)
+// =====================================================================
+// SYNTAX BREAKDOWN: The Drop Trait
+// =====================================================================
 impl Drop for Virtualizer {
     fn drop(&mut self) {
         unsafe {
-            // Here we would call the Objective-C `release` method to free the Swift object
-            // to prevent memory leaks.
-            // release(self.instance);
+            // When this Rust struct is destroyed, we call back into Swift 
+            // to run `.release()` on the Unmanaged pointer, freeing the memory!
+            if !self.instance.is_null() {
+                garden_virtualizer_destroy(self.instance);
+            }
         }
     }
 }

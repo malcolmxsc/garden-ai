@@ -61,8 +61,11 @@ public func garden_virtualizer_check_hardware(
         // If it fails, cast the Swift Error to an Objective-C NSError
         let nsError = error as NSError
         
-        // Write the NSError's address into the double-pointer provided by Rust
-        errorOut?.pointee = nsError
+        // Write the NSError's address into the double-pointer provided by Rust.
+        // We must passRetained() here because Rust will be responsible for releasing this error object later if it exists!
+        if let out = errorOut {
+            out.pointee = Unmanaged.passRetained(nsError).toOpaque().bindMemory(to: NSError.self, capacity: 1)
+        }
         
         return false
     }
@@ -85,29 +88,5 @@ public func garden_virtualizer_destroy(_ instance: UnsafeMutableRawPointer) {
     // Because the count hits 0, Swift will now permanently delete the 
     // object from the computer's memory. No memory leaks!
     Unmanaged<GardenVirtualizer>.fromOpaque(instance).release()
-}
-
-
-@_cdecl("garden_virtualizer_create")
-func garden_virtualizer_create() -> UnsafeMutableRawPointer {
-    return unmanaged.passRetained(GardenVirtualizer()).toOpaque()
-}
-
-@_cdecl ("garden_virtualizer_check_hardware")
-func garden_virtualizer_check_hardware(_ instance: UnsafeMutableRawPointer, _ errorOut: UnsafeMutablePointer<UnsafeMutablePointer<NSError>?>?) -> Bool
-{
-    let virtualizer = unmanaged(GardenVirtualizer).fromOpaque(instance).takeUnretainedValue()
-
-    do {
-        let isSupported = try virtualizer.checkHardwareSupport()
-        return isSupported
-    } catch {
-
-        let nsError = error as NSError
-
-        errorOut?.pointee = nsError
-
-        return false
-    }
 }
 
