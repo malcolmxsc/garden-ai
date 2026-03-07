@@ -36,6 +36,9 @@ extern "C" {
 
     // 5. The Deallocation Function
     fn garden_virtualizer_destroy(instance: *mut c_void);
+
+    // 6. The Run Loop
+    fn garden_run_loop();
 }
 
 // =====================================================================
@@ -145,6 +148,12 @@ impl Virtualizer {
             }
             let err_msg = unsafe { extract_nserror_description(error_ptr) };
             Err(format!("Apple Hypervisor failed to boot: {}", err_msg))
+        }
+    }
+
+    pub fn run_loop() {
+        unsafe {
+            garden_run_loop();
         }
     }
 }

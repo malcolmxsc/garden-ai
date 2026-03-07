@@ -149,16 +149,17 @@ public func garden_virtualizer_start(
 // TASK: Rust's `Drop` trait calls this function when it is done with the object.
 @_cdecl("garden_virtualizer_destroy")
 public func garden_virtualizer_destroy(_ instance: UnsafeMutableRawPointer) {
-    
-    // =================================================================
-    // SYNTAX BREAKDOWN: Releasing the Memory
-    // =================================================================
-    // `.release()`:
-    // Remember in the Allocation function when we used `passRetained` to 
-    // artificially add +1 to the ARC reference count? 
-    // Calling `.release()` subtracts exactly 1 from the reference count.
-    // Because the count hits 0, Swift will now permanently delete the 
-    // object from the computer's memory. No memory leaks!
+    // Decrease the ARC retain count by 1, physically deleting the Virtualizer
+    // object and destroying the running Virtual Machine!
     Unmanaged<GardenVirtualizer>.fromOpaque(instance).release()
 }
 
+// =====================================================================
+// 6. The Run Loop
+// =====================================================================
+@_cdecl("garden_run_loop")
+public func garden_run_loop() {
+    // This locks the thread and hands control to Apple so it can process 
+    // background hardware events like Serial terminal I/O.
+    CFRunLoopRun()
+}
