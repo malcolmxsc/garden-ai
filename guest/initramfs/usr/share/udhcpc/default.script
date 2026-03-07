@@ -1,0 +1,22 @@
+#!/bin/busybox sh
+# Minimal udhcpc default script for Garden Agent initramfs
+
+case "$1" in
+    bound|renew)
+        # Configure the interface with the assigned IP
+        /bin/busybox ifconfig "$interface" "$ip" netmask "$subnet"
+        
+        # Set default gateway if provided
+        if [ -n "$router" ]; then
+            /bin/busybox route add default gw "$router" dev "$interface"
+        fi
+
+        # Set DNS if provided
+        if [ -n "$dns" ]; then
+            echo -n > /etc/resolv.conf
+            for d in $dns; do
+                echo "nameserver $d" >> /etc/resolv.conf
+            done
+        fi
+        ;;
+esac

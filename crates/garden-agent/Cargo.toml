@@ -1,0 +1,20 @@
+[package]
+name = "garden-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio = { version = "1.37", features = ["full"] }
+tokio-stream = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+tonic = "0.11"
+prost = "0.12"
+garden-common = { path = "../garden-common" }
+nix = "0.31.2"
+rtnetlink = "0.20.0"
+netlink-packet-route = "0.28.0"

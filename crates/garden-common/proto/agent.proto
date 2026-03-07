@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package garden.agent.v1;
+
+// The core command-and-control service exposed by the Guest Agent over vSock.
+service AgentService {
+    // Executes a shell command inside the Alpine Linux Micro-VM
+    rpc ExecuteCommand(CommandRequest) returns (CommandResponse);
+    
+    // Checks the health of the Guest Agent
+    rpc GetStatus(StatusRequest) returns (StatusResponse);
+}
+
+// ---------------------------------------------------------
+// Execute Command
+// ---------------------------------------------------------
+
+message CommandRequest {
+    // The command to execute (e.g. "ls", "python", "apt-get")
+    string command = 1;
+    
+    // Optional arguments to pass to the command
+    repeated string args = 2;
+    
+    // Optional working directory. Defaults to "/tmp"
+    string cwd = 3;
+}
+
+message CommandResponse {
+    // The integer exit code (0 usually means success)
+    int32 exit_code = 1;
+    
+    // The raw standard output buffer
+    bytes stdout = 2;
+    
+    // The raw standard error buffer
+    bytes stderr = 3;
+}
+
+// ---------------------------------------------------------
+// Status Check
+// ---------------------------------------------------------
+
+message StatusRequest {
+    // Empty request for now
+}
+
+message StatusResponse {
+    // Information about the Guest Agent
+    string version = 1;
+    
+    // Uptime of the Micro-VM in seconds
+    uint64 uptime_seconds = 2;
+}

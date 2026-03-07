@@ -4,7 +4,7 @@ members = [
     "crates/garden-mcp",
     "crates/garden-cli",
     "crates/garden-ebpf",
-    "crates/garden-common",
+    "crates/garden-common", "crates/garden-agent",
 ]
 resolver = "2"
 

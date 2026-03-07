@@ -33,7 +33,7 @@ fn main() {
     
     // In a real app we'd get these paths dynamically from the CLI
     let kernel_path = "/Users/malcolmgriffin/.gemini/antigravity/scratch/garden-ai/guest/kernel/kernel"; 
-    let initrd_path = "/Users/malcolmgriffin/.gemini/antigravity/scratch/garden-ai/guest/kernel/initramfs-virt";
+    let initrd_path = "/Users/malcolmgriffin/.gemini/antigravity/scratch/garden-ai/guest/kernel/garden-initrd.cpio.gz";
 
     match engine.configure(kernel_path, initrd_path, 2, 512) {
         Ok(_) => println!("✅ VM successfully configured by Apple Hypervisor!"),

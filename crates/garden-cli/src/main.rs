@@ -125,9 +125,28 @@ async fn main() -> anyhow::Result<()> {
             println!("🌿 Sandbox booted successfully.");
         }
         Commands::Run { command, args } => {
-            tracing::info!(command = %command, args = ?args, "Executing command in sandbox...");
-            // TODO: Send Execute request via IPC
-            println!("🌿 Command executed.");
+            tracing::info!(command = %command, args = ?args, "Connecting to Micro-VM Agent...");
+            
+            // Connect to the TCP listener inside the macOS NAT router (using standard IP)
+            // Note: In Phase 3, this will be replaced with a native Apple vSock listener
+            let mut client = garden_common::ipc::agent_service_client::AgentServiceClient::connect("http://192.168.64.6:10000").await?;
+            
+            let request = tonic::Request::new(garden_common::ipc::CommandRequest {
+                command,
+                args,
+                cwd: "/".to_string(),
+            });
+
+            tracing::info!("Executing Remote Procedure Call...");
+            let response = client.execute_command(request).await?.into_inner();
+            
+            println!("🌿 Command executed. Exit Code: {}", response.exit_code);
+            if !response.stdout.is_empty() {
+                println!("--- STDOUT ---\n{}", String::from_utf8_lossy(&response.stdout));
+            }
+            if !response.stderr.is_empty() {
+                println!("--- STDERR ---\n{}", String::from_utf8_lossy(&response.stderr));
+            }
         }
         Commands::Status => {
             tracing::info!("Querying sandbox status...");
