@@ -69,7 +69,22 @@ public class GardenVirtualizer: NSObject {
         serialPort.attachment = attachment
         config.serialPorts = [serialPort]
         
-        // 4. Validate the Configuration
+        // 4. Set up External Networking (NAT)
+        // VZNATNetworkDeviceAttachment creates an invisible virtual router.
+        // It gives the VM an internal IP address and allows it to reach the 
+        // internet using the macOS Host's Wi-Fi connection.
+        let networkDevice = VZVirtioNetworkDeviceConfiguration()
+        networkDevice.attachment = VZNATNetworkDeviceAttachment()
+        config.networkDevices = [networkDevice]
+        
+        // 5. Set up Internal IPC (vSock)
+        // VZVirtioSocketDeviceConfiguration establishes a direct, high-speed 
+        // communication channel between the Host macOS and the Guest Alpine kernel,
+        // side-stepping standard TCP/IP firewalls entirely!
+        let socketDevice = VZVirtioSocketDeviceConfiguration()
+        config.socketDevices = [socketDevice]
+        
+        // 6. Validate the Configuration
         // This asks the Apple Hypervisor: "Is this a legal machine constraint?"
         // (e.g. Did we ask for 500 CPU cores when the Mac only has 8?)
         // If it's invalid, `.validate()` automatically `throws` an Error which Rust will catch!
