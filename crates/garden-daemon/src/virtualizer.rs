@@ -15,10 +15,20 @@ extern "C" {
     // 2. The Method call
     fn garden_virtualizer_check_hardware(
         instance: *mut c_void, 
-        error_out: *mut *mut std::ffi::c_void
+        error_out: *mut *mut c_void
     ) -> bool;
 
-    // 3. The Destructor call
+    // 3. The Configure Function
+    fn garden_virtualizer_configure(
+        instance: *mut c_void,
+        kernel_path: *const std::os::raw::c_char,
+        initrd_path: *const std::os::raw::c_char,
+        cpus: u32,
+        memory_mb: u64,
+        error_out: *mut *mut c_void,
+    ) -> bool;
+
+    // 4. The Deallocation Function
     fn garden_virtualizer_destroy(instance: *mut c_void);
 }
 
@@ -62,6 +72,78 @@ impl Virtualizer {
         
         Ok(())
     }
+
+    // =====================================================================
+    // SYNTAX BREAKDOWN: Safely passing Strings from Rust to C
+    // =====================================================================
+    // Rust strings (`String`, `&str`) are highly advanced. They guarantee valid UTF-8
+    // and inherently know their own length.
+    // 
+    // C-Strings (`*const c_char`) do not know their own length. They exist as memory bytes
+    // until a physical `\0` (null-byte) is found.
+    //
+    // `std::ffi::CString` allocates new memory and safely copies the Rust string into it,
+    // explicitly appending the `\0` so C/Swift can read it until the termination point.
+    pub fn configure(
+        &mut self,
+        kernel: &str,
+        initrd: &str,
+        cpus: u32,
+        memory_mb: u64,
+    ) -> Result<(), String> {
+        // Step 1: Convert Rust Strings into C-compatible Strings.
+        // This can fail if the original string accidentally contains a `\0` somewhere inside it!
+        let c_kernel = std::ffi::CString::new(kernel).map_err(|_| "Invalid Kernel path")?;
+        let c_initrd = std::ffi::CString::new(initrd).map_err(|_| "Invalid Initrd path")?;
+
+        let mut error_ptr: *mut c_void = std::ptr::null_mut();
+
+        // Step 2: Pass down the FFI boundary
+        let success = unsafe {
+            garden_virtualizer_configure(
+                self.instance,
+                c_kernel.as_ptr(), // .as_ptr() yields the raw `*const c_char` address
+                c_initrd.as_ptr(),
+                cpus,
+                memory_mb,
+                &mut error_ptr,
+            )
+        };
+
+        if success {
+            Ok(())
+        } else {
+            // Re-use our NSError extraction logic from before
+            if error_ptr.is_null() {
+                return Err("Failed to configure Virtualizer. (Unknown Error)".into());
+            }
+            let err_msg = unsafe { extract_nserror_description(error_ptr) };
+            Err(format!("Apple Hypervisor rejected configuration: {}", err_msg))
+        }
+    }
+}
+
+// Helper to extract the description string from an Objective-C NSError**
+unsafe fn extract_nserror_description(error_ptr: *mut c_void) -> String {
+    if error_ptr.is_null() {
+        return "Unknown Error".to_string();
+    }
+    
+    // We bind to the Objective-C runtime strictly to call `-[NSError localizedDescription]`
+    // and grab the UTF-8 C string out of the resulting NSString.
+    use objc::runtime::Object;
+    use objc::{msg_send, sel, sel_impl};
+    
+    let ns_error = error_ptr as *mut Object;
+    let desc: *mut Object = msg_send![ns_error, localizedDescription];
+    let utf8_str: *const c_char = msg_send![desc, UTF8String];
+    
+    if utf8_str.is_null() {
+        return "Failed to extract error description".to_string();
+    }
+    
+    let c_str = std::ffi::CStr::from_ptr(utf8_str);
+    c_str.to_string_lossy().into_owned()
 }
 
 // =====================================================================

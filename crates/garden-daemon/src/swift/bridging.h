@@ -16,6 +16,18 @@ void* garden_virtualizer_create(void);
 // Returns true if supported, false if an error occurred.
 bool garden_virtualizer_check_hardware(void* instance, void** error_out);
 
-// 3. The Deallocation Function
+// 3. The Configure Function
+// Passes C-Strings (const char*) and integers (uint32_t) across the FFI bridge
+// to configure the Virtual Machine Hardware attributes.
+bool garden_virtualizer_configure(
+    void* instance, 
+    const char* kernel_path, 
+    const char* initrd_path, 
+    uint32_t cpus, 
+    uint64_t memory_mb, 
+    void** error_out
+);
+
+// 4. The Deallocation Function
 // Takes the raw pointer (`instance`) and tells Swift to free the memory.
 void garden_virtualizer_destroy(void* instance);
