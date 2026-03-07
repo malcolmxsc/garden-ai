@@ -36,3 +36,6 @@ guest/rootfs/*.tar.gz
 
 # === Generated FFI headers ===
 crates/garden-ffi/garden_ffi.h
+guest/kernel/kernel
+guest/kernel/vmlinux-virt
+guest/kernel/extract-vmlinux
