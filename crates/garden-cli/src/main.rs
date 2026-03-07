@@ -97,8 +97,6 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Init => {
             tracing::info!("🌿 Initializing Garden workspace...");
-            let guest_dir = std::path::Path::new("guest/kernel");
-            tokio::fs::create_dir_all(guest_dir).await?;
             tracing::info!("Downloading Alpine Linux kernel...");
             download_alpine().await?;
             tracing::info!("✅ Workspace initialized securely!");
@@ -167,6 +165,9 @@ async fn download_alpine() -> anyhow::Result<()> {
     let initrd_url = "https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/aarch64/netboot/initramfs-virt";
 
     let guest_dir = std::path::Path::new("guest/kernel");
+    
+    // Safety check: ensure the folder actually exists before we try to save files into it!
+    tokio::fs::create_dir_all(guest_dir).await?;
     
     // 1. Download Kernel
     let kernel_dest = guest_dir.join("vmlinuz-virt");
