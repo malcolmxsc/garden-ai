@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "garden",
-    about = "🌿 Garden AI — The un-hackable room for your AI",
+    about = "🌿 Garden AI — A secure, hardware-accelerated Linux Micro-VM environment.",
     version,
     propagate_version = true
 )]
