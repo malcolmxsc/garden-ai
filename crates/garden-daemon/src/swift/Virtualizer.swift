@@ -48,7 +48,7 @@ public class GardenVirtualizer: NSObject {
         
         // Command line arguments passed directly into the Linux kernel on boot.
         // "console=hvc0" forces Linux to print its boot logs to the virtual serial port!
-        bootloader.commandLine = "console=hvc0"
+        bootloader.commandLine = "console=hvc0 console=ttyAMA0,115200 earlycon"
         self.bootloader = bootloader
         
         // 2. Set up the Hardware Configuration
@@ -58,11 +58,11 @@ public class GardenVirtualizer: NSObject {
         // Virtualization.framework expects memory in pure Bytes, so we multiply MB * 1024 * 1024
         config.memorySize = memoryMB * 1024 * 1024 
         
-        // 3. Attach a Serial Port (so we can see it boot!)
-        // Without this, the VM would boot silently in the background and we'd be blind.
-        let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
+        // Define the hardware platform explicitely as a Generic Linux Platform
+        config.platform = VZGenericPlatformConfiguration()
         
-        // We attach the virtual serial port directly to the Mac's standard input/output (our terminal!)
+        // 3. Attach a Serial Port (so we can see it boot!)
+        let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
         let attachment = VZFileHandleSerialPortAttachment(
             fileHandleForReading: FileHandle.standardInput,
             fileHandleForWriting: FileHandle.standardOutput
@@ -71,21 +71,19 @@ public class GardenVirtualizer: NSObject {
         config.serialPorts = [serialPort]
         
         // 4. Set up External Networking (NAT)
-        // VZNATNetworkDeviceAttachment creates an invisible virtual router.
-        // It gives the VM an internal IP address and allows it to reach the 
-        // internet using the macOS Host's Wi-Fi connection.
-        let networkDevice = VZVirtioNetworkDeviceConfiguration()
-        networkDevice.attachment = VZNATNetworkDeviceAttachment()
-        config.networkDevices = [networkDevice]
+        let network = VZVirtioNetworkDeviceConfiguration()
+        network.attachment = VZNATNetworkDeviceAttachment()
+        config.networkDevices = [network]
         
-        // 5. Set up Internal IPC (vSock)
-        // VZVirtioSocketDeviceConfiguration establishes a direct, high-speed 
-        // communication channel between the Host macOS and the Guest Alpine kernel,
-        // side-stepping standard TCP/IP firewalls entirely!
-        let socketDevice = VZVirtioSocketDeviceConfiguration()
-        config.socketDevices = [socketDevice]
+        // 5. Provide an Entropy Device (required by Linux)
+        let entropy = VZVirtioEntropyDeviceConfiguration()
+        config.entropyDevices = [entropy]
         
-        // 6. Validate the Configuration
+        // 6. Set up Inter-Process Communication (vSock)
+        let vsock = VZVirtioSocketDeviceConfiguration()
+        config.socketDevices = [vsock]
+        
+        // 7. Validate the Configuration
         // This asks the Apple Hypervisor: "Is this a legal machine constraint?"
         // (e.g. Did we ask for 500 CPU cores when the Mac only has 8?)
         // If it's invalid, `.validate()` automatically `throws` an Error which Rust will catch!
@@ -105,31 +103,36 @@ public class GardenVirtualizer: NSObject {
         
         // 1. Create the Physical Virtual Machine object using our validated config
         let machine = VZVirtualMachine(configuration: config)
+        machine.delegate = self
         self.machine = machine
         
-        // 2. We use dispatch groups to handle the async boot process safely
-        let group = DispatchGroup()
-        group.enter()
-        
-        var bootError: Error?
-        
-        // Ask Apple to boot the hypervisor
+        // 2. Ask Apple to boot the hypervisor asynchronously.
         machine.start { result in
             switch result {
             case .success:
                 print("✅ [Swift] VZVirtualMachine hardware launched successfully!")
+                fflush(stdout)
             case .failure(let error):
-                bootError = error
+                print("❌ [Swift] VZVirtualMachine failed to boot: \(error)")
+                fflush(stdout)
             }
-            group.leave()
         }
-        
-        // Wait for the boot callback to finish before returning
-        group.wait()
-        
-        // If Apple failed to boot it, bounce the error to Rust
-        if let error = bootError {
-            throw error
-        }
+    }
+}
+
+// =====================================================================
+// SYNTAX BREAKDOWN: Handling VM Crash Events
+// =====================================================================
+// This allows us to intercept Apple's background hypervisor errors if the Linux
+// kernel crashes or panics seconds after booting.
+extension GardenVirtualizer: VZVirtualMachineDelegate {
+    public func guestDidStop(_ virtualMachine: VZVirtualMachine) {
+        print("🛑 [Swift] VZVirtualMachine guest did stop!")
+        fflush(stdout)
+    }
+    
+    public func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
+        print("❌ [Swift] VZVirtualMachine stopped with error: \(error)")
+        fflush(stdout)
     }
 }

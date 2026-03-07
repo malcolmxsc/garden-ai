@@ -32,8 +32,8 @@ fn main() {
     println!("⚙️ Configuring Virtual Machine (2 CPUs, 512MB RAM)...");
     
     // In a real app we'd get these paths dynamically from the CLI
-    let kernel_path = "../guest/kernel/vmlinuz-virt"; 
-    let initrd_path = "../guest/kernel/initramfs-virt";
+    let kernel_path = "/Users/malcolmgriffin/.gemini/antigravity/scratch/garden-ai/guest/kernel/kernel"; 
+    let initrd_path = "/Users/malcolmgriffin/.gemini/antigravity/scratch/garden-ai/guest/kernel/initramfs-virt";
 
     match engine.configure(kernel_path, initrd_path, 2, 512) {
         Ok(_) => println!("✅ VM successfully configured by Apple Hypervisor!"),
@@ -53,12 +53,10 @@ fn main() {
         }
     }
 
-    println!("🔄 Daemon entering execution loop. Press Ctrl+C to stop.");
+    println!("🔄 Daemon handing control to macOS CFRunLoop. Press Ctrl+C to stop.");
     // 5. The Execution Loop
     // The Swift Virtualizer runs on background threads managed by macOS.
-    // If our Rust daemon exits here, the main process dies, and the VM dies instantly with it.
-    // We use an infinite loop to keep Process 2 alive indefinitely.
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
+    // Apple's Virtualization.framework requires an active RunLoop on the main thread
+    // to process asynchronous block callbacks and I/O streams.
+    Virtualizer::run_loop();
 }

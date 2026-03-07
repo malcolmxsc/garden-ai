@@ -35,3 +35,8 @@ bool garden_virtualizer_start(void* instance, void** error_out);
 // 5. The Deallocation Function
 // Takes the raw pointer (`instance`) and tells Swift to free the memory.
 void garden_virtualizer_destroy(void* instance);
+
+// 6. The Run Loop
+// Apple's Virtualization.framework requires an active macOS RunLoop to process
+// I/O streams (like the serial console). This hands control to the OS.
+void garden_run_loop();
