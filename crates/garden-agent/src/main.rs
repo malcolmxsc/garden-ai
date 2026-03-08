@@ -2,13 +2,77 @@
 //! 
 //! This binary is compiled statically and injected directly into the Apple Hypervisor
 //! via a custom `cpio` ramdisk. The Linux Kernel executes this file as Process 1 (`/init`).
+//!
+//! As PID 1, this process MUST NEVER EXIT — if it does, the kernel panics immediately.
+//! All errors are caught and logged, and the process enters an emergency loop if
+//! the main logic fails.
 
 use garden_common::ipc::agent_service_server::{AgentService, AgentServiceServer};
 use garden_common::ipc::{CommandRequest, CommandResponse, StatusRequest, StatusResponse};
-use std::process::Command;
 use tonic::{transport::Server, Request, Response, Status};
 
 use tokio_stream::StreamExt;
+
+// =====================================================================
+// PID 1 Signal Safety
+// =====================================================================
+// PID 1 is special in Linux:
+//   - If PID 1 exits for ANY reason, the kernel panics.
+//   - If PID 1 receives an unhandled fatal signal, the kernel panics.
+//   - When any process's parent exits, orphaned children are reparented to PID 1.
+//   - PID 1 must reap these orphan zombies via waitpid().
+//
+// We handle this by:
+//   1. Setting SIGCHLD to SIG_IGN — tells the kernel to auto-reap all children.
+//      This means we never accumulate zombie processes.
+//   2. Ignoring SIGHUP, SIGPIPE, SIGINT — prevents accidental PID 1 death.
+//   3. Wrapping main() in catch_unwind + never-exit loop.
+
+fn install_signal_handlers() {
+    unsafe {
+        // SIGCHLD: keep default behavior (SIG_DFL = ignore on Linux).
+        // We do NOT use SIG_IGN because that tells the kernel to auto-reap
+        // children, which races with waitpid() in std::process::Command and
+        // tokio::process::Command, causing ECHILD errors.
+        // Instead, we run a periodic reaper task to clean up orphan zombies.
+
+        // Ignore signals that would kill PID 1
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);    // No controlling terminal
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);    // Broken vSock connections
+        libc::signal(libc::SIGINT, libc::SIG_IGN);     // Console interrupt
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);    // VM will be killed externally
+    }
+}
+
+fn main() {
+    // Install signal handlers FIRST — before anything can panic or spawn children
+    install_signal_handlers();
+
+    // Catch any panic in the rest of the program
+    let result = std::panic::catch_unwind(|| {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build tokio runtime");
+
+        if let Err(e) = rt.block_on(async_main()) {
+            eprintln!("[init] async_main returned error: {:?}", e);
+        } else {
+            eprintln!("[init] async_main returned cleanly — this should not happen");
+        }
+    });
+
+    if let Err(panic_info) = result {
+        eprintln!("[init] PANIC caught: {:?}", panic_info);
+    }
+
+    // PID 1 must NEVER exit. If we get here, loop forever.
+    // The host can still kill the VM externally via Virtualizer.stop().
+    eprintln!("[init] Entering emergency hold loop — VM must be killed externally");
+    loop {
+        unsafe { libc::pause(); }
+    }
+}
 
 #[derive(Default)]
 pub struct GardenAgentImpl {}
@@ -22,16 +86,19 @@ impl AgentService for GardenAgentImpl {
         let req = request.into_inner();
         tracing::info!("Executing command: {} {:?} (cwd={})", req.command, req.args, req.cwd);
 
-        // Define our execution directory 
         let cwd = if req.cwd.is_empty() { "/" } else { &req.cwd };
 
-        // Execute the command inside the Linux Guest!
-        let output = Command::new(&req.command)
+        // Use tokio::process::Command for non-blocking child process management.
+        // This integrates with tokio's reactor and handles waitpid internally.
+        let output = tokio::process::Command::new(&req.command)
             .args(&req.args)
             .current_dir(cwd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .output()
+            .await
             .map_err(|e| {
-                tracing::error!("Command::new failed: {:?}", e);
+                tracing::error!("Failed to execute '{}': {:?}", req.command, e);
                 Status::internal(format!("Failed to execute process: {}", e))
             })?;
 
@@ -41,6 +108,7 @@ impl AgentService for GardenAgentImpl {
             stderr: output.stderr,
         };
 
+        tracing::info!("Command '{}' exited with code {}", req.command, response.exit_code);
         Ok(Response::new(response))
     }
 
@@ -59,16 +127,13 @@ impl AgentService for GardenAgentImpl {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn async_main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter("info")
         .init();
 
     // 0. Mount essential pseudo-filesystems for Linux operation
     // =========================================================
-    // As PID 1, we are the first userspace process. The kernel
-    // does NOT mount these automatically — we must do it ourselves.
     let _ = std::fs::create_dir_all("/proc");
     let _ = std::fs::create_dir_all("/sys");
     let _ = std::fs::create_dir_all("/dev");
@@ -77,10 +142,15 @@ async fn main() -> anyhow::Result<()> {
     let _ = std::process::Command::new("/bin/busybox").args(["mount", "-t", "devtmpfs", "dev", "/dev"]).status();
     tracing::info!("Mounted /proc, /sys, /dev");
 
+    // 0.5. Create BusyBox symlinks so commands like "echo", "ls" work
+    // =========================================================
+    // BusyBox is a single binary that acts as many commands depending
+    // on the name it's invoked as. We create symlinks so standard
+    // command names resolve to busybox.
+    setup_busybox_symlinks();
+
     // 1. Initialize Network Interfaces using Netlink
     // =========================================================
-    // With our custom kernel (CONFIG_MODULES=n), all drivers are
-    // built-in — no modprobe needed! Just bring up interfaces.
     tracing::info!("Configuring network interfaces via Netlink...");
     let (connection, handle, _) = rtnetlink::new_connection().unwrap();
     tokio::spawn(connection);
@@ -133,24 +203,35 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // 3. Start gRPC AgentService
+    // 3. Start zombie reaper for orphaned processes
     // =========================================================
-    // Check if /dev/vsock exists to decide transport:
-    //   - vSock present: listen on vSock port 6000 (host connects directly)
-    //   - vSock absent:  fallback to TCP 0.0.0.0:10000 (legacy NAT path)
+    // As PID 1, orphaned child processes (grandchildren) get reparented to us.
+    // We must periodically reap them to prevent zombie accumulation.
+    // Our OWN children are reaped by std::process::Command / tokio::process::Command.
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            // Reap all available zombies (non-blocking)
+            loop {
+                let pid = unsafe {
+                    libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG)
+                };
+                if pid <= 0 { break; } // 0 = no zombies, -1 = error/ECHILD
+                tracing::debug!("Reaped orphan zombie pid={}", pid);
+            }
+        }
+    });
+
+    // 4. Start gRPC AgentService
+    // =========================================================
     let agent = GardenAgentImpl::default();
 
     if std::path::Path::new("/dev/vsock").exists() {
-        // vSock transport: bind with AF_VSOCK using raw libc
         tracing::info!("🔌 /dev/vsock detected! Starting vSock listener on port 6000...");
         
         let vsock_listener_fd = create_vsock_listener(6000)?;
         tracing::info!("AgentService listening on vSock port 6000");
         
-        // We can NOT use TcpListener::from_raw_fd because vSock fds
-        // are AF_VSOCK, not AF_INET. Instead, we manually accept()
-        // and convert each connection into a UnixStream (which works
-        // for any SOCK_STREAM file descriptor).
         let incoming = VsockIncoming::new(vsock_listener_fd)?;
         
         Server::builder()
@@ -158,7 +239,6 @@ async fn main() -> anyhow::Result<()> {
             .serve_with_incoming(incoming)
             .await?;
     } else {
-        // TCP fallback: no vSock available (legacy Alpine kernel path)
         tracing::warn!("/dev/vsock not found — falling back to TCP listener");
         let addr = "0.0.0.0:10000".parse().unwrap();
         tracing::info!("AgentService listening on TCP {}", addr);
@@ -173,32 +253,45 @@ async fn main() -> anyhow::Result<()> {
 }
 
 // =====================================================================
-// SYNTAX BREAKDOWN: Creating a vSock Listener with Raw libc
+// BusyBox Symlink Setup
 // =====================================================================
-// Linux's AF_VSOCK socket family uses the same socket/bind/listen
-// syscalls as TCP, but with `sockaddr_vm` instead of `sockaddr_in`.
-//
-// We use raw libc calls because:
-//   1. The `vsock` crate pulls in dependencies that may not cross-compile
-//      cleanly under `aarch64-unknown-linux-musl`.
-//   2. It's only ~20 lines of code — not worth a dependency.
-//
-// `VMADDR_CID_ANY` (0xFFFFFFFF) tells the kernel: "Accept connections
-// from any CID" — meaning we don't need to know our own CID.
+// Creates /usr/bin symlinks for common BusyBox applets so that
+// commands like "echo", "ls", "cat" can be found by name.
+fn setup_busybox_symlinks() {
+    let applets = [
+        "cat", "cp", "echo", "env", "grep", "head", "hostname",
+        "id", "kill", "ln", "ls", "mkdir", "mv", "ps", "pwd",
+        "rm", "rmdir", "sed", "sh", "sleep", "sort", "tail",
+        "touch", "uname", "wc", "which", "whoami",
+    ];
+
+    let _ = std::fs::create_dir_all("/usr/bin");
+    
+    for applet in &applets {
+        let target = format!("/usr/bin/{}", applet);
+        // Ignore errors — symlink may already exist
+        let _ = std::os::unix::fs::symlink("/bin/busybox", &target);
+    }
+
+    // Also ensure /bin has the common ones
+    let bin_applets = ["sh", "echo", "ls", "cat", "ps", "kill", "hostname"];
+    for applet in &bin_applets {
+        let target = format!("/bin/{}", applet);
+        let _ = std::os::unix::fs::symlink("/bin/busybox", &target);
+    }
+
+    tracing::info!("Created BusyBox symlinks for {} applets", applets.len());
+}
+
+// =====================================================================
+// vSock Listener (raw libc)
+// =====================================================================
 fn create_vsock_listener(port: u32) -> anyhow::Result<i32> {
     use std::mem;
     
-    // AF_VSOCK = 40 on Linux
     const AF_VSOCK: i32 = 40;
-    // VMADDR_CID_ANY = -1 (0xFFFFFFFF) — accept from any CID
     const VMADDR_CID_ANY: u32 = 0xFFFFFFFF;
     
-    // struct sockaddr_vm layout (from Linux kernel headers):
-    //   sa_family: u16   (AF_VSOCK = 40)
-    //   reserved1: u16   (must be 0)
-    //   port:      u32   (the vSock port number)
-    //   cid:       u32   (VMADDR_CID_ANY to accept from any CID)
-    //   ...padding to 16 bytes total
     #[repr(C)]
     struct SockaddrVm {
         family: u16,
@@ -210,13 +303,11 @@ fn create_vsock_listener(port: u32) -> anyhow::Result<i32> {
     }
     
     unsafe {
-        // 1. Create the socket
         let fd = libc::socket(AF_VSOCK, libc::SOCK_STREAM, 0);
         if fd < 0 {
             anyhow::bail!("socket(AF_VSOCK) failed: {}", std::io::Error::last_os_error());
         }
         
-        // 2. Bind to our port
         let addr = SockaddrVm {
             family: AF_VSOCK as u16,
             reserved1: 0,
@@ -236,7 +327,6 @@ fn create_vsock_listener(port: u32) -> anyhow::Result<i32> {
             anyhow::bail!("bind(AF_VSOCK, port={}) failed: {}", port, std::io::Error::last_os_error());
         }
         
-        // 3. Listen for incoming connections
         let ret = libc::listen(fd, 5);
         if ret < 0 {
             libc::close(fd);
@@ -250,12 +340,6 @@ fn create_vsock_listener(port: u32) -> anyhow::Result<i32> {
 // =====================================================================
 // VsockStream: AsyncRead + AsyncWrite wrapper for AF_VSOCK fds
 // =====================================================================
-// Uses `tokio::io::unix::AsyncFd` which registers the fd with the tokio
-// reactor (epoll on Linux). This works for ANY pollable fd, including
-// AF_VSOCK accepted connections.
-//
-// We can NOT use `tokio::net::UnixStream` because it expects AF_UNIX
-// sockets and rejects AF_VSOCK fds.
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -274,7 +358,6 @@ impl AsRawFd for RawFdWrapper {
 
 impl VsockStream {
     fn new(fd: RawFd) -> std::io::Result<Self> {
-        // Set non-blocking
         unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFL);
             libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
@@ -290,7 +373,6 @@ impl Drop for VsockStream {
     }
 }
 
-// Required by tonic's serve_with_incoming
 impl tonic::transport::server::Connected for VsockStream {
     type ConnectInfo = ();
     fn connect_info(&self) -> Self::ConnectInfo {}
@@ -383,7 +465,6 @@ struct VsockIncoming {
 
 impl VsockIncoming {
     fn new(listener_fd: i32) -> std::io::Result<Self> {
-        // Set the listener to non-blocking for epoll
         unsafe {
             let flags = libc::fcntl(listener_fd, libc::F_GETFL);
             libc::fcntl(listener_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
