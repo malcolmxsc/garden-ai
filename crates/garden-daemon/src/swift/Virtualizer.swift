@@ -82,6 +82,29 @@ public class GardenVirtualizer: NSObject {
         // 6. Set up Inter-Process Communication (vSock)
         let vsock = VZVirtioSocketDeviceConfiguration()
         config.socketDevices = [vsock]
+
+        // 7. Set up Directory Sharing (VirtioFS Sandbox)
+        // We share exactly ONE folder (~/GardenBox) to act as the strict VM sandbox
+        let fileManager = FileManager.default
+        let homeDir = fileManager.homeDirectoryForCurrentUser
+        let sandboxURL = homeDir.appendingPathComponent("GardenBox")
+        
+        // Ensure the directory exists before Apple Hypervisor tries to share it
+        if !fileManager.fileExists(atPath: sandboxURL.path) {
+            do {
+                try fileManager.createDirectory(at: sandboxURL, withIntermediateDirectories: true)
+                print("🌱 Created secure sandbox at \\(sandboxURL.path)")
+            } catch {
+                print("❌ Failed to create sandbox directory: \\(error)")
+            }
+        }
+        
+        // Create a Read/Write share and attach it to a VirtioFS device 
+        // with the specific mount tag 'garden_workspace'
+        let share = VZSingleDirectoryShare(directory: VZSharedDirectory(url: sandboxURL, readOnly: false))
+        let fsDevice = VZVirtioFileSystemDeviceConfiguration(tag: "garden_workspace")
+        fsDevice.share = share
+        config.directorySharingDevices = [fsDevice]
         
         // 7. Validate the Configuration
         // This asks the Apple Hypervisor: "Is this a legal machine constraint?"

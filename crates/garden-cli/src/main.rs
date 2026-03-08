@@ -125,7 +125,32 @@ async fn main() -> anyhow::Result<()> {
             println!("🌿 Sandbox booted successfully.");
         }
         Commands::Run { command, args } => {
-            tracing::info!(command = %command, args = ?args, "Connecting to Micro-VM Agent...");
+            // ----------------------------------------------------
+            // VirtioFS Secure Sandbox Validation
+            // ----------------------------------------------------
+            // The macOS host only shares ~/GardenBox with the guest VM.
+            // We must enforce that the user runs the CLI from inside this directory.
+            let sandbox_root = dirs::home_dir()
+                .expect("Could not find home directory")
+                .join("GardenBox");
+                
+            let cwd = std::env::current_dir().unwrap_or_default();
+            
+            if !cwd.starts_with(&sandbox_root) {
+                eprintln!("❌ Security Violation: garden commands can only run inside the secure sandbox.");
+                eprintln!("   Your current directory is: {}", cwd.display());
+                eprintln!("   Please cd into: {}", sandbox_root.display());
+                std::process::exit(1);
+            }
+            
+            // Calculate the relative path from the sandbox root.
+            // e.g. ~/GardenBox/my_project/src -> my_project/src
+            let relative_cwd = cwd.strip_prefix(&sandbox_root)
+                .unwrap_or(std::path::Path::new(""))
+                .to_string_lossy()
+                .to_string();
+
+            tracing::info!(command = %command, args = ?args, cwd = %relative_cwd, "Connecting to Micro-VM Agent...");
             
             // Connect to the daemon's local TCP proxy which forwards to the
             // guest agent via vSock. No guest IP discovery needed!
@@ -134,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
             let request = tonic::Request::new(garden_common::ipc::CommandRequest {
                 command,
                 args,
-                cwd: "/".to_string(),
+                cwd: relative_cwd,
             });
 
             tracing::info!("Executing Remote Procedure Call...");

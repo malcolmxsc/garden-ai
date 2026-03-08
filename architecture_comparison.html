@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Architecture Comparison: Original Plan vs Current Implementation</title>
+    <style>
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; 
+            padding: 40px; 
+            max-width: 900px; 
+            margin: 0 auto; 
+            line-height: 1.6; 
+            color: #24292e; 
+            background: #ffffff;
+        }
+        h1, h2, h3 { color: #1b1f23; border-bottom: 1px solid #eaecef; padding-bottom: 0.3em; }
+        h3 { border-bottom: none; }
+        table { border-collapse: collapse; width: 100%; margin: 20px 0; font-size: 14px; }
+        th, td { border: 1px solid #dfe2e5; padding: 12px 16px; text-align: left; }
+        th { background-color: #f6f8fa; font-weight: 600; }
+        tr:nth-child(even) { background-color: #f6f8fa; }
+        code, pre { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; background-color: #f6f8fa; padding: 0.2em 0.4em; border-radius: 6px; font-size: 13px; }
+        pre { padding: 16px; overflow: auto; line-height: 1.45; }
+        .highlight { background-color: #e6ffed; border: 1px solid #acf2bd; display: inline-block; padding: 0.1em; }
+    </style>
+</head>
+<body>
+    <h1>Architecture Comparison: Original Plan vs Current Implementation</h1>
+    
+    <h2>What Changed</h2>
+    <table>
+        <tr>
+            <th>Component</th>
+            <th>Original Plan (v1)</th>
+            <th>Current Reality (v2)</th>
+        </tr>
+        <tr>
+            <td><strong>CLI → VM Transport</strong></td>
+            <td>Unspecified (implied MCP → VM)</td>
+            <td>CLI → TCP (127.0.0.1:10000) → daemon vSock proxy → guest gRPC</td>
+        </tr>
+        <tr>
+            <td><strong>Daemon Role</strong></td>
+            <td>MCP Server + VM Manager + Firewall + VirtioFS</td>
+            <td><strong>TCP→vSock byte proxy</strong> + VM Manager</td>
+        </tr>
+        <tr>
+            <td><strong>Guest Agent</strong></td>
+            <td>"Agent Shell / Runtime" (vague)</td>
+            <td><strong>PID 1 /init</strong> with tonic gRPC, signal handlers, zombie reaper, BusyBox symlinks</td>
+        </tr>
+        <tr>
+            <td><strong>IPC Mechanism</strong></td>
+            <td>"Unix Socket / XPC" between UI and daemon</td>
+            <td>gRPC/HTTP2 over vSock (AF_VSOCK, port 6000)</td>
+        </tr>
+        <tr>
+            <td><strong>Networking</strong></td>
+            <td>"Host Network Rules (NAT / Gateway config)"</td>
+            <td>DHCP via <code>udhcpc</code> on virtio-net <code>eth0</code>, macOS NAT</td>
+        </tr>
+        <tr>
+            <td><strong>eBPF</strong></td>
+            <td>Rust eBPF Daemon inside guest</td>
+            <td>❌ Not yet implemented</td>
+        </tr>
+        <tr>
+            <td><strong>VirtioFS</strong></td>
+            <td>Host VirtioFS Server ↔ Guest Client</td>
+            <td>❌ Not yet implemented</td>
+        </tr>
+        <tr>
+            <td><strong>garden-ui</strong></td>
+            <td>SwiftUI app with Menu Bar, Diff View, Security Dashboard</td>
+            <td>❌ Not yet implemented</td>
+        </tr>
+        <tr>
+            <td><strong>MCP Server</strong></td>
+            <td>Receives intents from Claude/LangChain</td>
+            <td>❌ Not yet implemented (daemon boots VM but doesn't serve MCP)</td>
+        </tr>
+    </table>
+    
+    <h2>Key Architectural Shifts</h2>
+    
+    <h3>1. Daemon became a byte proxy, not a gRPC proxy</h3>
+    <p>The original plan had the daemon as a heavyweight orchestrator. In practice, the daemon is a <strong>thin TCP↔vSock pipe</strong>. All gRPC logic lives in the guest agent. This is simpler and more robust — HTTP/2 frames pass through transparently.</p>
+    
+    <h3>2. Agent is PID 1 with real init responsibilities</h3>
+    <p>The original diagram treated the guest as a black box. In reality, the agent IS the init system — it mounts <code>/proc</code>, <code>/sys</code>, <code>/dev</code>, runs DHCP, handles signals, and reaps zombie processes. This was a hard-won lesson after kernel panics.</p>
+    
+    <h3>3. vSock replaced the implied network path</h3>
+    <p>The original plan showed a generic firewall between host and guest. We now use Apple's <code>VZVirtioSocketDevice</code> for a direct, zero-config host↔guest channel that bypasses networking entirely.</p>
+    
+    <h2>Overall Progress</h2>
+    <pre><code>✅ Completed          🔲 Not Started
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ VM boot (Virtualization.framework, custom aarch64 kernel)
+✅ Guest networking (DHCP, NAT egress)
+✅ vSock transport (AsyncFd, per-connection proxy)
+✅ gRPC command execution (CLI → daemon → agent → child process → response)
+✅ PID 1 resilience (signals, catch_unwind, zombie reaper)
+🔲 VirtioFS workspace sharing
+🔲 MCP Server integration (Claude/LangChain → daemon)
+🔲 garden-ui (SwiftUI menu bar app)
+🔲 eBPF observability daemon
+🔲 Security dashboard</code></pre>
+</body>
+</html>
