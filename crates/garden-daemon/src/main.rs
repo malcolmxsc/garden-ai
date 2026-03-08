@@ -5,10 +5,9 @@ use virtualizer::Virtualizer;
 fn main() {
     println!("🌱 Starting Garden Engine Daemon...");
 
-    // 1. Initialize the FFI Bridge
+    // 1. Initialize the FFI Bridge 
     println!("Checking Apple Silicon Virtualization support...");
     
-    // We use Rust's `match` statement to handle the Result enum returned by our `Virtualizer::new()` wrapper.
     let mut engine = match Virtualizer::new() {
         Ok(v) => v,
         Err(e) => {
@@ -17,8 +16,7 @@ fn main() {
         }
     };
 
-    // 2. Test the Swift Method
-    // Now we call our safe Rust method, which passes the raw pointer across the C-bridge into Swift.
+    // 2. Check hardware support
     match engine.check_hardware() {
         Ok(_) => println!("✅ Virtualization hardware is supported and ready!"),
         Err(e) => {
@@ -27,11 +25,9 @@ fn main() {
         }
     }
     
-    // 3. Test Configuring the Virtual Machine
-    // We pass our downloaded Alpine Linux paths across the bridge into Swift, requesting 2 CPUs and 512MB of RAM.
+    // 3. Configure the VM
     println!("⚙️ Configuring Virtual Machine (2 CPUs, 512MB RAM)...");
     
-    // In a real app we'd get these paths dynamically from the CLI
     let kernel_path = "/Users/malcolmgriffin/.gemini/antigravity/scratch/garden-ai/guest/kernel/kernel"; 
     let initrd_path = "/Users/malcolmgriffin/.gemini/antigravity/scratch/garden-ai/guest/kernel/garden-initrd.cpio.gz";
 
@@ -43,7 +39,7 @@ fn main() {
         }
     }
 
-    // 4. Test Booting the Virtual Machine
+    // 4. Boot the VM
     println!("🚀 Booting the Alpine Linux VM...");
     match engine.start() {
         Ok(_) => println!("✅ VM Boot sequence initiated!"),
@@ -53,53 +49,22 @@ fn main() {
         }
     }
 
-    // 5. Connect to guest agent via vSock (from a background thread)
+    // 5. Wait for agent to be ready, then start TCP proxy
     // =================================================================
-    // CRITICAL: VZVirtioSocketDevice.connect(toPort:) dispatches its
-    // completion callback on the main thread's CFRunLoop. We must start
-    // the RunLoop FIRST, then connect from a background thread.
-    println!("🔌 Will connect to guest agent via vSock (background thread)...");
+    // For each incoming CLI TCP connection, we open a FRESH vSock connection
+    // to the guest agent. The agent's VsockIncoming listener will accept()
+    // each one independently, giving each CLI connection its own HTTP/2 stream.
+    println!("🔌 Starting TCP→vSock proxy (background thread)...");
     
-    // Leak the engine into a &'static reference — it lives for the entire
-    // process lifetime anyway (until Ctrl+C kills the daemon).
     let engine: &'static Virtualizer = Box::leak(Box::new(engine));
     
     std::thread::spawn(move || {
         // Wait for the VM kernel to boot and the agent to start listening
         std::thread::sleep(std::time::Duration::from_secs(3));
         
+        // Start the TCP proxy — vSock connections are made on-demand per CLI session
         let vsock_port: u32 = 6000;
-        let mut vsock_fd: Option<i32> = None;
-        
-        for attempt in 1..=30 {
-            match engine.connect_vsock(vsock_port) {
-                Ok(fd) => {
-                    println!("✅ vSock connected! fd={} (attempt {})", fd, attempt);
-                    vsock_fd = Some(fd);
-                    break;
-                }
-                Err(e) => {
-                    if attempt % 5 == 0 {
-                        println!("   ⏳ vSock attempt {}/30: {}", attempt, e);
-                    }
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
-        
-        match vsock_fd {
-            Some(fd) => {
-                println!("🌿 Garden Agent connected on vSock fd={}", fd);
-                println!("   Starting local TCP proxy on 127.0.0.1:10000...");
-                if let Err(e) = run_tcp_vsock_proxy(fd) {
-                    eprintln!("❌ TCP-vSock proxy error: {}", e);
-                }
-            }
-            None => {
-                eprintln!("⚠️  vSock connection failed after 30 attempts.");
-                eprintln!("   Falling back to NAT TCP (guest must have a DHCP IP).");
-            }
-        }
+        run_tcp_vsock_proxy(engine, vsock_port);
     });
 
     println!("🔄 Daemon handing control to macOS CFRunLoop. Press Ctrl+C to stop.");
@@ -107,52 +72,193 @@ fn main() {
 }
 
 // =====================================================================
-// SYNTAX BREAKDOWN: TCP-to-vSock Proxy
+// TCP-to-vSock Async Proxy (per-connection vSock)
 // =====================================================================
-// The CLI connects to 127.0.0.1:10000 (localhost). We accept the
-// connection and bidirectionally copy bytes between the CLI's TCP
-// socket and the vSock file descriptor that points into the Linux VM.
-//
-// This is a simple single-connection proxy — good enough for the
-// current 1:1 CLI-to-agent model. For connection pooling or multiplexing,
-// this would need to be expanded into an async acceptor loop.
-fn run_tcp_vsock_proxy(vsock_fd: i32) -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::os::unix::io::FromRawFd;
+// For each CLI TCP connection to 127.0.0.1:10000, we open a NEW vSock
+// connection to the guest agent. This gives each CLI connection its own
+// isolated gRPC/HTTP/2 channel. The agent's VsockIncoming listener will
+// accept() each connection independently.
+fn run_tcp_vsock_proxy(engine: &'static Virtualizer, vsock_port: u32) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to build tokio runtime for proxy");
     
-    let listener = TcpListener::bind("127.0.0.1:10000")?;
-    // Allow rapid restart of the daemon without "Address already in use"
-    listener.set_nonblocking(false)?;
-    println!("✅ Local proxy listening on 127.0.0.1:10000");
-    
-    for stream in listener.incoming() {
-        let mut tcp_stream = stream?;
+    rt.block_on(async move {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:10000").await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("❌ Failed to bind proxy: {}", e);
+                return;
+            }
+        };
+        println!("✅ TCP→vSock proxy listening on 127.0.0.1:10000");
         
-        // Wrap the vSock fd into a Rust File for read/write.
-        // SAFETY: The fd was returned by VZVirtioSocketConnection and is
-        // valid for the lifetime of the VM. We use `dup()` to avoid
-        // closing the original fd when this File is dropped.
-        let dup_fd = unsafe { libc::dup(vsock_fd) };
-        if dup_fd < 0 {
-            eprintln!("❌ Failed to dup vSock fd");
-            continue;
+        loop {
+            let (tcp_stream, addr) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    eprintln!("❌ Accept error: {}", e);
+                    continue;
+                }
+            };
+            
+            println!("📥 CLI connected from {}", addr);
+            
+            // Open a FRESH vSock connection for this CLI session.
+            // connect_vsock dispatches to the main thread via GCD.
+            let vsock_fd = match engine.connect_vsock(vsock_port) {
+                Ok(fd) => {
+                    println!("   🔗 New vSock connection fd={}", fd);
+                    fd
+                }
+                Err(e) => {
+                    eprintln!("   ❌ vSock connect failed: {}", e);
+                    continue;
+                }
+            };
+            
+            // Set non-blocking for async I/O
+            unsafe {
+                let flags = libc::fcntl(vsock_fd, libc::F_GETFL);
+                libc::fcntl(vsock_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+            
+            // Wrap in our async VsockStream
+            let vsock_stream = match VsockStream::new(vsock_fd) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("   ❌ VsockStream error: {}", e);
+                    unsafe { libc::close(vsock_fd); }
+                    continue;
+                }
+            };
+            
+            // Spawn a task to bidirectionally copy bytes: TCP ↔ vSock
+            tokio::spawn(async move {
+                let (mut tcp_read, mut tcp_write) = tokio::io::split(tcp_stream);
+                let (mut vsock_read, mut vsock_write) = tokio::io::split(vsock_stream);
+                
+                let t1 = tokio::spawn(async move {
+                    let _ = tokio::io::copy(&mut tcp_read, &mut vsock_write).await;
+                });
+                let t2 = tokio::spawn(async move {
+                    let _ = tokio::io::copy(&mut vsock_read, &mut tcp_write).await;
+                });
+                
+                let _ = tokio::try_join!(t1, t2);
+                println!("📤 CLI disconnected from {}", addr);
+            });
         }
-        let mut vsock_stream = unsafe { std::fs::File::from_raw_fd(dup_fd) };
-        
-        // Bidirectional copy: TCP ↔ vSock
-        let mut tcp_clone = tcp_stream.try_clone()?;
-        let mut vsock_clone = vsock_stream.try_clone()?;
-        
-        // Forward TCP → vSock in a thread
-        let t1 = std::thread::spawn(move || {
-            let _ = std::io::copy(&mut tcp_stream, &mut vsock_stream);
-        });
-        
-        // Forward vSock → TCP in this thread
-        let _ = std::io::copy(&mut vsock_clone, &mut tcp_clone);
-        let _ = t1.join();
+    });
+}
+
+// =====================================================================
+// VsockStream: AsyncRead + AsyncWrite wrapper for any raw fd
+// =====================================================================
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+struct VsockStream {
+    inner: tokio::io::unix::AsyncFd<RawFdWrapper>,
+}
+
+struct RawFdWrapper(RawFd);
+
+impl AsRawFd for RawFdWrapper {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
+
+impl VsockStream {
+    fn new(fd: RawFd) -> std::io::Result<Self> {
+        let inner = tokio::io::unix::AsyncFd::new(RawFdWrapper(fd))?;
+        Ok(Self { inner })
+    }
+}
+
+impl Drop for VsockStream {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.inner.as_raw_fd()); }
+    }
+}
+
+impl tokio::io::AsyncRead for VsockStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            let mut guard = match self.inner.poll_read_ready(cx) {
+                Poll::Ready(Ok(guard)) => guard,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            };
+            
+            let fd = self.inner.as_raw_fd();
+            let unfilled = buf.initialize_unfilled();
+            let n = unsafe {
+                libc::read(fd, unfilled.as_mut_ptr() as *mut libc::c_void, unfilled.len())
+            };
+            
+            if n >= 0 {
+                buf.advance(n as usize);
+                return Poll::Ready(Ok(()));
+            } else {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    guard.clear_ready();
+                    continue;
+                }
+                return Poll::Ready(Err(err));
+            }
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for VsockStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        loop {
+            let mut guard = match self.inner.poll_write_ready(cx) {
+                Poll::Ready(Ok(guard)) => guard,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            };
+            
+            let fd = self.inner.as_raw_fd();
+            let n = unsafe {
+                libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len())
+            };
+            
+            if n >= 0 {
+                return Poll::Ready(Ok(n as usize));
+            } else {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    guard.clear_ready();
+                    continue;
+                }
+                return Poll::Ready(Err(err));
+            }
+        }
     }
     
-    Ok(())
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let fd = self.inner.as_raw_fd();
+        unsafe { libc::shutdown(fd, libc::SHUT_WR); }
+        Poll::Ready(Ok(()))
+    }
 }
+
+impl Unpin for VsockStream {}

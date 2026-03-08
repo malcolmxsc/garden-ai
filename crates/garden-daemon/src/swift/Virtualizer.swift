@@ -124,7 +124,7 @@ public class GardenVirtualizer: NSObject {
     // =====================================================================
     // After the VM boots we connect to the guest agent over vSock.
     // The file descriptor is stored here so Rust can retrieve it via FFI.
-    private var vsockConnection: VZVirtioSocketConnection?
+    private var vsockConnections: [VZVirtioSocketConnection] = []
     private var vsockFd: Int32 = -1
     
     // =====================================================================
@@ -162,9 +162,14 @@ public class GardenVirtualizer: NSObject {
             socketDevice.connect(toPort: port) { result in
                 switch result {
                 case .success(let connection):
-                    self.vsockConnection = connection
-                    resultFd = connection.fileDescriptor
-                    print("✅ [Swift] vSock connected to guest on port \(port), fd=\(resultFd)")
+                    // Store the connection to prevent ARC from deallocating it
+                    // (which would close the fd). We keep ALL connections alive.
+                    self.vsockConnections.append(connection)
+                    // Dup the fd so Rust owns an independent copy.
+                    // This way even if Swift closes the original, Rust's copy stays valid.
+                    let dupFd = dup(connection.fileDescriptor)
+                    resultFd = dupFd
+                    print("✅ [Swift] vSock connected to guest on port \(port), fd=\(connection.fileDescriptor) (dup'd to \(dupFd))")
                     fflush(stdout)
                 case .failure(let error):
                     print("❌ [Swift] vSock connection failed: \(error)")
