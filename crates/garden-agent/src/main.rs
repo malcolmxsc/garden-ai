@@ -151,7 +151,7 @@ async fn main() -> anyhow::Result<()> {
         // are AF_VSOCK, not AF_INET. Instead, we manually accept()
         // and convert each connection into a UnixStream (which works
         // for any SOCK_STREAM file descriptor).
-        let incoming = VsockIncoming::new(vsock_listener_fd);
+        let incoming = VsockIncoming::new(vsock_listener_fd)?;
         
         Server::builder()
             .add_service(AgentServiceServer::new(agent))
@@ -248,66 +248,182 @@ fn create_vsock_listener(port: u32) -> anyhow::Result<i32> {
 }
 
 // =====================================================================
-// SYNTAX BREAKDOWN: VsockIncoming — Custom Stream for tonic
+// VsockStream: AsyncRead + AsyncWrite wrapper for AF_VSOCK fds
 // =====================================================================
-// tonic's `serve_with_incoming` requires a `Stream` that yields
-// items implementing `AsyncRead + AsyncWrite + Connected + Unpin`.
-// `tokio::net::UnixStream` satisfies all of these and works with
-// any SOCK_STREAM file descriptor (not just AF_UNIX — AF_VSOCK too).
+// Uses `tokio::io::unix::AsyncFd` which registers the fd with the tokio
+// reactor (epoll on Linux). This works for ANY pollable fd, including
+// AF_VSOCK accepted connections.
 //
-// This struct wraps a raw AF_VSOCK listener fd and yields accepted
-// connections as `UnixStream`s.
+// We can NOT use `tokio::net::UnixStream` because it expects AF_UNIX
+// sockets and rejects AF_VSOCK fds.
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::net::UnixStream;
 
+struct VsockStream {
+    inner: tokio::io::unix::AsyncFd<RawFdWrapper>,
+}
+
+struct RawFdWrapper(RawFd);
+
+impl AsRawFd for RawFdWrapper {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
+
+impl VsockStream {
+    fn new(fd: RawFd) -> std::io::Result<Self> {
+        // Set non-blocking
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        let inner = tokio::io::unix::AsyncFd::new(RawFdWrapper(fd))?;
+        Ok(Self { inner })
+    }
+}
+
+impl Drop for VsockStream {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.inner.as_raw_fd()); }
+    }
+}
+
+// Required by tonic's serve_with_incoming
+impl tonic::transport::server::Connected for VsockStream {
+    type ConnectInfo = ();
+    fn connect_info(&self) -> Self::ConnectInfo {}
+}
+
+impl tokio::io::AsyncRead for VsockStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            let mut guard = match self.inner.poll_read_ready(cx) {
+                Poll::Ready(Ok(guard)) => guard,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            };
+            
+            let fd = self.inner.as_raw_fd();
+            let unfilled = buf.initialize_unfilled();
+            let n = unsafe {
+                libc::read(fd, unfilled.as_mut_ptr() as *mut libc::c_void, unfilled.len())
+            };
+            
+            if n >= 0 {
+                buf.advance(n as usize);
+                return Poll::Ready(Ok(()));
+            } else {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    guard.clear_ready();
+                    continue;
+                }
+                return Poll::Ready(Err(err));
+            }
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for VsockStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        loop {
+            let mut guard = match self.inner.poll_write_ready(cx) {
+                Poll::Ready(Ok(guard)) => guard,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            };
+            
+            let fd = self.inner.as_raw_fd();
+            let n = unsafe {
+                libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len())
+            };
+            
+            if n >= 0 {
+                return Poll::Ready(Ok(n as usize));
+            } else {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    guard.clear_ready();
+                    continue;
+                }
+                return Poll::Ready(Err(err));
+            }
+        }
+    }
+    
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let fd = self.inner.as_raw_fd();
+        unsafe { libc::shutdown(fd, libc::SHUT_WR); }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl Unpin for VsockStream {}
+
+// =====================================================================
+// VsockIncoming: Stream of accepted vSock connections for tonic
+// =====================================================================
 struct VsockIncoming {
-    listener_fd: i32,
+    listener: tokio::io::unix::AsyncFd<RawFdWrapper>,
 }
 
 impl VsockIncoming {
-    fn new(listener_fd: i32) -> Self {
-        // Set the listener to non-blocking so tokio can poll it
+    fn new(listener_fd: i32) -> std::io::Result<Self> {
+        // Set the listener to non-blocking for epoll
         unsafe {
             let flags = libc::fcntl(listener_fd, libc::F_GETFL);
             libc::fcntl(listener_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
-        Self { listener_fd }
+        let listener = tokio::io::unix::AsyncFd::new(RawFdWrapper(listener_fd))?;
+        Ok(Self { listener })
     }
 }
 
 impl futures_core::Stream for VsockIncoming {
-    type Item = Result<UnixStream, std::io::Error>;
+    type Item = Result<VsockStream, std::io::Error>;
     
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // Try to accept a connection
-        let conn_fd = unsafe {
-            libc::accept(self.listener_fd, std::ptr::null_mut(), std::ptr::null_mut())
-        };
-        
-        if conn_fd >= 0 {
-            // Successfully accepted — wrap as a UnixStream
-            let std_stream = unsafe {
-                use std::os::unix::io::FromRawFd;
-                std::os::unix::net::UnixStream::from_raw_fd(conn_fd)
+        loop {
+            let mut guard = match self.listener.poll_read_ready(cx) {
+                Poll::Ready(Ok(guard)) => guard,
+                Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                Poll::Pending => return Poll::Pending,
             };
-            std_stream.set_nonblocking(true)?;
-            let tokio_stream = UnixStream::from_std(std_stream)?;
-            Poll::Ready(Some(Ok(tokio_stream)))
-        } else {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::WouldBlock {
-                // No connection pending — register for wake-up.
-                // We use a simple timer-based poll since we can't easily
-                // register vSock fds with epoll via tokio's reactor.
-                let waker = cx.waker().clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    waker.wake();
-                });
-                Poll::Pending
+            
+            let conn_fd = unsafe {
+                libc::accept(self.listener.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut())
+            };
+            
+            if conn_fd >= 0 {
+                tracing::info!("📥 Accepted vSock connection, fd={}", conn_fd);
+                match VsockStream::new(conn_fd) {
+                    Ok(stream) => return Poll::Ready(Some(Ok(stream))),
+                    Err(e) => {
+                        unsafe { libc::close(conn_fd); }
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                }
             } else {
-                Poll::Ready(Some(Err(err)))
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    guard.clear_ready();
+                    continue;
+                }
+                return Poll::Ready(Some(Err(err)));
             }
         }
     }
