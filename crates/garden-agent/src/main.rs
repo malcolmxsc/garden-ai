@@ -84,15 +84,24 @@ impl AgentService for GardenAgentImpl {
         request: Request<CommandRequest>,
     ) -> Result<Response<CommandResponse>, Status> {
         let req = request.into_inner();
-        tracing::info!("Executing command: {} {:?} (cwd={})", req.command, req.args, req.cwd);
-
-        let cwd = if req.cwd.is_empty() { "/" } else { &req.cwd };
+        
+        // Ensure cwd is relative to the sandbox and prevents traversal
+        let relative_cwd = req.cwd.trim_start_matches('/');
+        if relative_cwd.contains("..") {
+            tracing::error!("Path traversal attempt blocked: cwd={}", req.cwd);
+            return Err(Status::invalid_argument("Path traversal ('..') is not allowed inside the sandbox"));
+        }
+        
+        let target_cwd = std::path::Path::new("/workspace").join(relative_cwd);
+        let cwd_str = target_cwd.to_string_lossy();
+        
+        tracing::info!("Executing command: {} {:?} (cwd={})", req.command, req.args, cwd_str);
 
         // Use tokio::process::Command for non-blocking child process management.
         // This integrates with tokio's reactor and handles waitpid internally.
         let output = tokio::process::Command::new(&req.command)
             .args(&req.args)
-            .current_dir(cwd)
+            .current_dir(&target_cwd)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output()
@@ -141,6 +150,27 @@ async fn async_main() -> anyhow::Result<()> {
     let _ = std::process::Command::new("/bin/busybox").args(["mount", "-t", "sysfs", "sys", "/sys"]).status();
     let _ = std::process::Command::new("/bin/busybox").args(["mount", "-t", "devtmpfs", "dev", "/dev"]).status();
     tracing::info!("Mounted /proc, /sys, /dev");
+
+    // 0.2. Mount the VirtioFS Workspace
+    // =========================================================
+    // The macOS host shares ~/GardenBox via VirtioFS with the tag "garden_workspace".
+    // FUSE and VirtioFS are compiled directly into the custom Linux kernel,
+    // so no modprobe or external modules are required!
+    let _ = std::fs::create_dir_all("/workspace");
+    let workspace_mount = std::process::Command::new("/bin/busybox")
+        .args(["mount", "-t", "virtiofs", "garden_workspace", "/workspace"])
+        .output();
+    match workspace_mount {
+        Ok(out) if out.status.success() => {
+            tracing::info!("✅ Mounted VirtioFS workspace at /workspace");
+        }
+        Ok(out) => {
+            tracing::error!("❌ Failed to mount VirtioFS workspace: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        Err(e) => {
+            tracing::error!("❌ Failed to execute mount for VirtioFS: {}", e);
+        }
+    }
 
     // 0.5. Create BusyBox symlinks so commands like "echo", "ls" work
     // =========================================================
