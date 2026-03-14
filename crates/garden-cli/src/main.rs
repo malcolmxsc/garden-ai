@@ -76,12 +76,8 @@ enum Commands {
         id: Option<String>,
     },
 
-    /// Start the MCP server for AI client connections
-    Serve {
-        /// Port for the SSE transport
-        #[arg(long, default_value = "3000")]
-        port: u16,
-    },
+    /// Start the MCP server for AI client connections (stdio transport)
+    Serve,
 }
 
 #[tokio::main]
@@ -183,13 +179,9 @@ async fn main() -> anyhow::Result<()> {
             // TODO: Send Stop request via IPC
             println!("🌿 Sandbox stopped.");
         }
-        Commands::Serve { port } => {
-            tracing::info!(port = port, "Starting MCP server...");
-            garden_mcp::server::start_server(garden_mcp::server::McpServerConfig {
-                sse_port: Some(port),
-                ..Default::default()
-            })
-            .await?;
+        Commands::Serve => {
+            garden_mcp::server::start_server(garden_mcp::server::McpServerConfig::default())
+                .await?;
         }
     }
 
