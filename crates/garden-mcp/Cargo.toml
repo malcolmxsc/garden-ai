@@ -13,3 +13,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+tonic = "0.11"
+futures = "0.3"
+schemars = "1"
