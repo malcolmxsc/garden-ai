@@ -7,13 +7,16 @@ description = "eBPF security daemon for Garden AI (userspace loader, runs inside
 
 [dependencies]
 garden-common = { path = "../garden-common" }
+garden-ebpf-common = { path = "../garden-ebpf-common", features = ["user"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+glob = { workspace = true }
 
 # eBPF dependencies are Linux-only
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { workspace = true }
 aya-log = { workspace = true }
+bytes = { workspace = true }

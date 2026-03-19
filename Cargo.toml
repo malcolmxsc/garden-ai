@@ -4,7 +4,9 @@ members = [
     "crates/garden-mcp",
     "crates/garden-cli",
     "crates/garden-ebpf",
-    "crates/garden-common", "crates/garden-agent",
+    "crates/garden-ebpf-common",
+    "crates/garden-common",
+    "crates/garden-agent",
 ]
 resolver = "2"
 
@@ -43,3 +45,7 @@ reqwest = { version = "0.12", features = ["stream", "rustls-tls"] }
 # eBPF (Linux-only)
 aya = "0.12"
 aya-log = "0.2"
+
+# Telemetry utilities
+bytes = "1"
+glob = "0.3"

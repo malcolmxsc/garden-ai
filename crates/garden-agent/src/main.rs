@@ -252,6 +252,99 @@ async fn async_main() -> anyhow::Result<()> {
         }
     });
 
+    // 3.5. Mount debugfs and bpffs for eBPF tracepoint attachment
+    // =========================================================
+    let _ = std::fs::create_dir_all("/sys/kernel/debug");
+    let _ = std::process::Command::new("/bin/busybox")
+        .args(["mount", "-t", "debugfs", "debugfs", "/sys/kernel/debug"])
+        .status();
+    let _ = std::fs::create_dir_all("/sys/fs/bpf");
+    let _ = std::process::Command::new("/bin/busybox")
+        .args(["mount", "-t", "bpf", "bpf", "/sys/fs/bpf"])
+        .status();
+    tracing::info!("Mounted debugfs and bpffs for eBPF");
+
+    // 3.6. Start eBPF security tracer
+    // =========================================================
+    let default_policy = garden_ebpf::policy::SecurityPolicy::default_observe();
+
+    match garden_ebpf::tracer::start_tracer(&default_policy).await {
+        Ok((handle, mut rx)) => {
+            tracing::info!("eBPF tracer started successfully");
+            // Leak the handle so programs stay attached for VM lifetime
+            std::mem::forget(handle);
+
+            // 3.7. Spawn telemetry vSock sender on port 6001
+            // =============================================================
+            // Streams SecurityEvents as NDJSON to the host daemon.
+            // Supports reconnection — if the host disconnects, we go back
+            // to the accept loop.
+            tokio::spawn(async move {
+                let listener_fd = match create_vsock_listener(6001) {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        tracing::error!("Failed to create telemetry vSock listener on port 6001: {}", e);
+                        return;
+                    }
+                };
+                tracing::info!("Telemetry vSock listener ready on port 6001");
+
+                loop {
+                    // Accept a telemetry consumer (the host daemon)
+                    let conn_fd = unsafe {
+                        libc::accept(listener_fd, std::ptr::null_mut(), std::ptr::null_mut())
+                    };
+                    if conn_fd < 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        continue;
+                    }
+                    tracing::info!("Telemetry consumer connected, fd={}", conn_fd);
+
+                    // Set non-blocking for async writes
+                    unsafe {
+                        let flags = libc::fcntl(conn_fd, libc::F_GETFL);
+                        libc::fcntl(conn_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                    }
+
+                    // Stream events to this consumer until it disconnects
+                    loop {
+                        match rx.recv().await {
+                            Some(event) => {
+                                let mut json = match serde_json::to_string(&event) {
+                                    Ok(j) => j,
+                                    Err(_) => continue,
+                                };
+                                json.push('\n');
+
+                                let written = unsafe {
+                                    libc::write(
+                                        conn_fd,
+                                        json.as_ptr() as *const libc::c_void,
+                                        json.len(),
+                                    )
+                                };
+                                if written < 0 {
+                                    tracing::warn!("Telemetry consumer disconnected");
+                                    unsafe { libc::close(conn_fd); }
+                                    break;
+                                }
+                            }
+                            None => {
+                                tracing::warn!("Telemetry event channel closed");
+                                unsafe { libc::close(conn_fd); }
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        Err(e) => {
+            tracing::error!("Failed to start eBPF tracer (non-fatal): {}", e);
+            tracing::warn!("Continuing without security telemetry");
+        }
+    }
+
     // 4. Start gRPC AgentService
     // =========================================================
     let agent = GardenAgentImpl::default();
