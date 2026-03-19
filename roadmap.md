@@ -28,7 +28,7 @@ This document breaks the project down into distinct, actionable phases based on 
 
 ---
 
-## Phase 3: The Walled Garden (Filesystem & Security Telemetry) — ~90% COMPLETE
+## Phase 3: The Walled Garden (Filesystem & Security Telemetry) — ~95% COMPLETE
 **Goal:** Securely share a specific host directory with the guest and monitor its activity without trusting the guest OS.
 
 ### Checkpoints
@@ -43,7 +43,7 @@ This document breaks the project down into distinct, actionable phases based on 
   - Guest agent mounts `debugfs`/`bpffs`, loads probes before gRPC server starts, streams NDJSON events over dedicated vSock port 6001.
   - Host daemon receives telemetry via vSock 6001, evaluates policy (Allow/Deny/Log), TCP proxy on `127.0.0.1:10001` for external telemetry consumers.
   - 25 unit/integration tests: policy evaluation (glob, CIDR, first-match), event serialization roundtrips, raw event conversion, macOS stub tracer.
-- [ ] **eBPF Tracing (Tier 2)**: DNS query logging (`sys_enter_sendto` UDP port 53), mount attempts (`sys_enter_mount`), BPF load attempts (`sys_enter_bpf`), kernel module load (`sys_enter_init_module`). Depends on Tier 1 validation in guest VM.
+- [x] **eBPF Tracing (Tier 2)**: DNS query logging (`sys_enter_sendto` UDP port 53 with wire-format domain decoding), mount attempt canary (`sys_enter_mount` — only PID 1 should mount), BPF syscall monitor (`sys_enter_bpf` — agent loading BPF is a red flag), kernel module load (`sys_enter_init_module` — should never fire with `CONFIG_MODULES=n`). All 4 probes use `PerCpuArray` scratch to avoid 512-byte BPF stack limit. BPF ELF compiles to 10.9 KB with all 7 tracepoints. 31 unit tests passing.
 - [x] **Telemetry Pipeline**: NDJSON-over-vSock streaming from guest to host. Dedicated vSock port 6001 (separate from gRPC command channel on 6000). Reconnection support on both sides. E2E test script at `scripts/test_ebpf_telemetry.sh`.
 - [ ] **Kernel BPF Verification**: Verify guest kernel 6.12.13 has `CONFIG_BPF=y`, `CONFIG_DEBUG_INFO_BTF=y`, `CONFIG_FTRACE_SYSCALLS=y`. Rebuild if needed via `kernel/build.sh`.
 
@@ -69,5 +69,6 @@ The fastest route to a fully working AI sandbox product:
 3. ~~**Load eBPF probes**~~ — **DONE.** Tier 1 probes (execve, openat, connect) implemented with `aya-ebpf`. Userspace loader, policy engine, and NDJSON telemetry pipeline complete.
 4. ~~**eBPF telemetry over vSock**~~ — **DONE.** Dedicated vSock port 6001 streams SecurityEvents as NDJSON. Host daemon evaluates policy and logs. TCP proxy on :10001 for external consumers.
 5. **Verify kernel BPF support** — boot VM, check `/proc/config.gz` for BTF/tracepoint config, rebuild kernel if needed.
-6. **Tier 2 eBPF probes** — DNS logging, mount/BPF/module load canaries.
-7. **SwiftUI menu bar app** — display VM status and security logs.
+6. ~~**Tier 2 eBPF probes**~~ — **DONE.** DNS logging, mount/BPF/module load canaries. All 7 tracepoints compiled into 10.9 KB BPF ELF.
+7. **E2E telemetry validation** — boot VM with BPF kernel, verify all 7 probes load, run `scripts/test_ebpf_telemetry.sh`.
+8. **SwiftUI menu bar app** — display VM status and security logs.

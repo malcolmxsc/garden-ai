@@ -17,6 +17,44 @@ pub struct TracerHandle {
     _ebpf: aya::Ebpf,
 }
 
+/// Decode a DNS query name from a raw DNS packet stored in `args`.
+///
+/// DNS wire format: 12-byte header, then length-prefixed labels.
+/// e.g., `\x07example\x03com\x00` → "example.com"
+fn decode_dns_query(raw: &[u8]) -> String {
+    // DNS header is 12 bytes; query name starts at offset 12
+    if raw.len() <= 12 {
+        return String::new();
+    }
+
+    let mut result = String::new();
+    let mut pos = 12;
+
+    // Safety: limit iterations to prevent infinite loops on malformed data
+    for _ in 0..64 {
+        if pos >= raw.len() {
+            break;
+        }
+        let label_len = raw[pos] as usize;
+        if label_len == 0 {
+            break;
+        }
+        pos += 1;
+        if pos + label_len > raw.len() {
+            break;
+        }
+        if !result.is_empty() {
+            result.push('.');
+        }
+        if let Ok(label) = core::str::from_utf8(&raw[pos..pos + label_len]) {
+            result.push_str(label);
+        }
+        pos += label_len;
+    }
+
+    result
+}
+
 /// Convert a raw BPF event to a typed `SecurityEvent`.
 fn convert_raw_event(raw: &RawSecurityEvent) -> Option<SecurityEvent> {
     let kind_enum = EventKind::from_u32(raw.kind)?;
@@ -46,11 +84,24 @@ fn convert_raw_event(raw: &RawSecurityEvent) -> Option<SecurityEvent> {
                 allowed: true,
             }
         }
-        // Tier 2 events — placeholder for future probes
-        _ => SecurityEventKind::SyscallTrace {
-            syscall_nr: raw.kind as u64,
-            syscall_name: format!("{:?}", kind_enum),
-            allowed: true,
+        EventKind::DnsQuery => {
+            let ip = raw.dest_ip.to_be_bytes();
+            SecurityEventKind::DnsQuery {
+                server_ip: format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
+                domain: decode_dns_query(&raw.args),
+            }
+        }
+        EventKind::Mount => SecurityEventKind::MountAttempt {
+            target: bytes_to_str(&raw.path).to_string(),
+            source: bytes_to_str(&raw.args).to_string(),
+            flags: raw.flags,
+        },
+        EventKind::BpfLoad => SecurityEventKind::BpfSyscall {
+            cmd: raw.flags,
+        },
+        EventKind::ModuleLoad => SecurityEventKind::ModuleLoad {
+            size: raw.flags,
+            args: bytes_to_str(&raw.args).to_string(),
         },
     };
 
@@ -97,11 +148,17 @@ pub async fn start_tracer(
         tracing::warn!("Failed to init eBPF logger (non-fatal): {}", e);
     }
 
-    // 3. Attach Tier 1 tracepoints
+    // 3. Attach tracepoints (Tier 1 + Tier 2)
     let probes = [
+        // Tier 1
         ("trace_execve", "syscalls", "sys_enter_execve"),
         ("trace_openat", "syscalls", "sys_enter_openat"),
         ("trace_connect", "syscalls", "sys_enter_connect"),
+        // Tier 2
+        ("trace_sendto", "syscalls", "sys_enter_sendto"),
+        ("trace_mount", "syscalls", "sys_enter_mount"),
+        ("trace_bpf", "syscalls", "sys_enter_bpf"),
+        ("trace_init_module", "syscalls", "sys_enter_init_module"),
     ];
 
     for (name, category, tracepoint) in &probes {
@@ -167,7 +224,7 @@ pub async fn start_tracer(
         });
     }
 
-    tracing::info!("eBPF tracer started — monitoring execve, openat, connect");
+    tracing::info!("eBPF tracer started — monitoring execve, openat, connect, sendto, mount, bpf, init_module");
 
     Ok((TracerHandle { _ebpf: ebpf }, rx))
 }
@@ -263,5 +320,101 @@ mod tests {
         let mut raw = RawSecurityEvent::zeroed();
         raw.kind = 255; // invalid
         assert!(convert_raw_event(&raw).is_none());
+    }
+
+    #[test]
+    fn test_decode_dns_query() {
+        // DNS wire format: 12-byte header + "\x07example\x03com\x00"
+        let mut raw = [0u8; 256];
+        // Skip 12-byte header (zeros)
+        raw[12] = 7; // length of "example"
+        raw[13..20].copy_from_slice(b"example");
+        raw[20] = 3; // length of "com"
+        raw[21..24].copy_from_slice(b"com");
+        raw[24] = 0; // terminator
+
+        assert_eq!(decode_dns_query(&raw), "example.com");
+    }
+
+    #[test]
+    fn test_decode_dns_query_empty() {
+        let raw = [0u8; 10]; // too short for DNS header
+        assert_eq!(decode_dns_query(&raw), "");
+    }
+
+    #[test]
+    fn test_convert_dns_event() {
+        let mut raw = RawSecurityEvent::zeroed();
+        raw.kind = EventKind::DnsQuery as u32;
+        raw.pid = 300;
+        raw.comm[..7].copy_from_slice(b"resolv ");
+        raw.dest_ip = u32::from_be_bytes([8, 8, 8, 8]);
+        raw.dest_port = 53;
+        raw.protocol = 17; // UDP
+        // DNS payload: header (12 bytes) + \x07example\x03com\x00
+        raw.args[12] = 7;
+        raw.args[13..20].copy_from_slice(b"example");
+        raw.args[20] = 3;
+        raw.args[21..24].copy_from_slice(b"com");
+
+        let event = convert_raw_event(&raw).unwrap();
+        if let SecurityEventKind::DnsQuery { server_ip, domain } = &event.kind {
+            assert_eq!(server_ip, "8.8.8.8");
+            assert_eq!(domain, "example.com");
+        } else {
+            panic!("expected DnsQuery");
+        }
+    }
+
+    #[test]
+    fn test_convert_mount_event() {
+        let mut raw = RawSecurityEvent::zeroed();
+        raw.kind = EventKind::Mount as u32;
+        raw.pid = 1;
+        raw.comm[..4].copy_from_slice(b"init");
+        raw.path[..4].copy_from_slice(b"/mnt");
+        raw.args[..8].copy_from_slice(b"/dev/vda");
+        raw.flags = 0;
+
+        let event = convert_raw_event(&raw).unwrap();
+        if let SecurityEventKind::MountAttempt { target, source, flags } = &event.kind {
+            assert_eq!(target, "/mnt");
+            assert_eq!(source, "/dev/vda");
+            assert_eq!(*flags, 0);
+        } else {
+            panic!("expected MountAttempt");
+        }
+    }
+
+    #[test]
+    fn test_convert_bpf_event() {
+        let mut raw = RawSecurityEvent::zeroed();
+        raw.kind = EventKind::BpfLoad as u32;
+        raw.pid = 500;
+        raw.comm[..5].copy_from_slice(b"agent");
+        raw.flags = 5; // BPF_PROG_LOAD
+
+        let event = convert_raw_event(&raw).unwrap();
+        if let SecurityEventKind::BpfSyscall { cmd } = &event.kind {
+            assert_eq!(*cmd, 5);
+        } else {
+            panic!("expected BpfSyscall");
+        }
+    }
+
+    #[test]
+    fn test_convert_module_load_event() {
+        let mut raw = RawSecurityEvent::zeroed();
+        raw.kind = EventKind::ModuleLoad as u32;
+        raw.pid = 600;
+        raw.comm[..6].copy_from_slice(b"insmod");
+        raw.flags = 4096; // module size
+
+        let event = convert_raw_event(&raw).unwrap();
+        if let SecurityEventKind::ModuleLoad { size, .. } = &event.kind {
+            assert_eq!(*size, 4096);
+        } else {
+            panic!("expected ModuleLoad");
+        }
     }
 }

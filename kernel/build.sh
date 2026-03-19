@@ -36,7 +36,7 @@ docker run --rm \
         apt-get update -qq
         apt-get install -y -qq \
             gcc-aarch64-linux-gnu make flex bison libssl-dev bc \
-            wget xz-utils > /dev/null 2>&1
+            wget xz-utils dwarves libelf-dev > /dev/null 2>&1
         
         echo '⬇️  Downloading Linux ${KERNEL_VERSION} source...'
         wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VERSION}.tar.xz
@@ -55,6 +55,9 @@ docker run --rm \
         
         echo '🔍 Verifying vSock config...'
         grep -E 'VSOCK|VIRTIO_VSOCK' .config
+
+        echo '🔍 Verifying eBPF config...'
+        grep -E 'CONFIG_BPF=|CONFIG_BPF_SYSCALL=|CONFIG_BPF_JIT=|CONFIG_TRACEPOINTS=|CONFIG_FTRACE_SYSCALLS=|CONFIG_PERF_EVENTS=|CONFIG_DEBUG_INFO_BTF=' .config
         
         echo ''
         echo '🔨 Building kernel (this takes ~5-10 minutes)...'

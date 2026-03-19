@@ -8,6 +8,9 @@ members = [
     "crates/garden-common",
     "crates/garden-agent",
 ]
+exclude = [
+    "crates/garden-ebpf-probes",
+]
 resolver = "2"
 
 [workspace.package]

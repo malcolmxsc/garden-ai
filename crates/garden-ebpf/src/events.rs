@@ -38,6 +38,34 @@ pub enum SecurityEventKind {
         args: Vec<String>,
         allowed: bool,
     },
+    /// A DNS query was sent (UDP port 53).
+    DnsQuery {
+        /// DNS server IP address.
+        server_ip: String,
+        /// Raw DNS query domain (decoded from wire format).
+        domain: String,
+    },
+    /// A mount syscall was invoked — escape canary.
+    MountAttempt {
+        /// Mount target directory.
+        target: String,
+        /// Device or source being mounted.
+        source: String,
+        /// Mount flags.
+        flags: u32,
+    },
+    /// A BPF syscall was invoked — red flag if from agent.
+    BpfSyscall {
+        /// BPF command (0=MAP_CREATE, 5=PROG_LOAD, etc.).
+        cmd: u32,
+    },
+    /// A kernel module load was attempted — should never fire.
+    ModuleLoad {
+        /// Module size in bytes.
+        size: u32,
+        /// Module arguments if any.
+        args: String,
+    },
     /// A syscall was invoked that matches a security policy.
     SyscallTrace {
         syscall_nr: u64,
@@ -116,6 +144,20 @@ mod tests {
                 binary: "/bin/ls".into(),
                 args: vec!["-la".into()],
                 allowed: true,
+            },
+            SecurityEventKind::DnsQuery {
+                server_ip: "8.8.8.8".into(),
+                domain: "example.com".into(),
+            },
+            SecurityEventKind::MountAttempt {
+                target: "/mnt".into(),
+                source: "/dev/vda".into(),
+                flags: 0,
+            },
+            SecurityEventKind::BpfSyscall { cmd: 5 },
+            SecurityEventKind::ModuleLoad {
+                size: 4096,
+                args: "".into(),
             },
             SecurityEventKind::SyscallTrace {
                 syscall_nr: 59,
