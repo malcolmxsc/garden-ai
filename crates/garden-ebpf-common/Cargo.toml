@@ -1,0 +1,15 @@
+[package]
+name = "garden-ebpf-common"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Shared #[repr(C)] types between eBPF kernel probes and userspace loader"
+
+[features]
+default = []
+# Enable serde support for userspace (not available in no_std BPF programs)
+user = ["dep:serde", "dep:serde_json"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }

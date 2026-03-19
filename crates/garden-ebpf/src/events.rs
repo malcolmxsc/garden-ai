@@ -45,3 +45,93 @@ pub enum SecurityEventKind {
         allowed: bool,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_security_event_json_roundtrip() {
+        let event = SecurityEvent {
+            timestamp_ns: 123456789,
+            pid: 42,
+            comm: "curl".into(),
+            kind: SecurityEventKind::NetworkConnect {
+                dest_ip: "93.184.216.34".into(),
+                dest_port: 443,
+                protocol: "tcp".into(),
+                allowed: true,
+            },
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: SecurityEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.pid, 42);
+        assert_eq!(parsed.comm, "curl");
+        assert_eq!(parsed.timestamp_ns, 123456789);
+        if let SecurityEventKind::NetworkConnect {
+            dest_ip, dest_port, ..
+        } = &parsed.kind
+        {
+            assert_eq!(dest_ip, "93.184.216.34");
+            assert_eq!(*dest_port, 443);
+        } else {
+            panic!("wrong event kind");
+        }
+    }
+
+    #[test]
+    fn test_ndjson_multiline_parsing() {
+        let lines = concat!(
+            r#"{"timestamp_ns":1,"pid":1,"comm":"ls","kind":{"type":"file_access","path":"/tmp","flags":0,"allowed":true}}"#,
+            "\n",
+            r#"{"timestamp_ns":2,"pid":2,"comm":"curl","kind":{"type":"network_connect","dest_ip":"1.2.3.4","dest_port":80,"protocol":"tcp","allowed":true}}"#,
+            "\n",
+            r#"{"timestamp_ns":3,"pid":3,"comm":"sh","kind":{"type":"process_exec","binary":"/bin/sh","args":["-c","echo"],"allowed":true}}"#,
+        );
+        let events: Vec<SecurityEvent> = lines
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].pid, 1);
+        assert_eq!(events[1].pid, 2);
+        assert_eq!(events[2].pid, 3);
+    }
+
+    #[test]
+    fn test_all_event_kinds_serialize() {
+        let kinds = vec![
+            SecurityEventKind::FileAccess {
+                path: "/test".into(),
+                flags: 0,
+                allowed: true,
+            },
+            SecurityEventKind::NetworkConnect {
+                dest_ip: "1.2.3.4".into(),
+                dest_port: 80,
+                protocol: "tcp".into(),
+                allowed: false,
+            },
+            SecurityEventKind::ProcessExec {
+                binary: "/bin/ls".into(),
+                args: vec!["-la".into()],
+                allowed: true,
+            },
+            SecurityEventKind::SyscallTrace {
+                syscall_nr: 59,
+                syscall_name: "execve".into(),
+                allowed: true,
+            },
+        ];
+        for kind in kinds {
+            let event = SecurityEvent {
+                timestamp_ns: 0,
+                pid: 1,
+                comm: "test".into(),
+                kind,
+            };
+            let json = serde_json::to_string(&event).unwrap();
+            let _: SecurityEvent = serde_json::from_str(&json).unwrap();
+        }
+    }
+}

@@ -67,6 +67,18 @@ fn main() {
         run_tcp_vsock_proxy(engine, vsock_port);
     });
 
+    // 6. Start telemetry receiver (connects to guest eBPF vSock port 6001)
+    // =================================================================
+    // Also starts a TCP proxy on 127.0.0.1:10001 so external tools can
+    // tap the raw telemetry NDJSON stream.
+    println!("📊 Starting telemetry receiver (background thread)...");
+
+    std::thread::spawn(move || {
+        // Wait longer than gRPC proxy — eBPF probes load after gRPC server starts
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        run_telemetry_receiver(engine);
+    });
+
     println!("🔄 Daemon handing control to macOS CFRunLoop. Press Ctrl+C to stop.");
     Virtualizer::run_loop();
 }
@@ -151,6 +163,155 @@ fn run_tcp_vsock_proxy(engine: &'static Virtualizer, vsock_port: u32) {
             });
         }
     });
+}
+
+// =====================================================================
+// Telemetry Receiver (connects to guest eBPF vSock port 6001)
+// =====================================================================
+// Reads NDJSON SecurityEvent stream from the guest agent's eBPF tracer.
+// Also starts a TCP proxy on 127.0.0.1:10001 for external tools to tap
+// the raw telemetry stream.
+fn run_telemetry_receiver(engine: &'static Virtualizer) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to build tokio runtime for telemetry");
+
+    let policy = garden_ebpf::policy::SecurityPolicy::default_observe();
+
+    rt.block_on(async move {
+        // Also start a TCP proxy for telemetry on port 10001
+        // so external tools (socat, test scripts) can tap the stream
+        tokio::spawn(run_telemetry_tcp_proxy(engine));
+
+        loop {
+            println!("📊 Connecting to guest telemetry vSock port 6001...");
+
+            let vsock_fd = match engine.connect_vsock(6001) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    eprintln!("📊 Telemetry connect failed: {}, retrying in 2s...", e);
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+
+            println!("📊 Telemetry connected to guest, fd={}", vsock_fd);
+
+            // Set non-blocking for async I/O
+            unsafe {
+                let flags = libc::fcntl(vsock_fd, libc::F_GETFL);
+                libc::fcntl(vsock_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+
+            let stream = match VsockStream::new(vsock_fd) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("📊 VsockStream error: {}, retrying...", e);
+                    unsafe { libc::close(vsock_fd); }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+
+            // Read NDJSON lines and evaluate policy
+            process_telemetry_stream(stream, &policy).await;
+
+            println!("📊 Telemetry connection lost, reconnecting in 2s...");
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    });
+}
+
+async fn process_telemetry_stream(stream: VsockStream, policy: &garden_ebpf::policy::SecurityPolicy) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let reader = BufReader::new(stream);
+    let mut lines = reader.lines();
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        match serde_json::from_str::<garden_ebpf::events::SecurityEvent>(&line) {
+            Ok(event) => {
+                let action = policy.evaluate(&event);
+                match action {
+                    garden_ebpf::policy::PolicyAction::Deny => {
+                        eprintln!(
+                            "🚨 DENIED: pid={} comm={} {:?}",
+                            event.pid, event.comm, event.kind
+                        );
+                    }
+                    garden_ebpf::policy::PolicyAction::Log => {
+                        println!(
+                            "📊 [telemetry] pid={} comm={} {:?}",
+                            event.pid, event.comm, event.kind
+                        );
+                    }
+                    garden_ebpf::policy::PolicyAction::Allow => {
+                        // Silent pass — allowed events are not printed
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("📊 Failed to parse telemetry event: {} (line: {})", e, line);
+            }
+        }
+    }
+}
+
+/// TCP proxy for telemetry on 127.0.0.1:10001.
+/// External tools (socat, test scripts) can connect here to receive
+/// the raw NDJSON telemetry stream from the guest.
+async fn run_telemetry_tcp_proxy(engine: &'static Virtualizer) {
+    let listener = match tokio::net::TcpListener::bind("127.0.0.1:10001").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("📊 Failed to bind telemetry proxy on 10001: {}", e);
+            return;
+        }
+    };
+    println!("✅ Telemetry TCP proxy listening on 127.0.0.1:10001");
+
+    loop {
+        let (tcp_stream, addr) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                eprintln!("📊 Telemetry proxy accept error: {}", e);
+                continue;
+            }
+        };
+
+        println!("📊 Telemetry consumer connected from {}", addr);
+
+        let vsock_fd = match engine.connect_vsock(6001) {
+            Ok(fd) => fd,
+            Err(e) => {
+                eprintln!("📊 Telemetry vSock connect failed: {}", e);
+                continue;
+            }
+        };
+
+        unsafe {
+            let flags = libc::fcntl(vsock_fd, libc::F_GETFL);
+            libc::fcntl(vsock_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
+        let vsock_stream = match VsockStream::new(vsock_fd) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("📊 VsockStream error: {}", e);
+                unsafe { libc::close(vsock_fd); }
+                continue;
+            }
+        };
+
+        // One-directional copy: vSock → TCP (telemetry flows guest → host → consumer)
+        tokio::spawn(async move {
+            let (mut vsock_read, _) = tokio::io::split(vsock_stream);
+            let (_, mut tcp_write) = tokio::io::split(tcp_stream);
+            let _ = tokio::io::copy(&mut vsock_read, &mut tcp_write).await;
+            println!("📊 Telemetry consumer disconnected from {}", addr);
+        });
+    }
 }
 
 // =====================================================================
