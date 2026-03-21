@@ -18,5 +18,4 @@ glob = { workspace = true }
 # eBPF dependencies are Linux-only
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { workspace = true }
-aya-log = { workspace = true }
 bytes = { workspace = true }

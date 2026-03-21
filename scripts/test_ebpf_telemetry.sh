@@ -78,10 +78,21 @@ run_in_vm() {
         127.0.0.1:10000 garden.agent.v1.AgentService/ExecuteCommand 2>/dev/null
 }
 
-# Helper: read telemetry lines for N seconds, return collected NDJSON
-collect_telemetry() {
-    local seconds="$1"
-    timeout "$seconds" nc 127.0.0.1 10001 2>/dev/null || true
+# Helper: start collecting telemetry in background, return PID and output file.
+# Usage: start_telemetry_collector; ... generate events ...; stop_telemetry_collector
+TELEMETRY_COLLECTOR_PID=""
+TELEMETRY_COLLECTOR_FILE=""
+
+start_telemetry_collector() {
+    TELEMETRY_COLLECTOR_FILE=$(mktemp)
+    nc -w 8 127.0.0.1 10001 > "$TELEMETRY_COLLECTOR_FILE" 2>/dev/null &
+    TELEMETRY_COLLECTOR_PID=$!
+    sleep 1  # Give nc time to connect and subscribe
+}
+
+stop_telemetry_collector() {
+    kill "$TELEMETRY_COLLECTOR_PID" 2>/dev/null || true
+    wait "$TELEMETRY_COLLECTOR_PID" 2>/dev/null || true
 }
 
 echo ""
@@ -104,13 +115,19 @@ fi
 log_info "Test 2: Telemetry port connectivity"
 
 if [ "$TELEMETRY_AVAILABLE" = true ]; then
-    # Try to read at least one line within 3 seconds
-    TELEMETRY_LINE=$(timeout 3 bash -c 'nc 127.0.0.1 10001 | head -1' 2>/dev/null || true)
-    if [ -n "$TELEMETRY_LINE" ]; then
-        log_pass "Received telemetry data from port 10001"
+    # Connect, generate an event, and check that we receive data
+    start_telemetry_collector
+    run_in_vm "echo" "connectivity-test" > /dev/null 2>&1
+    sleep 2
+    stop_telemetry_collector
+
+    LINES=$(wc -l < "$TELEMETRY_COLLECTOR_FILE" | tr -d ' ')
+    if [ "$LINES" -gt 0 ] 2>/dev/null; then
+        log_pass "Received $LINES telemetry line(s) from port 10001"
     else
-        log_fail "No telemetry data received within 3 seconds"
+        log_fail "No telemetry data received"
     fi
+    rm -f "$TELEMETRY_COLLECTOR_FILE"
 else
     log_fail "Telemetry proxy not available on :10001"
 fi
@@ -121,25 +138,19 @@ fi
 log_info "Test 3: execve event from command execution"
 
 if [ "$TELEMETRY_AVAILABLE" = true ]; then
-    # Start collecting telemetry in background
-    TELEMETRY_FILE=$(mktemp)
-    timeout 5 nc 127.0.0.1 10001 > "$TELEMETRY_FILE" 2>/dev/null &
-    NC_PID=$!
-    sleep 0.5
+    start_telemetry_collector
 
     # Execute a command
     run_in_vm "echo" "execve-test-marker" > /dev/null 2>&1
 
-    # Wait for events to flow
     sleep 2
-    kill $NC_PID 2>/dev/null || true
-    wait $NC_PID 2>/dev/null || true
+    stop_telemetry_collector
 
     # Check if we got an execve event
     if python3 -c "
 import json, sys
 found = False
-for line in open('$TELEMETRY_FILE'):
+for line in open('$TELEMETRY_COLLECTOR_FILE'):
     line = line.strip()
     if not line:
         continue
@@ -163,7 +174,7 @@ sys.exit(0 if found else 1)
     else
         log_fail "No execve event found in telemetry stream"
     fi
-    rm -f "$TELEMETRY_FILE"
+    rm -f "$TELEMETRY_COLLECTOR_FILE"
 else
     log_fail "Skipped — telemetry not available"
 fi
@@ -174,29 +185,25 @@ fi
 log_info "Test 4: openat event from file read"
 
 if [ "$TELEMETRY_AVAILABLE" = true ]; then
-    TELEMETRY_FILE=$(mktemp)
-    timeout 5 nc 127.0.0.1 10001 > "$TELEMETRY_FILE" 2>/dev/null &
-    NC_PID=$!
-    sleep 0.5
+    start_telemetry_collector
 
-    # Read a file
-    run_in_vm "cat" "/etc/hostname" > /dev/null 2>&1
+    # Read a file (use /proc/version which always exists)
+    run_in_vm "cat" "/proc/version" > /dev/null 2>&1
 
     sleep 2
-    kill $NC_PID 2>/dev/null || true
-    wait $NC_PID 2>/dev/null || true
+    stop_telemetry_collector
 
     if python3 -c "
 import json, sys
 found = False
-for line in open('$TELEMETRY_FILE'):
+for line in open('$TELEMETRY_COLLECTOR_FILE'):
     line = line.strip()
     if not line:
         continue
     try:
         event = json.loads(line)
         kind = event.get('kind', {})
-        if kind.get('type') == 'file_access' and 'hostname' in kind.get('path', ''):
+        if kind.get('type') == 'file_access' and 'version' in kind.get('path', ''):
             found = True
             print(f'  Found openat: path={kind[\"path\"]}')
             break
@@ -204,11 +211,11 @@ for line in open('$TELEMETRY_FILE'):
         continue
 sys.exit(0 if found else 1)
 " 2>/dev/null; then
-        log_pass "Received openat event for /etc/hostname"
+        log_pass "Received openat event for /proc/version"
     else
-        log_fail "No openat event found for /etc/hostname"
+        log_fail "No openat event found for /proc/version"
     fi
-    rm -f "$TELEMETRY_FILE"
+    rm -f "$TELEMETRY_COLLECTOR_FILE"
 else
     log_fail "Skipped — telemetry not available"
 fi
@@ -219,20 +226,17 @@ fi
 log_info "Test 5: NDJSON format validation"
 
 if [ "$TELEMETRY_AVAILABLE" = true ]; then
-    TELEMETRY_FILE=$(mktemp)
-    timeout 3 nc 127.0.0.1 10001 > "$TELEMETRY_FILE" 2>/dev/null &
-    NC_PID=$!
+    start_telemetry_collector
 
     # Generate some activity
     run_in_vm "ls" "/workspace" > /dev/null 2>&1
     sleep 2
-    kill $NC_PID 2>/dev/null || true
-    wait $NC_PID 2>/dev/null || true
+    stop_telemetry_collector
 
     VALID_LINES=$(python3 -c "
 import json
 count = 0
-for line in open('$TELEMETRY_FILE'):
+for line in open('$TELEMETRY_COLLECTOR_FILE'):
     line = line.strip()
     if not line:
         continue
@@ -254,7 +258,7 @@ print(count)
     else
         log_fail "No valid NDJSON events parsed"
     fi
-    rm -f "$TELEMETRY_FILE"
+    rm -f "$TELEMETRY_COLLECTOR_FILE"
 else
     log_fail "Skipped — telemetry not available"
 fi
@@ -265,18 +269,15 @@ fi
 log_info "Test 6: Event field completeness"
 
 if [ "$TELEMETRY_AVAILABLE" = true ]; then
-    TELEMETRY_FILE=$(mktemp)
-    timeout 3 nc 127.0.0.1 10001 > "$TELEMETRY_FILE" 2>/dev/null &
-    NC_PID=$!
+    start_telemetry_collector
 
     run_in_vm "whoami" > /dev/null 2>&1
     sleep 2
-    kill $NC_PID 2>/dev/null || true
-    wait $NC_PID 2>/dev/null || true
+    stop_telemetry_collector
 
     if python3 -c "
 import json, sys
-for line in open('$TELEMETRY_FILE'):
+for line in open('$TELEMETRY_COLLECTOR_FILE'):
     line = line.strip()
     if not line:
         continue
@@ -285,7 +286,7 @@ for line in open('$TELEMETRY_FILE'):
         assert e['pid'] > 0, 'pid must be > 0'
         assert e['timestamp_ns'] > 0, 'timestamp must be > 0'
         assert len(e['comm']) > 0, 'comm must not be empty'
-        assert e['kind']['type'] in ('file_access', 'network_connect', 'process_exec', 'syscall_trace'), \
+        assert e['kind']['type'] in ('file_access', 'network_connect', 'process_exec', 'syscall_trace', 'dns_query', 'mount_attempt', 'bpf_syscall', 'module_load'), \
             f'unknown event type: {e[\"kind\"][\"type\"]}'
         print(f'  Valid event: type={e[\"kind\"][\"type\"]} pid={e[\"pid\"]} comm={e[\"comm\"]}')
         sys.exit(0)
@@ -297,7 +298,7 @@ sys.exit(1)
     else
         log_fail "Event fields are incomplete or invalid"
     fi
-    rm -f "$TELEMETRY_FILE"
+    rm -f "$TELEMETRY_COLLECTOR_FILE"
 else
     log_fail "Skipped — telemetry not available"
 fi

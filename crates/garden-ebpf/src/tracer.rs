@@ -72,7 +72,7 @@ fn convert_raw_event(raw: &RawSecurityEvent) -> Option<SecurityEvent> {
             allowed: true,
         },
         EventKind::Connect => {
-            let ip = raw.dest_ip.to_be_bytes();
+            let ip = raw.dest_ip.to_ne_bytes();
             SecurityEventKind::NetworkConnect {
                 dest_ip: format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
                 dest_port: raw.dest_port,
@@ -85,7 +85,7 @@ fn convert_raw_event(raw: &RawSecurityEvent) -> Option<SecurityEvent> {
             }
         }
         EventKind::DnsQuery => {
-            let ip = raw.dest_ip.to_be_bytes();
+            let ip = raw.dest_ip.to_ne_bytes();
             SecurityEventKind::DnsQuery {
                 server_ip: format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
                 domain: decode_dns_query(&raw.args),
@@ -135,41 +135,59 @@ pub async fn start_tracer(
     // 1. Load BPF bytecode embedded at compile time
     //
     // The BPF ELF is built by `garden-ebpf-probes` and placed at a known
-    // path. During development, this path is set by the build script or
-    // can be overridden via the GARDEN_BPF_ELF environment variable.
-    let bpf_bytes = include_bytes!(concat!(
+    // path. We copy into a Vec to guarantee 8-byte alignment, which the
+    // `object` crate's ELF parser requires. `include_bytes!` only
+    // guarantees 1-byte alignment.
+    let bpf_bytes_raw = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../garden-ebpf-probes/target/bpfel-unknown-none/release/garden-ebpf-probes"
     ));
-    let mut ebpf = aya::Ebpf::load(bpf_bytes)?;
+    let bpf_bytes = bpf_bytes_raw.to_vec();
+    let mut ebpf = aya::Ebpf::load(&bpf_bytes)?;
 
-    // 2. Initialize aya-log for BPF-side debug logging
-    if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
-        tracing::warn!("Failed to init eBPF logger (non-fatal): {}", e);
-    }
-
-    // 3. Attach tracepoints (Tier 1 + Tier 2)
+    // 2. Attach tracepoints (Tier 1 + Tier 2)
+    //
+    // Some probes may be unavailable if the kernel was built without the
+    // corresponding syscall (e.g., init_module with CONFIG_MODULES=n).
+    // We attach as many as possible and log warnings for failures.
     let probes = [
         // Tier 1
-        ("trace_execve", "syscalls", "sys_enter_execve"),
-        ("trace_openat", "syscalls", "sys_enter_openat"),
-        ("trace_connect", "syscalls", "sys_enter_connect"),
+        ("trace_execve", "syscalls", "sys_enter_execve", true),
+        ("trace_openat", "syscalls", "sys_enter_openat", true),
+        ("trace_connect", "syscalls", "sys_enter_connect", true),
         // Tier 2
-        ("trace_sendto", "syscalls", "sys_enter_sendto"),
-        ("trace_mount", "syscalls", "sys_enter_mount"),
-        ("trace_bpf", "syscalls", "sys_enter_bpf"),
-        ("trace_init_module", "syscalls", "sys_enter_init_module"),
+        ("trace_sendto", "syscalls", "sys_enter_sendto", false),
+        ("trace_mount", "syscalls", "sys_enter_mount", false),
+        ("trace_bpf", "syscalls", "sys_enter_bpf", false),
+        ("trace_init_module", "syscalls", "sys_enter_init_module", false),
     ];
 
-    for (name, category, tracepoint) in &probes {
-        let program: &mut TracePoint = ebpf
-            .program_mut(name)
-            .ok_or_else(|| anyhow::anyhow!("BPF program '{}' not found in ELF", name))?
-            .try_into()?;
-        program.load()?;
-        program.attach(category, tracepoint)?;
-        tracing::info!("Attached eBPF probe: {}/{}", category, tracepoint);
+    let mut attached = 0u32;
+    for (name, category, tracepoint, required) in &probes {
+        let result = (|| -> anyhow::Result<()> {
+            let program: &mut TracePoint = ebpf
+                .program_mut(name)
+                .ok_or_else(|| anyhow::anyhow!("BPF program '{}' not found in ELF", name))?
+                .try_into()?;
+            program.load()?;
+            program.attach(category, tracepoint)?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                tracing::info!("Attached eBPF probe: {}/{}", category, tracepoint);
+                attached += 1;
+            }
+            Err(e) if *required => {
+                return Err(e.context(format!("Required probe {}/{} failed", category, tracepoint)));
+            }
+            Err(e) => {
+                tracing::warn!("Optional probe {}/{} unavailable: {}", category, tracepoint, e);
+            }
+        }
     }
+    tracing::info!("Attached {}/{} eBPF probes", attached, probes.len());
 
     // 4. Open PerfEventArray and spawn per-CPU polling tasks
     let (tx, rx) = mpsc::channel::<SecurityEvent>(1024);
@@ -179,7 +197,7 @@ pub async fn start_tracer(
             .ok_or_else(|| anyhow::anyhow!("BPF map 'EVENTS' not found"))?,
     )?;
 
-    let cpus = online_cpus().map_err(|e| anyhow::anyhow!("failed to get online CPUs: {}", e))?;
+    let cpus = online_cpus().map_err(|e| anyhow::anyhow!("failed to get online CPUs: {:?}", e))?;
     tracing::info!("Starting perf event readers on {} CPUs", cpus.len());
 
     for cpu_id in cpus {
@@ -294,8 +312,8 @@ mod tests {
         raw.kind = EventKind::Connect as u32;
         raw.pid = 200;
         raw.comm[..4].copy_from_slice(b"curl");
-        // 93.184.216.34 = 0x5DB8D822
-        raw.dest_ip = u32::from_be_bytes([93, 184, 216, 34]);
+        // BPF probe stores IP bytes via from_ne_bytes, preserving network byte order
+        raw.dest_ip = u32::from_ne_bytes([93, 184, 216, 34]);
         raw.dest_port = 443;
         raw.protocol = 6; // TCP
 
@@ -348,7 +366,7 @@ mod tests {
         raw.kind = EventKind::DnsQuery as u32;
         raw.pid = 300;
         raw.comm[..7].copy_from_slice(b"resolv ");
-        raw.dest_ip = u32::from_be_bytes([8, 8, 8, 8]);
+        raw.dest_ip = u32::from_ne_bytes([8, 8, 8, 8]);
         raw.dest_port = 53;
         raw.protocol = 17; // UDP
         // DNS payload: header (12 bytes) + \x07example\x03com\x00

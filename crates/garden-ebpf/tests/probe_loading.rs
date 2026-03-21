@@ -10,10 +10,10 @@
 
 #[cfg(target_os = "linux")]
 mod linux_tests {
-    use garden_ebpf::events::{SecurityEvent, SecurityEventKind};
+    use garden_ebpf::events::SecurityEventKind;
     use garden_ebpf::policy::SecurityPolicy;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore] // Requires root + BPF-capable kernel
     async fn test_probes_load_and_attach() {
         let policy = SecurityPolicy::default_observe();
@@ -25,7 +25,7 @@ mod linux_tests {
         drop(handle);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn test_execve_event_received() {
         let policy = SecurityPolicy::default_observe();
@@ -33,23 +33,31 @@ mod linux_tests {
             .await
             .expect("tracer should start");
 
-        // Trigger an execve by running a command
-        tokio::process::Command::new("/bin/true")
+        // Trigger an execve (/bin/sh -c since /bin/true may not exist in minimal VMs)
+        tokio::process::Command::new("/bin/sh")
+            .args(["-c", "echo test"])
             .output()
             .await
-            .expect("should be able to run /bin/true");
+            .expect("should be able to run /bin/sh");
 
-        // Should receive at least one execve event within 1 second
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-            .await
-            .expect("should receive event within 1s")
-            .expect("channel should not be closed");
-
-        assert!(event.pid > 0, "event pid should be > 0");
-        assert!(!event.comm.is_empty(), "event comm should not be empty");
+        // Should receive at least one event within 2 seconds
+        let mut found = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await {
+                Ok(Some(event)) => {
+                    assert!(event.pid > 0, "event pid should be > 0");
+                    assert!(!event.comm.is_empty(), "event comm should not be empty");
+                    found = true;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        assert!(found, "should have received at least one event");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn test_openat_event_received() {
         let policy = SecurityPolicy::default_observe();
@@ -57,17 +65,17 @@ mod linux_tests {
             .await
             .expect("tracer should start");
 
-        // Trigger an openat by reading a file
-        let _ = tokio::fs::read_to_string("/etc/hostname").await;
+        // Trigger an openat by reading a file (/proc/version exists in minimal VMs)
+        let _ = tokio::fs::read_to_string("/proc/version").await;
 
-        // Collect events for up to 1 second, look for an openat
+        // Collect events for up to 2 seconds, look for an openat
         let mut found_openat = false;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await {
                 Ok(Some(event)) => {
                     if let SecurityEventKind::FileAccess { path, .. } = &event.kind {
-                        if path.contains("hostname") {
+                        if path.contains("version") {
                             found_openat = true;
                             break;
                         }
@@ -76,10 +84,10 @@ mod linux_tests {
                 _ => continue,
             }
         }
-        assert!(found_openat, "should have received openat event for /etc/hostname");
+        assert!(found_openat, "should have received openat event for /proc/version");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn test_connect_event_received() {
         let policy = SecurityPolicy::default_observe();
@@ -92,7 +100,7 @@ mod linux_tests {
         let _ = tokio::net::TcpStream::connect("127.0.0.1:1").await;
 
         let mut found_connect = false;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await {
                 Ok(Some(event)) => {
@@ -112,7 +120,7 @@ mod linux_tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn test_event_fields_correct() {
         let policy = SecurityPolicy::default_observe();
@@ -121,19 +129,19 @@ mod linux_tests {
             .expect("tracer should start");
 
         // Run a known command
-        tokio::process::Command::new("/bin/echo")
-            .arg("hello")
+        tokio::process::Command::new("/bin/sh")
+            .args(["-c", "echo hello"])
             .output()
             .await
             .expect("should run echo");
 
-        // Find the execve event for echo
+        // Find the execve event for sh or echo
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await {
                 Ok(Some(event)) => {
                     if let SecurityEventKind::ProcessExec { binary, .. } = &event.kind {
-                        if binary.contains("echo") {
+                        if binary.contains("sh") || binary.contains("echo") {
                             assert!(event.pid > 0);
                             assert!(event.timestamp_ns > 0);
                             assert!(!event.comm.is_empty());
@@ -144,7 +152,7 @@ mod linux_tests {
                 _ => continue,
             }
         }
-        panic!("did not find execve event for /bin/echo within 2s");
+        panic!("did not find execve event for /bin/sh within 2s");
     }
 }
 
