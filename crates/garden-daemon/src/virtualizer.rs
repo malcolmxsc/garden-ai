@@ -34,7 +34,13 @@ extern "C" {
         error_out: *mut *mut c_void,
     ) -> bool;
 
-    // 5. The Deallocation Function
+    // 5. The Stop Function
+    fn garden_virtualizer_stop(
+        instance: *mut c_void,
+        error_out: *mut *mut c_void,
+    ) -> bool;
+
+    // 6. The Deallocation Function
     fn garden_virtualizer_destroy(instance: *mut c_void);
 
     // 6. The vSock Connect Function
@@ -103,7 +109,7 @@ impl Virtualizer {
     // `std::ffi::CString` allocates new memory and safely copies the Rust string into it,
     // explicitly appending the `\0` so C/Swift can read it until the termination point.
     pub fn configure(
-        &mut self,
+        &self,
         kernel: &str,
         initrd: &str,
         cpus: u32,
@@ -157,6 +163,24 @@ impl Virtualizer {
             }
             let err_msg = unsafe { extract_nserror_description(error_ptr) };
             Err(format!("Apple Hypervisor failed to boot: {}", err_msg))
+        }
+    }
+
+    pub fn stop(&self) -> Result<(), String> {
+        let mut error_ptr: *mut c_void = std::ptr::null_mut();
+
+        let success = unsafe {
+            garden_virtualizer_stop(self.instance, &mut error_ptr)
+        };
+
+        if success {
+            Ok(())
+        } else {
+            if error_ptr.is_null() {
+                return Err("Failed to stop Virtual Machine. (Unknown Error)".into());
+            }
+            let err_msg = unsafe { extract_nserror_description(error_ptr) };
+            Err(format!("Failed to stop VM: {}", err_msg))
         }
     }
 

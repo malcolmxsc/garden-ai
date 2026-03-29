@@ -20,3 +20,4 @@ tower = "0.4"
 
 [build-dependencies]
 cc = "1.0"
+serde_json = { workspace = true }

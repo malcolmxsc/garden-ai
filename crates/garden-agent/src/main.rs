@@ -74,8 +74,17 @@ fn main() {
     }
 }
 
-#[derive(Default)]
-pub struct GardenAgentImpl {}
+pub struct GardenAgentImpl {
+    boot_time: std::time::Instant,
+}
+
+impl Default for GardenAgentImpl {
+    fn default() -> Self {
+        Self {
+            boot_time: std::time::Instant::now(),
+        }
+    }
+}
 
 #[tonic::async_trait]
 impl AgentService for GardenAgentImpl {
@@ -129,7 +138,7 @@ impl AgentService for GardenAgentImpl {
         
         let response = StatusResponse {
             version: env!("CARGO_PKG_VERSION").to_string(),
-            uptime_seconds: 42, 
+            uptime_seconds: self.boot_time.elapsed().as_secs(),
         };
 
         Ok(Response::new(response))

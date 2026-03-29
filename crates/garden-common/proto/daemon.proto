@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package garden.daemon.v1;
+
+// Host-side VM lifecycle management service.
+// Runs on the daemon (macOS host), NOT inside the guest VM.
+service DaemonService {
+    // Boot a new sandbox VM with the given configuration.
+    rpc BootVm(BootVmRequest) returns (BootVmResponse);
+
+    // Force-stop the running VM.
+    rpc StopVm(StopVmRequest) returns (StopVmResponse);
+
+    // Query the current VM state.
+    rpc GetVmStatus(VmStatusRequest) returns (VmStatusResponse);
+}
+
+// ---------------------------------------------------------
+// Boot VM
+// ---------------------------------------------------------
+
+message BootVmRequest {
+    // Path to the Linux kernel image (empty = daemon default)
+    string kernel_path = 1;
+
+    // Path to the initrd/initramfs (empty = daemon default)
+    string initrd_path = 2;
+
+    // Number of vCPUs (0 = default: 2)
+    uint32 cpus = 3;
+
+    // Memory in MB (0 = default: 512)
+    uint64 memory_mb = 4;
+}
+
+message BootVmResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+// ---------------------------------------------------------
+// Stop VM
+// ---------------------------------------------------------
+
+message StopVmRequest {
+    // Empty — stops the currently running VM
+}
+
+message StopVmResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+// ---------------------------------------------------------
+// VM Status
+// ---------------------------------------------------------
+
+message VmStatusRequest {
+    // Empty
+}
+
+message VmStatusResponse {
+    bool running = 1;
+    uint64 uptime_seconds = 2;
+    string kernel_path = 3;
+}

@@ -32,7 +32,11 @@ bool garden_virtualizer_configure(
 // Triggers the actual hypervisor boot sequence.
 bool garden_virtualizer_start(void* instance, void** error_out);
 
-// 5. The Deallocation Function
+// 5. The Stop Function
+// Force-stops the running VM. Returns true on success.
+bool garden_virtualizer_stop(void* instance, void** error_out);
+
+// 6. The Deallocation Function
 // Takes the raw pointer (`instance`) and tells Swift to free the memory.
 void garden_virtualizer_destroy(void* instance);
 

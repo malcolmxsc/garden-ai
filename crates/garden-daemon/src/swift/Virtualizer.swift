@@ -143,6 +143,55 @@ public class GardenVirtualizer: NSObject {
     }
     
     // =====================================================================
+    // SYNTAX BREAKDOWN: Stopping the VM
+    // =====================================================================
+    // VZVirtualMachine.stop() is a synchronous, force-stop operation.
+    // It must be called from the main thread (VZVirtualMachine requirement).
+    // We use the same DispatchSemaphore pattern as connectToAgent().
+    public func stopVM() throws {
+        let semaphore = DispatchSemaphore(value: 0)
+        var stopError: Error? = nil
+
+        DispatchQueue.main.async {
+            guard let machine = self.machine else {
+                stopError = NSError(
+                    domain: "GardenVirtualizer", code: 3,
+                    userInfo: [NSLocalizedDescriptionKey: "No VM is running."]
+                )
+                semaphore.signal()
+                return
+            }
+
+            Task { @MainActor in
+                do {
+                    try await machine.stop()
+                    print("🛑 [Swift] VM stopped successfully")
+                    fflush(stdout)
+                    self.machine = nil
+                    self.vsockConnections.removeAll()
+                } catch {
+                    stopError = error
+                    print("❌ [Swift] VM stop failed: \(error)")
+                    fflush(stdout)
+                }
+                semaphore.signal()
+            }
+        }
+
+        let timeout = DispatchTime.now() + .seconds(10)
+        if semaphore.wait(timeout: timeout) == .timedOut {
+            throw NSError(
+                domain: "GardenVirtualizer", code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "VM stop timed out after 10s"]
+            )
+        }
+
+        if let error = stopError {
+            throw error
+        }
+    }
+
+    // =====================================================================
     // SYNTAX BREAKDOWN: Stored vSock Connection
     // =====================================================================
     // After the VM boots we connect to the guest agent over vSock.

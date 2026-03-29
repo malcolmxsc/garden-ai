@@ -1,14 +1,152 @@
 mod virtualizer;
 
 use virtualizer::Virtualizer;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use garden_common::daemon::daemon_service_server::{DaemonService, DaemonServiceServer};
+use garden_common::daemon::{
+    BootVmRequest, BootVmResponse, StopVmRequest, StopVmResponse,
+    VmStatusRequest, VmStatusResponse,
+};
+
+// =====================================================================
+// Shared VM State
+// =====================================================================
+// The DaemonService gRPC handlers and the main boot logic both need
+// access to the VM's running state. We use atomics and mutexes wrapped
+// in Arc so the gRPC service (running on a background tokio runtime)
+// can safely read and update state.
+struct VmState {
+    running: AtomicBool,
+    boot_time: Mutex<Option<Instant>>,
+    kernel_path: Mutex<String>,
+}
+
+// =====================================================================
+// DaemonService gRPC Implementation
+// =====================================================================
+struct DaemonServiceImpl {
+    engine: &'static Virtualizer,
+    state: Arc<VmState>,
+}
+
+#[tonic::async_trait]
+impl DaemonService for DaemonServiceImpl {
+    async fn boot_vm(
+        &self,
+        request: tonic::Request<BootVmRequest>,
+    ) -> Result<tonic::Response<BootVmResponse>, tonic::Status> {
+        if self.state.running.load(Ordering::SeqCst) {
+            return Ok(tonic::Response::new(BootVmResponse {
+                success: false,
+                message: "VM is already running".into(),
+            }));
+        }
+
+        let req = request.into_inner();
+
+        let kernel = if req.kernel_path.is_empty() {
+            "/Users/malcolmgriffin/.gemini/antigravity/scratch/garden-ai/guest/kernel/kernel".to_string()
+        } else {
+            req.kernel_path
+        };
+        let initrd = if req.initrd_path.is_empty() {
+            "/Users/malcolmgriffin/.gemini/antigravity/scratch/garden-ai/guest/kernel/garden-initrd.cpio.gz".to_string()
+        } else {
+            req.initrd_path
+        };
+        let cpus = if req.cpus == 0 { 2 } else { req.cpus };
+        let memory_mb = if req.memory_mb == 0 { 512 } else { req.memory_mb };
+
+        if let Err(e) = self.engine.configure(&kernel, &initrd, cpus, memory_mb) {
+            return Ok(tonic::Response::new(BootVmResponse {
+                success: false,
+                message: format!("Configure failed: {}", e),
+            }));
+        }
+
+        if let Err(e) = self.engine.start() {
+            return Ok(tonic::Response::new(BootVmResponse {
+                success: false,
+                message: format!("Start failed: {}", e),
+            }));
+        }
+
+        self.state.running.store(true, Ordering::SeqCst);
+        *self.state.boot_time.lock().unwrap() = Some(Instant::now());
+        *self.state.kernel_path.lock().unwrap() = kernel;
+
+        // Start proxies after a brief delay for the guest to initialize
+        let engine = self.engine;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            run_tcp_vsock_proxy(engine, 6000);
+        });
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            run_telemetry_receiver(engine);
+        });
+
+        Ok(tonic::Response::new(BootVmResponse {
+            success: true,
+            message: "VM booted successfully".into(),
+        }))
+    }
+
+    async fn stop_vm(
+        &self,
+        _request: tonic::Request<StopVmRequest>,
+    ) -> Result<tonic::Response<StopVmResponse>, tonic::Status> {
+        if !self.state.running.load(Ordering::SeqCst) {
+            return Ok(tonic::Response::new(StopVmResponse {
+                success: false,
+                message: "No VM is running".into(),
+            }));
+        }
+
+        match self.engine.stop() {
+            Ok(_) => {
+                self.state.running.store(false, Ordering::SeqCst);
+                *self.state.boot_time.lock().unwrap() = None;
+                Ok(tonic::Response::new(StopVmResponse {
+                    success: true,
+                    message: "VM stopped successfully".into(),
+                }))
+            }
+            Err(e) => Ok(tonic::Response::new(StopVmResponse {
+                success: false,
+                message: format!("Stop failed: {}", e),
+            })),
+        }
+    }
+
+    async fn get_vm_status(
+        &self,
+        _request: tonic::Request<VmStatusRequest>,
+    ) -> Result<tonic::Response<VmStatusResponse>, tonic::Status> {
+        let running = self.state.running.load(Ordering::SeqCst);
+        let uptime = self.state.boot_time.lock().unwrap()
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        let kernel_path = self.state.kernel_path.lock().unwrap().clone();
+
+        Ok(tonic::Response::new(VmStatusResponse {
+            running,
+            uptime_seconds: uptime,
+            kernel_path,
+        }))
+    }
+}
 
 fn main() {
     println!("🌱 Starting Garden Engine Daemon...");
 
-    // 1. Initialize the FFI Bridge 
+    // 1. Initialize the FFI Bridge
     println!("Checking Apple Silicon Virtualization support...");
-    
-    let mut engine = match Virtualizer::new() {
+
+    let engine = match Virtualizer::new() {
         Ok(v) => v,
         Err(e) => {
             eprintln!("❌ Failed to initialize Garden Engine: {}", e);
@@ -24,11 +162,11 @@ fn main() {
             std::process::exit(1);
         }
     }
-    
+
     // 3. Configure the VM
     println!("⚙️ Configuring Virtual Machine (2 CPUs, 512MB RAM)...");
-    
-    let kernel_path = "/Users/malcolmgriffin/.gemini/antigravity/scratch/garden-ai/guest/kernel/kernel"; 
+
+    let kernel_path = "/Users/malcolmgriffin/.gemini/antigravity/scratch/garden-ai/guest/kernel/kernel";
     let initrd_path = "/Users/malcolmgriffin/.gemini/antigravity/scratch/garden-ai/guest/kernel/garden-initrd.cpio.gz";
 
     match engine.configure(kernel_path, initrd_path, 2, 512) {
@@ -49,19 +187,26 @@ fn main() {
         }
     }
 
+    // Shared VM state for the DaemonService
+    let vm_state = Arc::new(VmState {
+        running: AtomicBool::new(true),
+        boot_time: Mutex::new(Some(Instant::now())),
+        kernel_path: Mutex::new(kernel_path.to_string()),
+    });
+
     // 5. Wait for agent to be ready, then start TCP proxy
     // =================================================================
     // For each incoming CLI TCP connection, we open a FRESH vSock connection
     // to the guest agent. The agent's VsockIncoming listener will accept()
     // each one independently, giving each CLI connection its own HTTP/2 stream.
     println!("🔌 Starting TCP→vSock proxy (background thread)...");
-    
+
     let engine: &'static Virtualizer = Box::leak(Box::new(engine));
-    
+
     std::thread::spawn(move || {
         // Wait for the VM kernel to boot and the agent to start listening
         std::thread::sleep(std::time::Duration::from_secs(3));
-        
+
         // Start the TCP proxy — vSock connections are made on-demand per CLI session
         let vsock_port: u32 = 6000;
         run_tcp_vsock_proxy(engine, vsock_port);
@@ -77,6 +222,36 @@ fn main() {
         // Wait longer than gRPC proxy — eBPF probes load after gRPC server starts
         std::thread::sleep(std::time::Duration::from_secs(5));
         run_telemetry_receiver(engine);
+    });
+
+    // 7. Start DaemonService gRPC server on port 9000 (background thread)
+    // =================================================================
+    // This allows the CLI to send boot/stop/status commands to the daemon.
+    println!("🔧 Starting DaemonService gRPC on 127.0.0.1:9000...");
+
+    let daemon_state = vm_state.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to build tokio runtime for DaemonService");
+
+        rt.block_on(async move {
+            let service = DaemonServiceImpl {
+                engine,
+                state: daemon_state,
+            };
+
+            let addr = "127.0.0.1:9000".parse().unwrap();
+            match tonic::transport::Server::builder()
+                .add_service(DaemonServiceServer::new(service))
+                .serve(addr)
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => eprintln!("❌ DaemonService gRPC server error: {}", e),
+            }
+        });
     });
 
     println!("🔄 Daemon handing control to macOS CFRunLoop. Press Ctrl+C to stop.");

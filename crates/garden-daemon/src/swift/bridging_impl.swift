@@ -144,7 +144,30 @@ public func garden_virtualizer_start(
 }
 
 // =====================================================================
-// 5. The Deallocation Function
+// 5. The Stop Function
+// =====================================================================
+// TASK: Force-stop the running VM. Returns true on success.
+@_cdecl("garden_virtualizer_stop")
+public func garden_virtualizer_stop(
+    _ instance: UnsafeMutableRawPointer,
+    _ errorOut: UnsafeMutablePointer<UnsafeMutablePointer<NSError>?>?
+) -> Bool {
+    let virtualizer = Unmanaged<GardenVirtualizer>.fromOpaque(instance).takeUnretainedValue()
+
+    do {
+        try virtualizer.stopVM()
+        return true
+    } catch {
+        let nsError = error as NSError
+        if let out = errorOut {
+            out.pointee = Unmanaged.passRetained(nsError).toOpaque().bindMemory(to: NSError.self, capacity: 1)
+        }
+        return false
+    }
+}
+
+// =====================================================================
+// 6. The Deallocation Function
 // =====================================================================
 // TASK: Rust's `Drop` trait calls this function when it is done with the object.
 @_cdecl("garden_virtualizer_destroy")

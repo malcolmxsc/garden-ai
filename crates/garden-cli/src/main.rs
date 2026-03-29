@@ -117,8 +117,25 @@ async fn main() -> anyhow::Result<()> {
                 shared_dirs = ?share,
                 "Booting sandbox VM..."
             );
-            // TODO: Send Boot request via IPC
-            println!("🌿 Sandbox booted successfully.");
+
+            let mut client = garden_common::daemon::daemon_service_client::DaemonServiceClient::connect("http://127.0.0.1:9000")
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to connect to daemon on :9000: {}", e))?;
+
+            let request = tonic::Request::new(garden_common::daemon::BootVmRequest {
+                kernel_path: kernel,
+                initrd_path: rootfs,
+                cpus,
+                memory_mb: memory,
+            });
+
+            let response = client.boot_vm(request).await?.into_inner();
+            if response.success {
+                println!("🌿 {}", response.message);
+            } else {
+                eprintln!("❌ {}", response.message);
+                std::process::exit(1);
+            }
         }
         Commands::Run { command, args } => {
             // ----------------------------------------------------
@@ -171,13 +188,73 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Status => {
             tracing::info!("Querying sandbox status...");
-            // TODO: Send Status request via IPC
-            println!("🌿 No sandboxes running.");
+
+            // First try the DaemonService for VM-level status
+            match garden_common::daemon::daemon_service_client::DaemonServiceClient::connect("http://127.0.0.1:9000").await {
+                Ok(mut daemon_client) => {
+                    let vm_status = daemon_client
+                        .get_vm_status(tonic::Request::new(garden_common::daemon::VmStatusRequest {}))
+                        .await?
+                        .into_inner();
+
+                    println!("🌿 Sandbox Status");
+                    println!("  VM running:     {}", if vm_status.running { "yes" } else { "no" });
+
+                    if vm_status.running {
+                        let uptime = vm_status.uptime_seconds;
+                        let hours = uptime / 3600;
+                        let minutes = (uptime % 3600) / 60;
+                        let seconds = uptime % 60;
+                        println!("  Uptime:         {}h {}m {}s", hours, minutes, seconds);
+                    }
+
+                    if !vm_status.kernel_path.is_empty() {
+                        println!("  Kernel:         {}", vm_status.kernel_path);
+                    }
+
+                    // Also try the agent for guest-side info
+                    if vm_status.running {
+                        match garden_common::ipc::agent_service_client::AgentServiceClient::connect("http://127.0.0.1:10000").await {
+                            Ok(mut agent_client) => {
+                                let agent_status = agent_client
+                                    .get_status(tonic::Request::new(garden_common::ipc::StatusRequest {}))
+                                    .await?
+                                    .into_inner();
+                                println!("  Agent version:  {}", agent_status.version);
+                            }
+                            Err(_) => {
+                                println!("  Agent:          not reachable (still booting?)");
+                            }
+                        }
+                    }
+
+                    println!("  Daemon gRPC:    127.0.0.1:9000");
+                    println!("  Agent proxy:    127.0.0.1:10000");
+                    println!("  Telemetry:      127.0.0.1:10001");
+                }
+                Err(_) => {
+                    println!("🌿 No sandbox running (daemon not reachable on :9000).");
+                }
+            }
         }
         Commands::Stop { id } => {
             tracing::info!(id = ?id, "Stopping sandbox...");
-            // TODO: Send Stop request via IPC
-            println!("🌿 Sandbox stopped.");
+
+            let mut client = garden_common::daemon::daemon_service_client::DaemonServiceClient::connect("http://127.0.0.1:9000")
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to connect to daemon on :9000: {}", e))?;
+
+            let response = client
+                .stop_vm(tonic::Request::new(garden_common::daemon::StopVmRequest {}))
+                .await?
+                .into_inner();
+
+            if response.success {
+                println!("🌿 {}", response.message);
+            } else {
+                eprintln!("❌ {}", response.message);
+                std::process::exit(1);
+            }
         }
         Commands::Serve => {
             garden_mcp::server::start_server(garden_mcp::server::McpServerConfig::default())

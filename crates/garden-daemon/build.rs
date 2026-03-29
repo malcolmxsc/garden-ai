@@ -47,4 +47,36 @@ fn main() {
     println!("cargo:rustc-link-search=native=/usr/lib/swift");
     println!("cargo:rustc-link-lib=swiftCore");
     println!("cargo:rustc-link-lib=swiftFoundation");
+    println!("cargo:rustc-link-lib=swift_Concurrency");
+
+    // 5. Set rpath so the dynamic linker can find Swift runtime dylibs at runtime.
+    // Swift's runtime libraries live in /usr/lib/swift on macOS, but the binary
+    // needs an LC_RPATH entry to locate them (macOS SIP strips DYLD_LIBRARY_PATH).
+    let swift_runtime_paths = Command::new("swift")
+        .args(&["-print-target-info"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| {
+            // Parse the JSON to extract runtimeLibraryPaths
+            serde_json::from_str::<serde_json::Value>(&s).ok()
+        })
+        .and_then(|v| {
+            v["paths"]["runtimeLibraryPaths"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|p| p.as_str().map(String::from))
+                        .collect::<Vec<_>>()
+                })
+        })
+        .unwrap_or_else(|| vec![
+            "/usr/lib/swift".to_string(),
+            "/Library/Developer/CommandLineTools/usr/lib/swift/macosx".to_string(),
+        ]);
+
+    for path in &swift_runtime_paths {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", path);
+        println!("cargo:rustc-link-search=native={}", path);
+    }
 }
