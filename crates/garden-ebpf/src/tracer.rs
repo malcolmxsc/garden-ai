@@ -5,7 +5,7 @@
 //! no-op stub.
 
 use super::events::{SecurityEvent, SecurityEventKind};
-use garden_ebpf_common::{bytes_to_str, EventKind, RawSecurityEvent};
+use garden_ebpf_common::{bytes_to_str, EventKind, RawSecurityEvent, MAX_COMM_LEN};
 use tokio::sync::mpsc;
 
 /// Handle to a running eBPF tracer.
@@ -103,6 +103,28 @@ fn convert_raw_event(raw: &RawSecurityEvent) -> Option<SecurityEvent> {
             size: raw.flags,
             args: bytes_to_str(&raw.args).to_string(),
         },
+        EventKind::Fork => SecurityEventKind::ProcessFork {
+            parent_pid: raw.pid,
+            child_pid: raw.flags,
+            child_comm: bytes_to_str(&raw.path[..MAX_COMM_LEN]).to_string(),
+        },
+        EventKind::Exit => SecurityEventKind::ProcessExit {
+            exit_code: raw.flags,
+        },
+        EventKind::CredsChanged => SecurityEventKind::CredsChanged {
+            old_uid: raw.aux as u32,
+            new_uid: raw.flags,
+        },
+        EventKind::TcpSend => SecurityEventKind::TcpSend {
+            bytes: raw.aux,
+        },
+        EventKind::TcpRecv => SecurityEventKind::TcpRecv {
+            bytes: raw.aux,
+        },
+        EventKind::OomKill => SecurityEventKind::OomKill {
+            victim_pid: raw.pid,
+            victim_comm: bytes_to_str(&raw.path[..MAX_COMM_LEN]).to_string(),
+        },
     };
 
     Some(SecurityEvent {
@@ -126,7 +148,7 @@ pub async fn start_tracer(
     _policy: &super::policy::SecurityPolicy,
 ) -> anyhow::Result<(TracerHandle, mpsc::Receiver<SecurityEvent>)> {
     use aya::maps::perf::AsyncPerfEventArray;
-    use aya::programs::TracePoint;
+    use aya::programs::{KProbe, TracePoint};
     use aya::util::online_cpus;
     use bytes::BytesMut;
 
@@ -160,6 +182,10 @@ pub async fn start_tracer(
         ("trace_mount", "syscalls", "sys_enter_mount", false),
         ("trace_bpf", "syscalls", "sys_enter_bpf", false),
         ("trace_init_module", "syscalls", "sys_enter_init_module", false),
+        // Tier 3 — process lifecycle + OOM
+        ("trace_fork", "sched", "sched_process_fork", false),
+        ("trace_exit", "sched", "sched_process_exit", false),
+        ("trace_oom_victim", "oom", "mark_victim", false),
     ];
 
     let mut attached = 0u32;
@@ -187,7 +213,41 @@ pub async fn start_tracer(
             }
         }
     }
-    tracing::info!("Attached {}/{} eBPF probes", attached, probes.len());
+    tracing::info!("Attached {}/{} eBPF tracepoints", attached, probes.len());
+
+    // 3. Attach kprobes (Tier 3 — require CONFIG_KPROBES=y)
+    let kprobes = [
+        ("trace_commit_creds", "commit_creds", false),
+        ("trace_tcp_sendmsg",  "tcp_sendmsg",  false),
+        ("trace_tcp_recvmsg",  "tcp_recvmsg",  false),
+    ];
+
+    let mut kprobes_attached = 0u32;
+    for (name, fn_name, required) in &kprobes {
+        let result = (|| -> anyhow::Result<()> {
+            let program: &mut KProbe = ebpf
+                .program_mut(name)
+                .ok_or_else(|| anyhow::anyhow!("BPF program '{}' not found in ELF", name))?
+                .try_into()?;
+            program.load()?;
+            program.attach(fn_name, 0)?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                tracing::info!("Attached kprobe: {}", fn_name);
+                kprobes_attached += 1;
+            }
+            Err(e) if *required => {
+                return Err(e.context(format!("Required kprobe {} failed", fn_name)));
+            }
+            Err(e) => {
+                tracing::warn!("Optional kprobe {} unavailable: {}", fn_name, e);
+            }
+        }
+    }
+    tracing::info!("Attached {}/{} kprobes", kprobes_attached, kprobes.len());
 
     // 4. Open PerfEventArray and spawn per-CPU polling tasks
     let (tx, rx) = mpsc::channel::<SecurityEvent>(1024);
@@ -242,7 +302,7 @@ pub async fn start_tracer(
         });
     }
 
-    tracing::info!("eBPF tracer started — monitoring execve, openat, connect, sendto, mount, bpf, init_module");
+    tracing::info!("eBPF tracer started — monitoring execve, openat, connect, sendto, mount, bpf, init_module, fork, exit, oom, commit_creds, tcp_sendmsg, tcp_recvmsg");
 
     Ok((TracerHandle { _ebpf: ebpf }, rx))
 }

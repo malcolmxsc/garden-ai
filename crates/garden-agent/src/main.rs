@@ -391,10 +391,13 @@ async fn async_main() -> anyhow::Result<()> {
 // commands like "echo", "ls", "cat" can be found by name.
 fn setup_busybox_symlinks() {
     let applets = [
-        "cat", "cp", "echo", "env", "grep", "head", "hostname",
-        "id", "kill", "ln", "ls", "mkdir", "mv", "ps", "pwd",
-        "rm", "rmdir", "sed", "sh", "sleep", "sort", "tail",
-        "touch", "uname", "wc", "which", "whoami",
+        "awk", "cat", "cp", "cut", "dd", "df", "du", "echo", "env",
+        "expr", "grep", "gunzip", "gzip", "head", "hostname", "id",
+        "ifconfig", "kill", "ln", "ls", "mkdir", "mount", "mv",
+        "ping", "printenv", "ps", "pwd", "rm", "rmdir", "sed", "sh",
+        "sleep", "sort", "tail", "tar", "tee", "touch", "tr",
+        "umount", "uname", "uniq", "wc", "wget", "which", "whoami",
+        "xargs", "zcat",
     ];
 
     let _ = std::fs::create_dir_all("/usr/bin");

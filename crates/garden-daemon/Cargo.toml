@@ -11,7 +11,9 @@ objc = "0.2.7"
 libc = "0.2"
 garden-common = { path = "../garden-common" }
 garden-ebpf = { path = "../garden-ebpf" }
+serde = { workspace = true }
 serde_json = { workspace = true }
+anyhow = { workspace = true }
 tonic = "0.11"
 prost = "0.12"
 tokio = { workspace = true }

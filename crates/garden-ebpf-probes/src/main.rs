@@ -27,12 +27,13 @@
 use aya_ebpf::{
     cty::c_long,
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_ktime_get_ns,
-        bpf_probe_read_user_buf, bpf_probe_read_user_str_bytes,
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
+        bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_probe_read_user_buf,
+        bpf_probe_read_user_str_bytes,
     },
-    macros::{map, tracepoint},
+    macros::{kprobe, map, tracepoint},
     maps::{PerCpuArray, PerfEventArray},
-    programs::TracePointContext,
+    programs::{ProbeContext, TracePointContext},
 };
 use garden_ebpf_common::{EventKind, RawSecurityEvent};
 
@@ -449,6 +450,228 @@ fn try_trace_init_module(ctx: &TracePointContext) -> Result<(), c_long> {
             )
         };
     }
+
+    EVENTS.output(ctx, event, 0);
+    Ok(())
+}
+
+// ===========================================================================
+// Tier 3: sched/sched_process_fork — process lifecycle
+// ===========================================================================
+// Tracepoint format (from /sys/kernel/debug/tracing/events/sched/sched_process_fork/format):
+//   field:char parent_comm[16]; offset:8;  size:16;
+//   field:pid_t parent_pid;     offset:24; size:4;
+//   field:char child_comm[16];  offset:28; size:16;
+//   field:pid_t child_pid;      offset:44; size:4;
+
+#[tracepoint(category = "sched", name = "sched_process_fork")]
+pub fn trace_fork(ctx: TracePointContext) -> u32 {
+    match try_trace_fork(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 0,
+    }
+}
+
+fn try_trace_fork(ctx: &TracePointContext) -> Result<(), c_long> {
+    let event = get_scratch_event().ok_or(1i64)?;
+    event.kind = EventKind::Fork as u32;
+    event.timestamp_ns = unsafe { bpf_ktime_get_ns() };
+
+    // Read parent_pid at offset 24
+    let parent_pid: u32 = unsafe { ctx.read_at(24)? };
+    event.pid = parent_pid;
+
+    // Read child_pid at offset 44
+    let child_pid: u32 = unsafe { ctx.read_at(44)? };
+    event.flags = child_pid;
+
+    // Read parent_comm (16 bytes at offset 8) as two u64 reads
+    let comm_lo: u64 = unsafe { ctx.read_at(8)? };
+    let comm_hi: u64 = unsafe { ctx.read_at(16)? };
+    event.comm[..8].copy_from_slice(&comm_lo.to_ne_bytes());
+    event.comm[8..16].copy_from_slice(&comm_hi.to_ne_bytes());
+
+    // Read child_comm (16 bytes at offset 28) into path
+    let child_lo: u64 = unsafe { ctx.read_at(28)? };
+    let child_hi: u64 = unsafe { ctx.read_at(36)? };
+    event.path[..8].copy_from_slice(&child_lo.to_ne_bytes());
+    event.path[8..16].copy_from_slice(&child_hi.to_ne_bytes());
+
+    EVENTS.output(ctx, event, 0);
+    Ok(())
+}
+
+// ===========================================================================
+// Tier 3: sched/sched_process_exit — process lifecycle
+// ===========================================================================
+// Tracepoint format:
+//   field:char comm[16]; offset:8;  size:16;
+//   field:pid_t pid;     offset:24; size:4;
+//   field:int prio;      offset:28; size:4;
+
+#[tracepoint(category = "sched", name = "sched_process_exit")]
+pub fn trace_exit(ctx: TracePointContext) -> u32 {
+    match try_trace_exit(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 0,
+    }
+}
+
+fn try_trace_exit(ctx: &TracePointContext) -> Result<(), c_long> {
+    let event = get_scratch_event().ok_or(1i64)?;
+    event.kind = EventKind::Exit as u32;
+    event.timestamp_ns = unsafe { bpf_ktime_get_ns() };
+
+    // Read pid at offset 24
+    let pid: u32 = unsafe { ctx.read_at(24)? };
+    event.pid = pid;
+
+    // Read comm (16 bytes at offset 8) as two u64 reads
+    let comm_lo: u64 = unsafe { ctx.read_at(8)? };
+    let comm_hi: u64 = unsafe { ctx.read_at(16)? };
+    event.comm[..8].copy_from_slice(&comm_lo.to_ne_bytes());
+    event.comm[8..16].copy_from_slice(&comm_hi.to_ne_bytes());
+
+    EVENTS.output(ctx, event, 0);
+    Ok(())
+}
+
+// ===========================================================================
+// Tier 3: oom/mark_victim — OOM kill victim
+// ===========================================================================
+// Tracepoint format (from /sys/kernel/debug/tracing/events/oom/mark_victim/format):
+//   field:int pid;         offset:8;  size:4;
+//   field:char comm[16];   offset:12; size:16;
+
+#[tracepoint(category = "oom", name = "mark_victim")]
+pub fn trace_oom_victim(ctx: TracePointContext) -> u32 {
+    match try_trace_oom_victim(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 0,
+    }
+}
+
+fn try_trace_oom_victim(ctx: &TracePointContext) -> Result<(), c_long> {
+    let event = get_scratch_event().ok_or(1i64)?;
+    event.kind = EventKind::OomKill as u32;
+    event.timestamp_ns = unsafe { bpf_ktime_get_ns() };
+
+    // Victim pid at offset 8
+    let victim_pid: u32 = unsafe { ctx.read_at(8)? };
+    event.pid = victim_pid;
+
+    // Victim comm (16 bytes at offset 12) — store in path field
+    // offset 12 means: first u64 straddles the boundary, read as two separate reads
+    let comm_lo: u64 = unsafe { ctx.read_at(12)? };
+    let comm_hi: u64 = unsafe { ctx.read_at(20)? };
+    event.path[..8].copy_from_slice(&comm_lo.to_ne_bytes());
+    event.path[8..16].copy_from_slice(&comm_hi.to_ne_bytes());
+
+    EVENTS.output(ctx, event, 0);
+    Ok(())
+}
+
+// ===========================================================================
+// Tier 3: commit_creds kprobe — privilege escalation detection
+// ===========================================================================
+// Function signature: int commit_creds(struct cred *new)
+// struct cred layout (aarch64):
+//   offset 0:  atomic_long_t usage (8 bytes)
+//   offset 8:  kuid_t uid          (4 bytes)
+//   offset 12: kgid_t gid          (4 bytes)
+//   offset 20: kuid_t euid         (4 bytes)
+
+#[kprobe]
+pub fn trace_commit_creds(ctx: ProbeContext) -> u32 {
+    match try_trace_commit_creds(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 0,
+    }
+}
+
+fn try_trace_commit_creds(ctx: &ProbeContext) -> Result<(), c_long> {
+    let event = get_scratch_event().ok_or(1i64)?;
+    event.kind = EventKind::CredsChanged as u32;
+    event.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    event.timestamp_ns = unsafe { bpf_ktime_get_ns() };
+    event.comm = bpf_get_current_comm()?;
+
+    // Old uid: current process uid before the change
+    // bpf_get_current_uid_gid() returns (gid << 32 | uid)
+    let old_uid_gid = bpf_get_current_uid_gid();
+    event.aux = (old_uid_gid & 0xFFFF_FFFF) as u64;
+
+    // New uid: read from the cred struct argument (arg 0)
+    // struct cred: atomic_long_t usage (8 bytes) then kuid_t uid (4 bytes)
+    let cred_ptr = ctx.arg::<u64>(0).ok_or(1i64)?;
+    if cred_ptr != 0 {
+        let new_uid: u32 = unsafe {
+            bpf_probe_read_kernel((cred_ptr + 8) as *const u32).unwrap_or(0)
+        };
+        event.flags = new_uid;
+    }
+
+    EVENTS.output(ctx, event, 0);
+    Ok(())
+}
+
+// ===========================================================================
+// Tier 3: tcp_sendmsg kprobe — TCP data volume sent
+// ===========================================================================
+// Function signature: int tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
+// arg2 = size (bytes being sent)
+
+#[kprobe]
+pub fn trace_tcp_sendmsg(ctx: ProbeContext) -> u32 {
+    match try_trace_tcp_sendmsg(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 0,
+    }
+}
+
+fn try_trace_tcp_sendmsg(ctx: &ProbeContext) -> Result<(), c_long> {
+    let bytes = ctx.arg::<u64>(2).unwrap_or(0);
+    if bytes == 0 {
+        return Ok(());
+    }
+
+    let event = get_scratch_event().ok_or(1i64)?;
+    event.kind = EventKind::TcpSend as u32;
+    event.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    event.timestamp_ns = unsafe { bpf_ktime_get_ns() };
+    event.comm = bpf_get_current_comm()?;
+    event.aux = bytes;
+
+    EVENTS.output(ctx, event, 0);
+    Ok(())
+}
+
+// ===========================================================================
+// Tier 3: tcp_recvmsg kprobe — TCP data volume received
+// ===========================================================================
+// Function signature: int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags, int *addr_len)
+// arg2 = len (bytes requested to receive)
+
+#[kprobe]
+pub fn trace_tcp_recvmsg(ctx: ProbeContext) -> u32 {
+    match try_trace_tcp_recvmsg(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 0,
+    }
+}
+
+fn try_trace_tcp_recvmsg(ctx: &ProbeContext) -> Result<(), c_long> {
+    let bytes = ctx.arg::<u64>(2).unwrap_or(0);
+    if bytes == 0 {
+        return Ok(());
+    }
+
+    let event = get_scratch_event().ok_or(1i64)?;
+    event.kind = EventKind::TcpRecv as u32;
+    event.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    event.timestamp_ns = unsafe { bpf_ktime_get_ns() };
+    event.comm = bpf_get_current_comm()?;
+    event.aux = bytes;
 
     EVENTS.output(ctx, event, 0);
     Ok(())

@@ -1,3 +1,4 @@
+mod event_log;
 mod virtualizer;
 
 use virtualizer::Virtualizer;
@@ -356,6 +357,11 @@ fn run_telemetry_receiver(engine: &'static Virtualizer) {
     let policy = garden_ebpf::policy::SecurityPolicy::default_observe();
     let (broadcast_tx, _) = tokio::sync::broadcast::channel::<String>(256);
 
+    let logger = std::sync::Arc::new(
+        event_log::EventLogger::new().expect("Failed to create session event log"),
+    );
+    println!("📋 Session log: {}", logger.session_dir().display());
+
     rt.block_on(async move {
         // Also start a TCP proxy for telemetry on port 10001
         // so external tools (socat, test scripts) can tap the stream
@@ -391,8 +397,8 @@ fn run_telemetry_receiver(engine: &'static Virtualizer) {
                 }
             };
 
-            // Read NDJSON lines, evaluate policy, and broadcast to TCP clients
-            process_telemetry_stream(stream, &policy, &broadcast_tx).await;
+            // Read NDJSON lines, evaluate policy, log to session file, and broadcast
+            process_telemetry_stream(stream, &policy, &broadcast_tx, logger.clone()).await;
 
             println!("📊 Telemetry connection lost, reconnecting in 2s...");
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -404,6 +410,7 @@ async fn process_telemetry_stream(
     stream: VsockStream,
     policy: &garden_ebpf::policy::SecurityPolicy,
     broadcast_tx: &tokio::sync::broadcast::Sender<String>,
+    logger: std::sync::Arc<event_log::EventLogger>,
 ) {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -416,6 +423,11 @@ async fn process_telemetry_stream(
 
         match serde_json::from_str::<garden_ebpf::events::SecurityEvent>(&line) {
             Ok(event) => {
+                // Persist to session log (includes violation detection)
+                if let Err(e) = logger.log(&event) {
+                    eprintln!("📋 Failed to write session log: {}", e);
+                }
+
                 let action = policy.evaluate(&event);
                 match action {
                     garden_ebpf::policy::PolicyAction::Deny => {

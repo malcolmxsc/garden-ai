@@ -34,6 +34,18 @@ pub enum EventKind {
     BpfLoad = 6,
     /// Kernel module load attempt (sys_enter_init_module) — Tier 2.
     ModuleLoad = 7,
+    /// Process fork (sched/sched_process_fork). `flags`=child_pid, `path`=child_comm.
+    Fork = 8,
+    /// Process exit (sched/sched_process_exit). `flags`=exit_code.
+    Exit = 9,
+    /// Credentials change (commit_creds kprobe). `flags`=new_uid, `aux`=old_uid.
+    CredsChanged = 10,
+    /// TCP data sent (tcp_sendmsg kprobe). `aux`=bytes.
+    TcpSend = 11,
+    /// TCP data received (tcp_recvmsg kprobe). `aux`=bytes.
+    TcpRecv = 12,
+    /// OOM kill victim (oom/mark_victim). `pid`=victim_pid, `path`=victim_comm.
+    OomKill = 13,
 }
 
 impl EventKind {
@@ -47,6 +59,12 @@ impl EventKind {
             5 => Some(Self::Mount),
             6 => Some(Self::BpfLoad),
             7 => Some(Self::ModuleLoad),
+            8 => Some(Self::Fork),
+            9 => Some(Self::Exit),
+            10 => Some(Self::CredsChanged),
+            11 => Some(Self::TcpSend),
+            12 => Some(Self::TcpRecv),
+            13 => Some(Self::OomKill),
             _ => None,
         }
     }
@@ -75,8 +93,10 @@ pub struct RawSecurityEvent {
     pub path: [u8; MAX_PATH_LEN],
     /// Execve first argument (null-terminated).
     pub args: [u8; MAX_ARGS_LEN],
-    /// Open flags for `openat`, unused for other event types.
+    /// Open flags for `openat`; new_uid for `CredsChanged`; child_pid for `Fork`; exit_code for `Exit`.
     pub flags: u32,
+    /// Auxiliary u64: byte count for `TcpSend`/`TcpRecv`; old_uid for `CredsChanged`.
+    pub aux: u64,
     /// Destination IPv4 address in network byte order (for `connect`).
     pub dest_ip: u32,
     /// Destination port in host byte order (for `connect`).
@@ -122,6 +142,12 @@ mod tests {
         assert_eq!(EventKind::from_u32(1), Some(EventKind::Execve));
         assert_eq!(EventKind::from_u32(2), Some(EventKind::Openat));
         assert_eq!(EventKind::from_u32(3), Some(EventKind::Connect));
+        assert_eq!(EventKind::from_u32(8), Some(EventKind::Fork));
+        assert_eq!(EventKind::from_u32(9), Some(EventKind::Exit));
+        assert_eq!(EventKind::from_u32(10), Some(EventKind::CredsChanged));
+        assert_eq!(EventKind::from_u32(11), Some(EventKind::TcpSend));
+        assert_eq!(EventKind::from_u32(12), Some(EventKind::TcpRecv));
+        assert_eq!(EventKind::from_u32(13), Some(EventKind::OomKill));
         assert_eq!(EventKind::from_u32(99), None);
     }
 

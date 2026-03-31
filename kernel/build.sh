@@ -25,6 +25,7 @@ echo ""
 
 # Build inside Docker for reliable cross-compilation
 docker run --rm \
+    --memory 6g \
     -v "${SCRIPT_DIR}:/build" \
     -v "${OUTPUT_DIR}:/output" \
     -w /src \
@@ -35,9 +36,13 @@ docker run --rm \
         echo '📦 Installing cross-compilation toolchain...'
         apt-get update -qq
         apt-get install -y -qq \
-            gcc-aarch64-linux-gnu make flex bison libssl-dev bc \
-            wget xz-utils dwarves libelf-dev > /dev/null 2>&1
+            gcc gcc-aarch64-linux-gnu make flex bison libssl-dev bc \
+            wget xz-utils dwarves libelf-dev pkg-config python3 > /dev/null 2>&1
         
+        echo '🔍 Toolchain versions:'
+        aarch64-linux-gnu-gcc --version | head -1
+        pahole --version 2>/dev/null || echo 'pahole not found!'
+
         echo '⬇️  Downloading Linux ${KERNEL_VERSION} source...'
         wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VERSION}.tar.xz
         tar xf linux-${KERNEL_VERSION}.tar.xz
@@ -53,15 +58,38 @@ docker run --rm \
         # Resolve any dependency conflicts introduced by our overrides
         make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig > /dev/null 2>&1
         
-        echo '🔍 Verifying vSock config...'
-        grep -E 'VSOCK|VIRTIO_VSOCK' .config
-
-        echo '🔍 Verifying eBPF config...'
-        grep -E 'CONFIG_BPF=|CONFIG_BPF_SYSCALL=|CONFIG_BPF_JIT=|CONFIG_TRACEPOINTS=|CONFIG_FTRACE_SYSCALLS=|CONFIG_PERF_EVENTS=|CONFIG_DEBUG_INFO_BTF=' .config
+        echo '🔍 Verifying critical configs survived olddefconfig...'
+        FAILED=0
+        for cfg in CONFIG_BPF_SYSCALL CONFIG_DEBUG_INFO_BTF CONFIG_KPROBES CONFIG_FTRACE_SYSCALLS CONFIG_PERF_EVENTS CONFIG_VSOCKETS CONFIG_VIRTIO_VSOCKETS; do
+            if ! grep -q \"^\${cfg}=y\" .config; then
+                echo \"❌ FATAL: \${cfg} was dropped by olddefconfig!\"
+                grep \"\${cfg}\" .config || echo \"  (not found at all)\"
+                FAILED=1
+            fi
+        done
+        if [ \"\$FAILED\" -eq 1 ]; then
+            echo ''
+            echo '🔍 Full BPF/debug config for diagnosis:'
+            grep -E 'CONFIG_BPF|CONFIG_DEBUG_INFO|CONFIG_KPROBE|CONFIG_FTRACE|CONFIG_PERF|CONFIG_VSOCK|CONFIG_VIRTIO_VSOCK' .config
+            exit 1
+        fi
+        echo '✅ All critical configs verified'
         
         echo ''
         echo '🔨 Building kernel (this takes ~5-10 minutes)...'
-        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j\$(nproc) Image 2>&1 | tail -5
+        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j\$(nproc) Image 2>&1 || {
+            echo ''
+            echo '🔍 Diagnosing BTF failure...'
+            echo 'DWARF sections in vmlinux:'
+            aarch64-linux-gnu-readelf -S vmlinux 2>/dev/null | grep -i debug || echo '  No debug sections found!'
+            echo ''
+            echo 'Trying pahole manually:'
+            pahole --btf_encode_detached /tmp/test.btf vmlinux 2>&1 || true
+            echo ''
+            echo 'DEBUG_INFO config:'
+            grep CONFIG_DEBUG_INFO .config
+            exit 1
+        }
         
         echo ''
         echo '📋 Kernel binary info:'

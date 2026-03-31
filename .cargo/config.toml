@@ -1,2 +1,3 @@
 [target.aarch64-unknown-linux-musl]
 linker = "/Users/malcolmgriffin/.gemini/antigravity/scratch/garden-ai/scripts/aarch64-linux-musl-zig-cc"
+rustflags = ["-C", "link-self-contained=no"]

@@ -72,6 +72,44 @@ pub enum SecurityEventKind {
         syscall_name: String,
         allowed: bool,
     },
+    /// A process was forked.
+    ProcessFork {
+        /// Parent process PID.
+        parent_pid: u32,
+        /// Newly spawned child PID.
+        child_pid: u32,
+        /// Child process name.
+        child_comm: String,
+    },
+    /// A process exited.
+    ProcessExit {
+        /// Exit code / signal number.
+        exit_code: u32,
+    },
+    /// Process credentials changed (commit_creds kprobe).
+    CredsChanged {
+        /// UID before the change.
+        old_uid: u32,
+        /// UID after the change (0 = root — escalation).
+        new_uid: u32,
+    },
+    /// TCP data was sent.
+    TcpSend {
+        /// Bytes sent in this call.
+        bytes: u64,
+    },
+    /// TCP data was received.
+    TcpRecv {
+        /// Bytes requested in this receive call.
+        bytes: u64,
+    },
+    /// The OOM killer selected a victim process.
+    OomKill {
+        /// PID of the process being killed.
+        victim_pid: u32,
+        /// Name of the process being killed.
+        victim_comm: String,
+    },
 }
 
 #[cfg(test)]
@@ -163,6 +201,22 @@ mod tests {
                 syscall_nr: 59,
                 syscall_name: "execve".into(),
                 allowed: true,
+            },
+            SecurityEventKind::ProcessFork {
+                parent_pid: 100,
+                child_pid: 101,
+                child_comm: "bash".into(),
+            },
+            SecurityEventKind::ProcessExit { exit_code: 0 },
+            SecurityEventKind::CredsChanged {
+                old_uid: 1000,
+                new_uid: 0,
+            },
+            SecurityEventKind::TcpSend { bytes: 4096 },
+            SecurityEventKind::TcpRecv { bytes: 8192 },
+            SecurityEventKind::OomKill {
+                victim_pid: 500,
+                victim_comm: "oom-test".into(),
             },
         ];
         for kind in kinds {
