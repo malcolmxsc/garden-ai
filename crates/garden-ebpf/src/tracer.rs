@@ -5,6 +5,8 @@
 //! no-op stub.
 
 use super::events::{SecurityEvent, SecurityEventKind};
+#[cfg(target_os = "linux")]
+use super::policy::PolicyAction;
 use garden_ebpf_common::{bytes_to_str, EventKind, RawSecurityEvent, MAX_COMM_LEN};
 use tokio::sync::mpsc;
 
@@ -145,7 +147,7 @@ fn convert_raw_event(raw: &RawSecurityEvent) -> Option<SecurityEvent> {
 /// - `mpsc::Receiver<SecurityEvent>` — event stream (capacity 1024)
 #[cfg(target_os = "linux")]
 pub async fn start_tracer(
-    _policy: &super::policy::SecurityPolicy,
+    policy: super::policy::SecurityPolicy,
 ) -> anyhow::Result<(TracerHandle, mpsc::Receiver<SecurityEvent>)> {
     use aya::maps::perf::AsyncPerfEventArray;
     use aya::programs::{KProbe, TracePoint};
@@ -250,6 +252,7 @@ pub async fn start_tracer(
     tracing::info!("Attached {}/{} kprobes", kprobes_attached, kprobes.len());
 
     // 4. Open PerfEventArray and spawn per-CPU polling tasks
+    let policy = std::sync::Arc::new(policy);
     let (tx, rx) = mpsc::channel::<SecurityEvent>(1024);
 
     let mut perf_array = AsyncPerfEventArray::try_from(
@@ -263,6 +266,7 @@ pub async fn start_tracer(
     for cpu_id in cpus {
         let mut buf = perf_array.open(cpu_id, Some(256))?;
         let tx = tx.clone();
+        let policy = policy.clone();
 
         tokio::spawn(async move {
             let mut buffers = (0..10)
@@ -290,8 +294,19 @@ pub async fn start_tracer(
                             &*(buffers[i].as_ptr() as *const RawSecurityEvent)
                         };
                         if let Some(event) = convert_raw_event(raw) {
-                            // Non-blocking send — drop events if channel is full
-                            // rather than blocking the perf reader
+                            // Enforce policy: SIGKILL the process immediately on Deny.
+                            // The syscall already completed (tracepoints are async), but
+                            // killing here prevents the process from making further syscalls.
+                            if policy.evaluate(&event) == PolicyAction::Deny {
+                                unsafe {
+                                    libc::kill(event.pid as libc::pid_t, libc::SIGKILL);
+                                }
+                                tracing::warn!(
+                                    "ENFORCED KILL: pid={} comm={} {:?}",
+                                    event.pid, event.comm, event.kind
+                                );
+                            }
+                            // Always forward to channel so daemon can log the event
                             if tx.try_send(event).is_err() {
                                 tracing::warn!("Telemetry channel full, dropping event");
                             }
@@ -314,7 +329,7 @@ pub async fn start_tracer(
 /// conditional compilation at every call site.
 #[cfg(not(target_os = "linux"))]
 pub async fn start_tracer(
-    _policy: &super::policy::SecurityPolicy,
+    _policy: super::policy::SecurityPolicy,
 ) -> anyhow::Result<(TracerHandle, mpsc::Receiver<SecurityEvent>)> {
     tracing::warn!("eBPF tracer is only available on Linux (inside the guest VM)");
     let (_tx, rx) = mpsc::channel(1);

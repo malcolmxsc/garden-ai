@@ -19,3 +19,4 @@ glob = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { workspace = true }
 bytes = { workspace = true }
+libc = "0.2"

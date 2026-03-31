@@ -76,14 +76,105 @@ fn main() {
 
 pub struct GardenAgentImpl {
     boot_time: std::time::Instant,
+    /// Pre-built seccomp baseline filter applied to every spawned child process.
+    /// Built once at startup and shared (read-only) across all command invocations.
+    #[cfg(target_os = "linux")]
+    seccomp_filter: std::sync::Arc<seccompiler::BpfProgram>,
+}
+
+impl GardenAgentImpl {
+    fn new() -> Self {
+        #[cfg(target_os = "linux")]
+        let seccomp_filter = {
+            match build_seccomp_baseline() {
+                Ok(prog) => {
+                    tracing::info!("Seccomp baseline filter built successfully");
+                    std::sync::Arc::new(prog)
+                }
+                Err(e) => {
+                    tracing::error!("Failed to build seccomp filter: {} — spawned commands will be unfiltered", e);
+                    // Build an empty (allow-all) filter as fallback rather than crashing
+                    std::sync::Arc::new(build_seccomp_allow_all())
+                }
+            }
+        };
+
+        Self {
+            boot_time: std::time::Instant::now(),
+            #[cfg(target_os = "linux")]
+            seccomp_filter,
+        }
+    }
 }
 
 impl Default for GardenAgentImpl {
     fn default() -> Self {
-        Self {
-            boot_time: std::time::Instant::now(),
-        }
+        Self::new()
     }
+}
+
+/// Build a seccomp-BPF filter that blocks dangerous syscalls with EPERM.
+/// Default action is Allow — only the listed syscalls are blocked.
+///
+/// Blocked syscalls are operations that a legitimate AI agent workload should
+/// never need and represent significant escalation or escape vectors.
+#[cfg(target_os = "linux")]
+fn build_seccomp_baseline() -> anyhow::Result<seccompiler::BpfProgram> {
+    use seccompiler::{SeccompAction, SeccompFilter, SeccompRule, TargetArch};
+    use std::collections::BTreeMap;
+
+    // aarch64 syscall numbers for blocked operations
+    // See: https://github.com/torvalds/linux/blob/master/include/uapi/asm-generic/unistd.h
+    let blocked_syscalls: &[i64] = &[
+        40,  // mount           — filesystem escape
+        39,  // umount2         — filesystem escape
+        105, // init_module     — kernel module load
+        273, // finit_module    — kernel module load via fd
+        106, // delete_module   — kernel module removal
+        117, // ptrace          — process inspection/injection
+        104, // kexec_load      — kernel replacement
+        294, // kexec_file_load — kernel replacement via file
+        142, // reboot          — VM shutdown
+        224, // swapon          — storage escape
+        225, // swapoff         — storage escape
+        161, // sethostname     — identity change
+        162, // setdomainname   — identity change
+        241, // perf_event_open — side-channel / kernel introspection
+    ];
+
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    for &nr in blocked_syscalls {
+        rules.insert(nr, vec![SeccompRule::new(
+            vec![],
+            SeccompAction::Errno(libc::EPERM as u32),
+        )?]);
+    }
+
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,  // default: allow everything else
+        SeccompAction::Allow,  // on missing arch: allow
+        TargetArch::aarch64,
+    )?;
+
+    Ok(filter.try_into()?)
+}
+
+/// Fallback: build a trivial allow-all BPF program used if the baseline fails to compile.
+#[cfg(target_os = "linux")]
+fn build_seccomp_allow_all() -> seccompiler::BpfProgram {
+    use seccompiler::{SeccompAction, SeccompFilter, TargetArch};
+    use std::collections::BTreeMap;
+
+    let filter = SeccompFilter::new(
+        BTreeMap::new(),
+        SeccompAction::Allow,
+        SeccompAction::Allow,
+        TargetArch::aarch64,
+    )
+    .expect("allow-all seccomp filter should never fail");
+
+    filter.try_into().expect("allow-all seccomp filter conversion should never fail")
 }
 
 #[tonic::async_trait]
@@ -108,11 +199,28 @@ impl AgentService for GardenAgentImpl {
 
         // Use tokio::process::Command for non-blocking child process management.
         // This integrates with tokio's reactor and handles waitpid internally.
-        let output = tokio::process::Command::new(&req.command)
+        let mut command = tokio::process::Command::new(&req.command);
+        command
             .args(&req.args)
             .current_dir(&target_cwd)
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        // Apply the seccomp baseline filter to the child process.
+        // pre_exec runs after fork() but before exec() in the child, so it
+        // cannot affect the agent process itself.
+        #[cfg(target_os = "linux")]
+        {
+            let filter = self.seccomp_filter.clone();
+            unsafe {
+                command.pre_exec(move || {
+                    seccompiler::apply_filter(&filter)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                });
+            }
+        }
+
+        let output = command
             .output()
             .await
             .map_err(|e| {
@@ -277,7 +385,7 @@ async fn async_main() -> anyhow::Result<()> {
     // =========================================================
     let default_policy = garden_ebpf::policy::SecurityPolicy::default_observe();
 
-    match garden_ebpf::tracer::start_tracer(&default_policy).await {
+    match garden_ebpf::tracer::start_tracer(default_policy).await {
         Ok((handle, mut rx)) => {
             tracing::info!("eBPF tracer started successfully");
             // Leak the handle so programs stay attached for VM lifetime

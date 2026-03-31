@@ -17,7 +17,7 @@ mod linux_tests {
     #[ignore] // Requires root + BPF-capable kernel
     async fn test_probes_load_and_attach() {
         let policy = SecurityPolicy::default_observe();
-        let (handle, _rx) = garden_ebpf::tracer::start_tracer(&policy)
+        let (handle, _rx) = garden_ebpf::tracer::start_tracer(policy)
             .await
             .expect("tracer should start — check kernel BPF config and root privileges");
 
@@ -29,7 +29,7 @@ mod linux_tests {
     #[ignore]
     async fn test_execve_event_received() {
         let policy = SecurityPolicy::default_observe();
-        let (_handle, mut rx) = garden_ebpf::tracer::start_tracer(&policy)
+        let (_handle, mut rx) = garden_ebpf::tracer::start_tracer(policy)
             .await
             .expect("tracer should start");
 
@@ -61,7 +61,7 @@ mod linux_tests {
     #[ignore]
     async fn test_openat_event_received() {
         let policy = SecurityPolicy::default_observe();
-        let (_handle, mut rx) = garden_ebpf::tracer::start_tracer(&policy)
+        let (_handle, mut rx) = garden_ebpf::tracer::start_tracer(policy)
             .await
             .expect("tracer should start");
 
@@ -91,7 +91,7 @@ mod linux_tests {
     #[ignore]
     async fn test_connect_event_received() {
         let policy = SecurityPolicy::default_observe();
-        let (_handle, mut rx) = garden_ebpf::tracer::start_tracer(&policy)
+        let (_handle, mut rx) = garden_ebpf::tracer::start_tracer(policy)
             .await
             .expect("tracer should start");
 
@@ -124,7 +124,7 @@ mod linux_tests {
     #[ignore]
     async fn test_event_fields_correct() {
         let policy = SecurityPolicy::default_observe();
-        let (_handle, mut rx) = garden_ebpf::tracer::start_tracer(&policy)
+        let (_handle, mut rx) = garden_ebpf::tracer::start_tracer(policy)
             .await
             .expect("tracer should start");
 
@@ -164,7 +164,7 @@ mod macos_tests {
     #[tokio::test]
     async fn test_stub_tracer_returns_ok() {
         let policy = SecurityPolicy::default_observe();
-        let (handle, mut rx) = garden_ebpf::tracer::start_tracer(&policy)
+        let (handle, mut rx) = garden_ebpf::tracer::start_tracer(policy)
             .await
             .expect("stub tracer should return Ok");
 
