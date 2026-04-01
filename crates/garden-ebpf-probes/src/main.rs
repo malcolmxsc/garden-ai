@@ -27,13 +27,13 @@
 use aya_ebpf::{
     cty::c_long,
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
-        bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_probe_read_user_buf,
-        bpf_probe_read_user_str_bytes,
+        bpf_d_path, bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
+        bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes,
+        bpf_probe_read_user_buf, bpf_probe_read_user_str_bytes,
     },
-    macros::{kprobe, map, tracepoint},
-    maps::{PerCpuArray, PerfEventArray},
-    programs::{ProbeContext, TracePointContext},
+    macros::{kprobe, lsm, map, tracepoint},
+    maps::{HashMap, LpmTrie, PerCpuArray, PerfEventArray},
+    programs::{LsmContext, ProbeContext, TracePointContext},
 };
 use garden_ebpf_common::{EventKind, RawSecurityEvent};
 
@@ -675,6 +675,293 @@ fn try_trace_tcp_recvmsg(ctx: &ProbeContext) -> Result<(), c_long> {
 
     EVENTS.output(ctx, event, 0);
     Ok(())
+}
+
+// ===========================================================================
+// BPF-LSM policy enforcement
+// ===========================================================================
+//
+// These maps are populated by userspace (tracer.rs::populate_policy_maps) at
+// probe load time. LSM hooks look up policy here synchronously — before the
+// syscall completes — and return -EPERM if a Deny rule matches. No userspace
+// roundtrip is needed; the BPF program enforces directly.
+//
+// Map key conventions:
+//   DENIED_PATHS / ALLOWED_PATHS: null-terminated path, zero-padded to 256 bytes
+//   DENIED_NETS / ALLOWED_NETS:   LPM key = [prefix_len: u32 LE][ip: u32 BE]
+//
+// Evaluation order: ALLOWED wins over DENIED (first-match-wins with allow first).
+// Glob patterns are not supported in BPF — handled by kill-on-detect fallback.
+
+/// Per-CPU scratch buffer for path strings used in LSM hook map lookups.
+/// Avoids putting 256-byte arrays on the 512-byte BPF stack limit.
+#[map]
+static PATH_SCRATCH: PerCpuArray<[u8; 256]> = PerCpuArray::with_max_entries(1, 0);
+
+/// Paths explicitly denied by policy (exact match, no globs).
+/// Populated from `PolicyRule::FileAccess { action: Deny }` rules without globs.
+#[map]
+static DENIED_PATHS: HashMap<[u8; 256], u8> = HashMap::with_max_entries(512, 0);
+
+/// Paths explicitly allowed by policy. Checked before DENIED_PATHS.
+/// Populated from `PolicyRule::FileAccess { action: Allow }` rules without globs.
+#[map]
+static ALLOWED_PATHS: HashMap<[u8; 256], u8> = HashMap::with_max_entries(512, 0);
+
+/// Network CIDR ranges denied by policy (longest-prefix match).
+/// Key: [prefix_len: u32 LE][ipv4: u32 in network byte order].
+/// Populated from `PolicyRule::Network { port: None, action: Deny }` rules.
+#[map]
+static DENIED_NETS: LpmTrie<[u8; 8], u8> = LpmTrie::with_max_entries(256, 0);
+
+/// Network CIDR ranges allowed by policy. Checked before DENIED_NETS.
+/// Populated from `PolicyRule::Network { port: None, action: Allow }` rules.
+#[map]
+static ALLOWED_NETS: LpmTrie<[u8; 8], u8> = LpmTrie::with_max_entries(256, 0);
+
+/// Linux EPERM errno value (permission denied).
+const EPERM: i32 = 1;
+
+/// Byte offset of `f_path` within `struct file` on aarch64 Linux 6.12.
+/// Verified via BTF: `pahole -C file vmlinux | grep f_path`.
+const OFFSET_FILE_F_PATH: usize = 16;
+
+// ---------------------------------------------------------------------------
+// LSM probe: file_open — block forbidden file access before open() returns
+// ---------------------------------------------------------------------------
+//
+// Hook fires synchronously when any process calls open()/openat(). We use
+// bpf_d_path() to resolve the full path (following symlinks and mounts),
+// then check ALLOWED_PATHS / DENIED_PATHS. Returns -EPERM immediately if
+// the path is denied — no SIGKILL needed.
+//
+// Limitation: glob patterns can't be evaluated in BPF, so only exact-path
+// rules are enforced here. Glob rules fall back to kill-on-detect.
+
+#[lsm(hook = "file_open")]
+pub fn lsm_file_open(ctx: LsmContext) -> i32 {
+    match try_lsm_file_open(&ctx) {
+        Ok(verdict) => verdict,
+        Err(_) => 0, // fail open on error
+    }
+}
+
+fn try_lsm_file_open(ctx: &LsmContext) -> Result<i32, c_long> {
+    // Get path scratch buffer — avoids 256-byte local on stack
+    let path_buf_ptr = unsafe { PATH_SCRATCH.get_ptr_mut(0).ok_or(1i64)? };
+    // Zero the buffer so unused bytes don't pollute the map key
+    unsafe { core::ptr::write_bytes(path_buf_ptr as *mut u8, 0, 256) };
+
+    // arg(0) is struct file *file
+    let file_ptr: *mut core::ffi::c_void = unsafe { ctx.arg(0) };
+    if file_ptr.is_null() {
+        return Ok(0);
+    }
+
+    // f_path is at offset OFFSET_FILE_F_PATH in struct file (aarch64 Linux 6.12).
+    // bpf_d_path() resolves the vfsmount + dentry into a full path string.
+    let f_path_ptr = (file_ptr as usize + OFFSET_FILE_F_PATH) as *mut core::ffi::c_void;
+    let ret = unsafe {
+        bpf_d_path(f_path_ptr as *mut _, path_buf_ptr as *mut u8, 256)
+    };
+    if ret < 0 {
+        return Ok(0); // fail open if path extraction fails
+    }
+
+    let path_key = unsafe { &*(path_buf_ptr as *const [u8; 256]) };
+
+    // Allow list takes precedence
+    if unsafe { ALLOWED_PATHS.get(path_key) }.is_some() {
+        return Ok(0);
+    }
+
+    // Check deny list
+    if unsafe { DENIED_PATHS.get(path_key) }.is_some() {
+        let event = get_scratch_event().ok_or(1i64)?;
+        event.kind = EventKind::Openat as u32;
+        event.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        event.timestamp_ns = unsafe { bpf_ktime_get_ns() };
+        event.comm = bpf_get_current_comm()?;
+        event.path.copy_from_slice(path_key);
+        EVENTS.output(ctx, event, 0);
+        return Ok(-EPERM);
+    }
+
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// LSM probe: socket_connect — block forbidden network connections
+// ---------------------------------------------------------------------------
+//
+// Hook fires before connect() completes. We read the destination sockaddr,
+// build an LPM key, and check ALLOWED_NETS / DENIED_NETS. Only AF_INET
+// (IPv4) is checked; AF_INET6 and AF_UNIX pass through.
+
+#[lsm(hook = "socket_connect")]
+pub fn lsm_socket_connect(ctx: LsmContext) -> i32 {
+    match try_lsm_socket_connect(&ctx) {
+        Ok(verdict) => verdict,
+        Err(_) => 0,
+    }
+}
+
+fn try_lsm_socket_connect(ctx: &LsmContext) -> Result<i32, c_long> {
+    // arg(1) is struct sockaddr *address
+    let addr_ptr: *const u8 = unsafe { ctx.arg(1) };
+    if addr_ptr.is_null() {
+        return Ok(0);
+    }
+
+    // Read first 8 bytes: sa_family(2) + sin_port(2) + sin_addr(4)
+    let sa_buf: [u8; 8] = unsafe {
+        bpf_probe_read_kernel(addr_ptr as *const [u8; 8]).unwrap_or([0u8; 8])
+    };
+
+    // Only enforce IPv4 connections
+    let sa_family = u16::from_ne_bytes([sa_buf[0], sa_buf[1]]);
+    if sa_family != AF_INET {
+        return Ok(0);
+    }
+
+    // sin_port in network byte order; sin_addr in network byte order
+    let dest_port = u16::from_be_bytes([sa_buf[2], sa_buf[3]]);
+    let dest_ip_be = u32::from_ne_bytes([sa_buf[4], sa_buf[5], sa_buf[6], sa_buf[7]]);
+
+    // LPM key: [prefix_len=32 as u32 LE][ip as u32 in network order]
+    // Prefix length 32 means "look up this exact host; LPM trie returns longest match".
+    let mut lpm_key = [0u8; 8];
+    lpm_key[0..4].copy_from_slice(&32u32.to_ne_bytes());
+    lpm_key[4..8].copy_from_slice(&dest_ip_be.to_ne_bytes());
+
+    // Allow list takes precedence
+    if unsafe { ALLOWED_NETS.get(&lpm_key) }.is_some() {
+        return Ok(0);
+    }
+
+    // Check deny list
+    if unsafe { DENIED_NETS.get(&lpm_key) }.is_some() {
+        let event = get_scratch_event().ok_or(1i64)?;
+        event.kind = EventKind::Connect as u32;
+        event.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        event.timestamp_ns = unsafe { bpf_ktime_get_ns() };
+        event.comm = bpf_get_current_comm()?;
+        event.dest_ip = dest_ip_be;
+        event.dest_port = dest_port;
+        event.protocol = 6; // TCP
+        EVENTS.output(ctx, event, 0);
+        return Ok(-EPERM);
+    }
+
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// LSM probe: bprm_check_security — block forbidden binary execution
+// ---------------------------------------------------------------------------
+//
+// Hook fires when the kernel is about to exec a binary (after ELF/script
+// detection). `bprm->buf` at offset 0 contains the binary path string.
+// We check the same ALLOWED_PATHS / DENIED_PATHS maps as lsm_file_open.
+
+#[lsm(hook = "bprm_check_security")]
+pub fn lsm_bprm_check(ctx: LsmContext) -> i32 {
+    match try_lsm_bprm_check(&ctx) {
+        Ok(verdict) => verdict,
+        Err(_) => 0,
+    }
+}
+
+fn try_lsm_bprm_check(ctx: &LsmContext) -> Result<i32, c_long> {
+    let path_buf_ptr = unsafe { PATH_SCRATCH.get_ptr_mut(0).ok_or(1i64)? };
+    unsafe { core::ptr::write_bytes(path_buf_ptr as *mut u8, 0, 256) };
+
+    // arg(0) is struct linux_binprm *bprm.
+    // bprm->buf (offset 0) holds the binary path as a null-terminated string.
+    let bprm_ptr: *const u8 = unsafe { ctx.arg(0) };
+    if bprm_ptr.is_null() {
+        return Ok(0);
+    }
+
+    // Read binary path from bprm->buf into scratch buffer
+    let path_slice = unsafe { &mut *(path_buf_ptr as *mut [u8; 256]) };
+    let _ = unsafe { bpf_probe_read_kernel_str_bytes(bprm_ptr, path_slice) };
+
+    let path_key = unsafe { &*(path_buf_ptr as *const [u8; 256]) };
+
+    if unsafe { ALLOWED_PATHS.get(path_key) }.is_some() {
+        return Ok(0);
+    }
+
+    if unsafe { DENIED_PATHS.get(path_key) }.is_some() {
+        let event = get_scratch_event().ok_or(1i64)?;
+        event.kind = EventKind::Execve as u32;
+        event.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        event.timestamp_ns = unsafe { bpf_ktime_get_ns() };
+        event.comm = bpf_get_current_comm()?;
+        event.path.copy_from_slice(path_key);
+        EVENTS.output(ctx, event, 0);
+        return Ok(-EPERM);
+    }
+
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// LSM probe: sb_mount — block all mount attempts from non-init processes
+// ---------------------------------------------------------------------------
+//
+// Hook fires before mount() completes. In our VM, only PID 1 (init) mounts
+// filesystems during boot. Any mount from another process is an escape attempt
+// (bind-mounting /proc or /sys to get out of a chroot). We emit a telemetry
+// event regardless and deny if the caller is not PID 1.
+
+#[lsm(hook = "sb_mount")]
+pub fn lsm_sb_mount(ctx: LsmContext) -> i32 {
+    match try_lsm_sb_mount(&ctx) {
+        Ok(verdict) => verdict,
+        Err(_) => 0,
+    }
+}
+
+fn try_lsm_sb_mount(ctx: &LsmContext) -> Result<i32, c_long> {
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+
+    let event = get_scratch_event().ok_or(1i64)?;
+    event.kind = EventKind::Mount as u32;
+    event.pid = pid;
+    event.timestamp_ns = unsafe { bpf_ktime_get_ns() };
+    event.comm = bpf_get_current_comm()?;
+
+    // arg(0) is const char *dev_name
+    let dev_name_ptr: *const u8 = unsafe { ctx.arg(0) };
+    if !dev_name_ptr.is_null() {
+        let _ = unsafe { bpf_probe_read_kernel_str_bytes(dev_name_ptr, &mut event.args) };
+    }
+
+    // arg(1) is const struct path *path (mount target).
+    // bpf_d_path() resolves the mount target to a full path string.
+    let path_ptr: *mut core::ffi::c_void = unsafe { ctx.arg(1) };
+    if !path_ptr.is_null() {
+        let path_buf_ptr = unsafe { PATH_SCRATCH.get_ptr_mut(0).ok_or(1i64)? };
+        unsafe { core::ptr::write_bytes(path_buf_ptr as *mut u8, 0, 256) };
+        let ret = unsafe {
+            bpf_d_path(path_ptr as *mut _, path_buf_ptr as *mut u8, 256)
+        };
+        if ret >= 0 {
+            let path_key = unsafe { &*(path_buf_ptr as *const [u8; 256]) };
+            event.path.copy_from_slice(path_key);
+        }
+    }
+
+    EVENTS.output(ctx, event, 0);
+
+    // Block any mount from non-init — no legitimate workload process should mount
+    if pid != 1 {
+        return Ok(-EPERM);
+    }
+
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------

@@ -55,6 +55,14 @@ pub enum PolicyAction {
     Log,
 }
 
+/// Returns `true` if `pattern` contains glob metacharacters (`*` or `?`).
+///
+/// Used by `tracer.rs` to decide whether a `FileAccess` rule can be encoded
+/// into a BPF map (exact match only) or must fall back to kill-on-detect.
+pub fn has_glob_pattern(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?')
+}
+
 impl SecurityPolicy {
     /// Evaluate an event against all rules. Returns the action for the first
     /// matching rule, or `PolicyAction::Log` if no rules match (default:

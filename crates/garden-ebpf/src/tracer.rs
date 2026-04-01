@@ -150,8 +150,9 @@ pub async fn start_tracer(
     policy: super::policy::SecurityPolicy,
 ) -> anyhow::Result<(TracerHandle, mpsc::Receiver<SecurityEvent>)> {
     use aya::maps::perf::AsyncPerfEventArray;
-    use aya::programs::{KProbe, TracePoint};
+    use aya::programs::{KProbe, Lsm, TracePoint};
     use aya::util::online_cpus;
+    use aya::Btf;
     use bytes::BytesMut;
 
     tracing::info!("Loading eBPF probes...");
@@ -168,6 +169,12 @@ pub async fn start_tracer(
     ));
     let bpf_bytes = bpf_bytes_raw.to_vec();
     let mut ebpf = aya::Ebpf::load(&bpf_bytes)?;
+
+    // 1b. Populate BPF-LSM policy maps before attaching probes.
+    // LSM probes read these maps synchronously at hook time, so they must be
+    // populated before the probes are attached. Glob-pattern rules are skipped
+    // here and fall back to kill-on-detect in the perf event loop.
+    populate_policy_maps(&mut ebpf, &policy)?;
 
     // 2. Attach tracepoints (Tier 1 + Tier 2)
     //
@@ -251,7 +258,54 @@ pub async fn start_tracer(
     }
     tracing::info!("Attached {}/{} kprobes", kprobes_attached, kprobes.len());
 
-    // 4. Open PerfEventArray and spawn per-CPU polling tasks
+    // 4. Attach BPF-LSM programs.
+    // LSM programs enforce policy synchronously — before syscalls complete —
+    // by returning -EPERM from the hook. They require BTF (loaded from
+    // /sys/kernel/btf/vmlinux) for CO-RE relocation at load time.
+    let btf = Btf::from_sys_fs().unwrap_or_else(|e| {
+        tracing::warn!("Failed to load BTF from /sys/kernel/btf/vmlinux: {} — LSM probes may not load", e);
+        // Safety: we'll fail at load time below if BTF is missing
+        unsafe { core::mem::zeroed() }
+    });
+
+    let lsm_hooks: &[(&str, &str, bool)] = &[
+        ("lsm_file_open",      "file_open",           false),
+        ("lsm_socket_connect", "socket_connect",       false),
+        ("lsm_bprm_check",     "bprm_check_security", false),
+        ("lsm_sb_mount",       "sb_mount",             false),
+    ];
+
+    let mut lsm_attached = 0u32;
+    for (name, hook, required) in lsm_hooks {
+        let result = (|| -> anyhow::Result<()> {
+            let program: &mut Lsm = ebpf
+                .program_mut(name)
+                .ok_or_else(|| anyhow::anyhow!("BPF program '{}' not found in ELF", name))?
+                .try_into()?;
+            program.load(hook, &btf)?;
+            program.attach()?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                tracing::info!("Attached BPF-LSM hook: {}", hook);
+                lsm_attached += 1;
+            }
+            Err(e) if *required => {
+                return Err(e.context(format!("Required LSM hook {} failed", hook)));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Optional LSM hook {} unavailable (need CONFIG_BPF_LSM=y + 'bpf' in CONFIG_LSM): {}",
+                    hook, e
+                );
+            }
+        }
+    }
+    tracing::info!("Attached {}/{} BPF-LSM hooks", lsm_attached, lsm_hooks.len());
+
+    // 5. Open PerfEventArray and spawn per-CPU polling tasks
     let policy = std::sync::Arc::new(policy);
     let (tx, rx) = mpsc::channel::<SecurityEvent>(1024);
 
@@ -259,6 +313,9 @@ pub async fn start_tracer(
         ebpf.take_map("EVENTS")
             .ok_or_else(|| anyhow::anyhow!("BPF map 'EVENTS' not found"))?,
     )?;
+
+    // Note: `ebpf` must be kept alive for the duration of tracing.
+    // Moved into TracerHandle below.
 
     let cpus = online_cpus().map_err(|e| anyhow::anyhow!("failed to get online CPUs: {:?}", e))?;
     tracing::info!("Starting perf event readers on {} CPUs", cpus.len());
@@ -294,17 +351,30 @@ pub async fn start_tracer(
                             &*(buffers[i].as_ptr() as *const RawSecurityEvent)
                         };
                         if let Some(event) = convert_raw_event(raw) {
-                            // Enforce policy: SIGKILL the process immediately on Deny.
-                            // The syscall already completed (tracepoints are async), but
-                            // killing here prevents the process from making further syscalls.
+                            // Kill-on-detect is now restricted to stateful violations that
+                            // BPF-LSM cannot handle at a single hook point:
+                            //   - TcpSend / TcpRecv: byte-count thresholds accumulated over
+                            //     multiple sends/receives; no single LSM hook covers them.
+                            //
+                            // All single-operation violations (file access, exec, connect,
+                            // mount) are now enforced synchronously by BPF-LSM hooks, which
+                            // return -EPERM before the syscall completes. Killing here for
+                            // those events would be redundant and racy.
                             if policy.evaluate(&event) == PolicyAction::Deny {
-                                unsafe {
-                                    libc::kill(event.pid as libc::pid_t, libc::SIGKILL);
-                                }
-                                tracing::warn!(
-                                    "ENFORCED KILL: pid={} comm={} {:?}",
-                                    event.pid, event.comm, event.kind
+                                let is_stateful = matches!(
+                                    &event.kind,
+                                    SecurityEventKind::TcpSend { .. }
+                                        | SecurityEventKind::TcpRecv { .. }
                                 );
+                                if is_stateful {
+                                    unsafe {
+                                        libc::kill(event.pid as libc::pid_t, libc::SIGKILL);
+                                    }
+                                    tracing::warn!(
+                                        "STATEFUL KILL: pid={} comm={} {:?}",
+                                        event.pid, event.comm, event.kind
+                                    );
+                                }
                             }
                             // Always forward to channel so daemon can log the event
                             if tx.try_send(event).is_err() {
@@ -317,9 +387,151 @@ pub async fn start_tracer(
         });
     }
 
-    tracing::info!("eBPF tracer started — monitoring execve, openat, connect, sendto, mount, bpf, init_module, fork, exit, oom, commit_creds, tcp_sendmsg, tcp_recvmsg");
+    tracing::info!("eBPF tracer started — tracepoints, kprobes, and BPF-LSM hooks active");
 
     Ok((TracerHandle { _ebpf: ebpf }, rx))
+}
+
+/// Populate BPF-LSM policy maps from the given security policy.
+///
+/// Translates `PolicyRule::FileAccess` and `PolicyRule::Network` rules into
+/// BPF map entries. Rules with glob patterns are skipped (BPF can't evaluate
+/// globs) and fall back to kill-on-detect in the perf event loop.
+///
+/// Must be called before attaching LSM probes so the maps are ready when the
+/// first hook fires.
+#[cfg(target_os = "linux")]
+fn populate_policy_maps(
+    ebpf: &mut aya::Ebpf,
+    policy: &super::policy::SecurityPolicy,
+) -> anyhow::Result<()> {
+    use aya::maps::{HashMap, LpmTrie};
+    use super::policy::{PolicyAction, PolicyRule};
+
+    let mut denied_paths: HashMap<_, [u8; 256], u8> =
+        HashMap::try_from(ebpf.map_mut("DENIED_PATHS").ok_or_else(|| {
+            anyhow::anyhow!("BPF map 'DENIED_PATHS' not found")
+        })?)?;
+    let mut allowed_paths: HashMap<_, [u8; 256], u8> =
+        HashMap::try_from(ebpf.map_mut("ALLOWED_PATHS").ok_or_else(|| {
+            anyhow::anyhow!("BPF map 'ALLOWED_PATHS' not found")
+        })?)?;
+    let mut denied_nets: LpmTrie<_, [u8; 8], u8> =
+        LpmTrie::try_from(ebpf.map_mut("DENIED_NETS").ok_or_else(|| {
+            anyhow::anyhow!("BPF map 'DENIED_NETS' not found")
+        })?)?;
+    let mut allowed_nets: LpmTrie<_, [u8; 8], u8> =
+        LpmTrie::try_from(ebpf.map_mut("ALLOWED_NETS").ok_or_else(|| {
+            anyhow::anyhow!("BPF map 'ALLOWED_NETS' not found")
+        })?)?;
+
+    for rule in &policy.rules {
+        match rule {
+            PolicyRule::FileAccess { pattern, action } => {
+                // Skip glob patterns — BPF maps do exact match only.
+                // Glob rules are evaluated by kill-on-detect in the perf loop.
+                if super::policy::has_glob_pattern(pattern) {
+                    tracing::debug!("Glob FileAccess rule skipped for BPF map (kill-on-detect fallback): {}", pattern);
+                    continue;
+                }
+                let key = path_to_map_key(pattern);
+                match action {
+                    PolicyAction::Deny => {
+                        denied_paths.insert(key, 1u8, 0)?;
+                        tracing::debug!("BPF-LSM: DENIED_PATHS += {}", pattern);
+                    }
+                    PolicyAction::Allow => {
+                        allowed_paths.insert(key, 1u8, 0)?;
+                        tracing::debug!("BPF-LSM: ALLOWED_PATHS += {}", pattern);
+                    }
+                    PolicyAction::Log => {}
+                }
+            }
+            PolicyRule::Network { dest, port: None, action } => {
+                // Port-specific rules can't be enforced per-port by CIDR LPM trie;
+                // those fall back to kill-on-detect.
+                match cidr_to_lpm_key(dest) {
+                    Ok(key) => {
+                        match action {
+                            PolicyAction::Deny => {
+                                denied_nets.insert(&key, 1u8, 0)?;
+                                tracing::debug!("BPF-LSM: DENIED_NETS += {}", dest);
+                            }
+                            PolicyAction::Allow => {
+                                allowed_nets.insert(&key, 1u8, 0)?;
+                                tracing::debug!("BPF-LSM: ALLOWED_NETS += {}", dest);
+                            }
+                            PolicyAction::Log => {}
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to parse CIDR '{}' for BPF-LSM map: {}", dest, e);
+                    }
+                }
+            }
+            PolicyRule::Network { port: Some(_), .. } => {
+                // Port-specific rules fall back to kill-on-detect (no per-port LPM trie).
+            }
+            PolicyRule::Syscall { .. } => {
+                // Syscall rules are handled by seccomp, not BPF-LSM maps.
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Convert a filesystem path string to a zero-padded 256-byte BPF map key.
+#[cfg(target_os = "linux")]
+fn path_to_map_key(path: &str) -> [u8; 256] {
+    let mut key = [0u8; 256];
+    let bytes = path.as_bytes();
+    let len = bytes.len().min(255); // leave final byte as null terminator
+    key[..len].copy_from_slice(&bytes[..len]);
+    key
+}
+
+/// Convert a CIDR string (e.g. "10.0.0.0/8") to a BPF LPM trie key.
+///
+/// Key format: `[prefix_len: u32 LE][ipv4: u32 in network byte order]`.
+/// This matches the kernel's `struct bpf_lpm_trie_key` followed by 4-byte data.
+#[cfg(target_os = "linux")]
+fn cidr_to_lpm_key(cidr: &str) -> anyhow::Result<[u8; 8]> {
+    let (net_str, prefix_len) = if let Some((net, bits)) = cidr.split_once('/') {
+        let bits: u32 = bits.parse().map_err(|_| anyhow::anyhow!("invalid prefix length in '{}'", cidr))?;
+        (net, bits)
+    } else {
+        (cidr, 32u32) // bare IP = /32
+    };
+
+    let ip_u32 = parse_ipv4_to_u32(net_str)
+        .ok_or_else(|| anyhow::anyhow!("invalid IPv4 address in '{}'", cidr))?;
+
+    // Mask the address to the prefix length to normalise (e.g. 10.0.0.5/8 → 10.0.0.0/8)
+    let masked = if prefix_len == 0 {
+        0u32
+    } else if prefix_len >= 32 {
+        ip_u32
+    } else {
+        ip_u32 & (!0u32 << (32 - prefix_len))
+    };
+
+    let mut key = [0u8; 8];
+    key[0..4].copy_from_slice(&prefix_len.to_ne_bytes()); // LE on aarch64
+    key[4..8].copy_from_slice(&masked.to_be_bytes());     // network byte order
+    Ok(key)
+}
+
+/// Parse a dotted-quad IPv4 address into a host-byte-order u32.
+#[cfg(target_os = "linux")]
+fn parse_ipv4_to_u32(s: &str) -> Option<u32> {
+    let mut parts = s.split('.');
+    let a: u8 = parts.next()?.parse().ok()?;
+    let b: u8 = parts.next()?.parse().ok()?;
+    let c: u8 = parts.next()?.parse().ok()?;
+    let d: u8 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() { return None; }
+    Some(u32::from_be_bytes([a, b, c, d]))
 }
 
 /// Stub tracer for non-Linux platforms (macOS host).

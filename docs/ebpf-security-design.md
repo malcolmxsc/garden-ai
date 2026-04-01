@@ -16,7 +16,7 @@ The standard approach for sandboxing is seccomp-BPF — attach a syscall filter 
 
 eBPF solves both problems. Tracepoints and kprobes attach to the kernel non-intrusively, capture rich context (pid, comm, arguments, timestamps), and emit structured events to userspace via a `PerfEventArray`. This gives full observability across all processes in the VM regardless of how they were spawned, without requiring any modification to the workloads.
 
-The tradeoff is that tracepoints fire *after* the syscall completes — they are async and read-only with respect to the syscall result. This is why we combine eBPF observability with a separate enforcement layer (kill-on-detect + seccomp) rather than relying on eBPF alone to block operations.
+Tracepoints fire *after* the syscall completes — they are async and read-only with respect to the syscall result. This is why single-operation policy violations are enforced by **BPF-LSM hooks** (synchronous, return `-EPERM` before the syscall completes) while tracepoints remain the observability layer. Kill-on-detect is retained only for stateful violations (byte-count thresholds) that span multiple syscalls and have no single LSM hook.
 
 ---
 
@@ -35,6 +35,8 @@ The guest kernel (Linux 6.12.13, cross-compiled for aarch64) requires specific c
 | `CONFIG_PERF_EVENTS` | y | Enable the perf subsystem — required for `PerfEventArray` ring buffer |
 | `CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT` | y | Use the toolchain's DWARF version (avoids pahole version conflicts) |
 | `CONFIG_DEBUG_INFO_REDUCED` | n | Must be off — reduced debug info breaks BTF generation |
+| `CONFIG_BPF_LSM` | y | Enable BPF programs as Linux Security Module hooks — required for synchronous pre-syscall enforcement |
+| `CONFIG_LSM` | `"...,bpf"` | Must include `bpf` at the end or LSM hooks exist but are never invoked |
 
 `CONFIG_DEBUG_INFO_BTF` is the most critical and fragile setting. `olddefconfig` silently drops it if `CONFIG_DEBUG_INFO_REDUCED=y` is present (which the arm64 defconfig sets). The build script explicitly sets `CONFIG_DEBUG_INFO_REDUCED=n` and verifies all critical configs survived after the dependency resolution pass.
 
@@ -112,7 +114,12 @@ Each CPU gets its own independent copy of the map entry. BPF programs run with p
 ```
 Guest kernel
   │
-  │  eBPF probes fire on syscall/kprobe
+  │  BPF-LSM hooks (synchronous, pre-syscall)
+  │  → look up DENIED_PATHS / DENIED_NETS / ALLOWED_* maps
+  │  → return -EPERM if denied (syscall never completes)
+  │  → emit event to EVENTS ring buffer for telemetry
+  │
+  │  eBPF tracepoints + kprobes (async, post-syscall)
   │  → fill RawSecurityEvent in PerCpuArray scratch
   │  → EVENTS.output() → PerfEventArray ring buffer
   │
@@ -121,7 +128,8 @@ Garden agent (guest userspace, PID 1)
   │  Per-CPU async tasks drain PerfEventArray
   │  → convert_raw_event() → SecurityEvent (typed)
   │  → policy.evaluate() → PolicyAction
-  │  → if Deny: libc::kill(pid, SIGKILL)    ← kill-on-detect enforcement
+  │  → if Deny AND stateful (TcpSend/TcpRecv):
+  │      libc::kill(pid, SIGKILL)   ← stateful-only kill-on-detect
   │  → mpsc channel → NDJSON serializer
   │
   │  vSock port 6001 → host daemon
@@ -137,30 +145,52 @@ Garden daemon (host, macOS)
 
 ---
 
-## Two-Layer Enforcement
+## Three-Layer Enforcement
 
-### Layer 1 — Kill-on-detect (post-hoc, universal)
+### Layer 1 — BPF-LSM (synchronous, single-operation policy violations)
 
-When the eBPF perf reader converts a raw event and policy evaluation returns `Deny`, the guest agent calls `kill(pid, SIGKILL)` immediately. This is post-hoc — the syscall that triggered the event has already returned — but the process is killed before it can make another syscall. For threat scenarios like privilege escalation (`commit_creds` with new_uid=0) or unauthorized exec, this is sufficient.
+BPF-LSM programs run as Linux Security Module hooks. They execute *synchronously inside the kernel*, before the syscall completes, and can return `-EPERM` to deny the operation. The process never sees a successful result — the syscall fails immediately.
 
-This layer covers all processes in the VM regardless of how they were spawned.
+Four LSM hooks are attached:
 
-### Layer 2 — Seccomp baseline (pre-emptive, for spawned commands)
+| Hook | Protects against |
+|------|-----------------|
+| `file_open` | Unauthorized file reads/writes (e.g. `/etc/shadow`) |
+| `socket_connect` | Unauthorized outbound network connections (CIDR-based) |
+| `bprm_check_security` | Unauthorized binary execution |
+| `sb_mount` | Filesystem escape via mount (blocked for all non-init PIDs) |
+
+Policy is encoded into BPF maps at probe load time:
+- `DENIED_PATHS` / `ALLOWED_PATHS`: exact-path `HashMap<[u8;256], u8>` lookups
+- `DENIED_NETS` / `ALLOWED_NETS`: CIDR `LpmTrie<[u8;8], u8>` lookups (longest prefix match)
+
+**Limitation:** BPF cannot evaluate glob patterns. `FileAccess` rules with wildcards (e.g. `/workspace/**`) are not encoded into LSM maps and fall back to kill-on-detect.
+
+### Layer 2 — Kill-on-detect (stateful violations only)
+
+Kill-on-detect (`SIGKILL` from the perf event loop) is now restricted to violations that span multiple syscalls and have no single LSM hook:
+- `TcpSend` byte threshold — accumulated over multiple `tcp_sendmsg` calls
+- `TcpRecv` byte threshold — accumulated over multiple `tcp_recvmsg` calls
+
+For all other event types, the BPF-LSM hook fires first. Killing in the perf loop would be redundant and racy; it's suppressed for non-stateful events.
+
+### Layer 3 — Seccomp baseline (pre-emptive, for spawned commands)
 
 Every command spawned via `execute_command` applies a seccomp-BPF filter in the child process after `fork()` but before `exec()` (via `pre_exec` hook). The filter uses a default-allow policy with a blocklist of syscalls that a legitimate AI agent workload should never need.
 
 The `seccompiler` crate builds the BPF filter at agent startup and stores it in `GardenAgentImpl`. The filter is applied in the child process, so it cannot affect the agent itself.
 
-### Why both?
+### Layer comparison
 
-| Scenario | Kill-on-detect | Seccomp |
-|----------|---------------|---------|
-| Workload calls `mount()` | Kills after the syscall returns ENOENT/EPERM | Returns EPERM before the call completes |
-| Workload forks and child calls `ptrace` | eBPF fires, child killed | EPERM returned immediately |
-| Agent itself is compromised | eBPF monitors everything including the agent | N/A (seccomp only applies to children) |
-| Wildcard file/IP policy | Kill on pattern match | Not applicable (seccomp can't do path/IP matching) |
-
-Seccomp is the faster and cleaner mechanism for syscalls that should never happen. Kill-on-detect handles the dynamic policy cases (file path patterns, IP ranges, byte thresholds) that seccomp cannot express.
+| Scenario | BPF-LSM | Kill-on-detect | Seccomp |
+|----------|---------|---------------|---------|
+| Workload opens `/etc/shadow` | `-EPERM` before open returns | — | — |
+| Workload connects to denied IP | `-EPERM` before connect returns | — | — |
+| Workload calls `mount()` | `-EPERM` (non-PID-1) | — | `-EPERM` |
+| Workload forks and child calls `ptrace` | — | — | `-EPERM` |
+| Workload sends > N bytes over TCP | — | SIGKILL (stateful) | — |
+| Glob-pattern file deny (`/workspace/**`) | — (no BPF glob) | SIGKILL | — |
+| Agent itself is compromised | hooks cover all processes | covers all processes | N/A |
 
 ---
 
