@@ -32,7 +32,7 @@ use aya_ebpf::{
         bpf_probe_read_user_buf, bpf_probe_read_user_str_bytes,
     },
     macros::{kprobe, lsm, map, tracepoint},
-    maps::{HashMap, LpmTrie, PerCpuArray, PerfEventArray},
+    maps::{lpm_trie::Key as LpmKey, HashMap, LpmTrie, PerCpuArray, PerfEventArray},
     programs::{LsmContext, ProbeContext, TracePointContext},
 };
 use garden_ebpf_common::{EventKind, RawSecurityEvent};
@@ -709,15 +709,15 @@ static DENIED_PATHS: HashMap<[u8; 256], u8> = HashMap::with_max_entries(512, 0);
 static ALLOWED_PATHS: HashMap<[u8; 256], u8> = HashMap::with_max_entries(512, 0);
 
 /// Network CIDR ranges denied by policy (longest-prefix match).
-/// Key: [prefix_len: u32 LE][ipv4: u32 in network byte order].
+/// Key: Key<u32> where data is IPv4 address in network byte order.
 /// Populated from `PolicyRule::Network { port: None, action: Deny }` rules.
 #[map]
-static DENIED_NETS: LpmTrie<[u8; 8], u8> = LpmTrie::with_max_entries(256, 0);
+static DENIED_NETS: LpmTrie<u32, u8> = LpmTrie::with_max_entries(256, 0);
 
 /// Network CIDR ranges allowed by policy. Checked before DENIED_NETS.
 /// Populated from `PolicyRule::Network { port: None, action: Allow }` rules.
 #[map]
-static ALLOWED_NETS: LpmTrie<[u8; 8], u8> = LpmTrie::with_max_entries(256, 0);
+static ALLOWED_NETS: LpmTrie<u32, u8> = LpmTrie::with_max_entries(256, 0);
 
 /// Linux EPERM errno value (permission denied).
 const EPERM: i32 = 1;
@@ -752,15 +752,15 @@ fn try_lsm_file_open(ctx: &LsmContext) -> Result<i32, c_long> {
     // Zero the buffer so unused bytes don't pollute the map key
     unsafe { core::ptr::write_bytes(path_buf_ptr as *mut u8, 0, 256) };
 
-    // arg(0) is struct file *file
-    let file_ptr: *mut core::ffi::c_void = unsafe { ctx.arg(0) };
-    if file_ptr.is_null() {
+    // arg(0) is struct file *file — read as u64, cast to pointer
+    let file_addr: u64 = unsafe { ctx.arg(0) };
+    if file_addr == 0 {
         return Ok(0);
     }
 
     // f_path is at offset OFFSET_FILE_F_PATH in struct file (aarch64 Linux 6.12).
     // bpf_d_path() resolves the vfsmount + dentry into a full path string.
-    let f_path_ptr = (file_ptr as usize + OFFSET_FILE_F_PATH) as *mut core::ffi::c_void;
+    let f_path_ptr = (file_addr as usize + OFFSET_FILE_F_PATH) as *mut core::ffi::c_void;
     let ret = unsafe {
         bpf_d_path(f_path_ptr as *mut _, path_buf_ptr as *mut u8, 256)
     };
@@ -826,27 +826,25 @@ fn try_lsm_socket_connect(ctx: &LsmContext) -> Result<i32, c_long> {
 
     // sin_port in network byte order; sin_addr in network byte order
     let dest_port = u16::from_be_bytes([sa_buf[2], sa_buf[3]]);
-    let dest_ip_be = u32::from_ne_bytes([sa_buf[4], sa_buf[5], sa_buf[6], sa_buf[7]]);
+    // dest_ip_ne: IPv4 address bytes from sin_addr, kept in network byte order
+    // using from_ne_bytes so the u32 memory layout == original network-order bytes.
+    let dest_ip_ne = u32::from_ne_bytes([sa_buf[4], sa_buf[5], sa_buf[6], sa_buf[7]]);
 
-    // LPM key: [prefix_len=32 as u32 LE][ip as u32 in network order]
-    // Prefix length 32 means "look up this exact host; LPM trie returns longest match".
-    let mut lpm_key = [0u8; 8];
-    lpm_key[0..4].copy_from_slice(&32u32.to_ne_bytes());
-    lpm_key[4..8].copy_from_slice(&dest_ip_be.to_ne_bytes());
-
+    // LPM key: Key<u32> = { prefix_len: u32, data: u32 } = 8 bytes total.
+    // prefix_len=32 means "match this exact host; trie returns longest prefix match".
     // Allow list takes precedence
-    if unsafe { ALLOWED_NETS.get(&lpm_key) }.is_some() {
+    if unsafe { ALLOWED_NETS.get(&LpmKey::new(32, dest_ip_ne)) }.is_some() {
         return Ok(0);
     }
 
     // Check deny list
-    if unsafe { DENIED_NETS.get(&lpm_key) }.is_some() {
+    if unsafe { DENIED_NETS.get(&LpmKey::new(32, dest_ip_ne)) }.is_some() {
         let event = get_scratch_event().ok_or(1i64)?;
         event.kind = EventKind::Connect as u32;
         event.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
         event.timestamp_ns = unsafe { bpf_ktime_get_ns() };
         event.comm = bpf_get_current_comm()?;
-        event.dest_ip = dest_ip_be;
+        event.dest_ip = dest_ip_ne;
         event.dest_port = dest_port;
         event.protocol = 6; // TCP
         EVENTS.output(ctx, event, 0);
@@ -941,7 +939,8 @@ fn try_lsm_sb_mount(ctx: &LsmContext) -> Result<i32, c_long> {
 
     // arg(1) is const struct path *path (mount target).
     // bpf_d_path() resolves the mount target to a full path string.
-    let path_ptr: *mut core::ffi::c_void = unsafe { ctx.arg(1) };
+    let path_addr: u64 = unsafe { ctx.arg(1) };
+    let path_ptr = path_addr as *mut core::ffi::c_void;
     if !path_ptr.is_null() {
         let path_buf_ptr = unsafe { PATH_SCRATCH.get_ptr_mut(0).ok_or(1i64)? };
         unsafe { core::ptr::write_bytes(path_buf_ptr as *mut u8, 0, 256) };

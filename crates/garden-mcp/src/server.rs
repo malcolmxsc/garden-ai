@@ -17,6 +17,7 @@ use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
 
+use crate::prompts::{build_list_prompts_result, dispatch_get_prompt};
 use crate::resources::{
     read_recent_events, read_sandbox_status, read_violations, URI_SANDBOX_STATUS,
     URI_SECURITY_EVENTS, URI_SECURITY_VIOLATIONS,
@@ -183,6 +184,7 @@ impl ServerHandler for GardenMcpServer {
             capabilities: ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
+                .enable_prompts()
                 .build(),
             server_info: Implementation {
                 name: "garden-ai".to_string(),
@@ -280,6 +282,22 @@ impl ServerHandler for GardenMcpServer {
                 meta: None,
             }],
         })
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::ListPromptsResult, rmcp::model::ErrorData> {
+        Ok(build_list_prompts_result())
+    }
+
+    async fn get_prompt(
+        &self,
+        request: rmcp::model::GetPromptRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::GetPromptResult, rmcp::model::ErrorData> {
+        dispatch_get_prompt(request).await
     }
 }
 

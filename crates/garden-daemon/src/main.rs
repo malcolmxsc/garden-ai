@@ -61,6 +61,22 @@ impl DaemonService for DaemonServiceImpl {
         let cpus = if req.cpus == 0 { 2 } else { req.cpus };
         let memory_mb = if req.memory_mb == 0 { 512 } else { req.memory_mb };
 
+        // Write policy JSON to VirtioFS so the guest agent can read it at startup.
+        // ~/GardenBox is mounted at /workspace inside the guest.
+        let home = std::env::var("HOME").unwrap_or_default();
+        let policy_file = std::path::Path::new(&home)
+            .join("GardenBox")
+            .join(".garden-policy.json");
+        if !req.policy_json.is_empty() {
+            if let Err(e) = std::fs::write(&policy_file, req.policy_json.as_bytes()) {
+                eprintln!("⚠️  Failed to write policy to VirtioFS: {} — guest will use default-observe", e);
+            } else {
+                println!("📋 Policy written to {}", policy_file.display());
+            }
+        } else {
+            let _ = std::fs::remove_file(&policy_file); // clear stale policy from prior boot
+        }
+
         if let Err(e) = self.engine.configure(&kernel, &initrd, cpus, memory_mb) {
             return Ok(tonic::Response::new(BootVmResponse {
                 success: false,
@@ -354,7 +370,20 @@ fn run_telemetry_receiver(engine: &'static Virtualizer) {
         .build()
         .expect("Failed to build tokio runtime for telemetry");
 
-    let policy = garden_ebpf::policy::SecurityPolicy::default_observe();
+    // Load host-side policy from ~/.garden/policy.json if present.
+    // Falls back to default-observe (log everything, deny nothing).
+    let policy = {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let p = std::path::Path::new(&home).join(".garden").join("policy.json");
+        std::fs::read_to_string(&p)
+            .ok()
+            .and_then(|json| {
+                serde_json::from_str(&json)
+                    .map_err(|e| { eprintln!("⚠️  Bad host policy at {}: {}", p.display(), e); e })
+                    .ok()
+            })
+            .unwrap_or_else(garden_ebpf::policy::SecurityPolicy::default_observe)
+    };
     let (broadcast_tx, _) = tokio::sync::broadcast::channel::<String>(256);
 
     let logger = std::sync::Arc::new(

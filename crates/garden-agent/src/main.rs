@@ -144,16 +144,15 @@ fn build_seccomp_baseline() -> anyhow::Result<seccompiler::BpfProgram> {
 
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
     for &nr in blocked_syscalls {
-        rules.insert(nr, vec![SeccompRule::new(
-            vec![],
-            SeccompAction::Errno(libc::EPERM as u32),
-        )?]);
+        // In seccompiler 0.4+, SeccompRule::new() takes only conditions;
+        // the action is specified as match_action on the SeccompFilter.
+        rules.insert(nr, vec![SeccompRule::new(vec![])?]);
     }
 
     let filter = SeccompFilter::new(
         rules,
-        SeccompAction::Allow,  // default: allow everything else
-        SeccompAction::Allow,  // on missing arch: allow
+        SeccompAction::Allow,                    // mismatch_action: allow syscalls NOT in rules
+        SeccompAction::Errno(libc::EPERM as u32), // match_action: deny syscalls IN rules
         TargetArch::aarch64,
     )?;
 
@@ -383,9 +382,27 @@ async fn async_main() -> anyhow::Result<()> {
 
     // 3.6. Start eBPF security tracer
     // =========================================================
-    let default_policy = garden_ebpf::policy::SecurityPolicy::default_observe();
+    // Load policy from VirtioFS if present; fall back to default-observe.
+    // The daemon writes /workspace/.garden-policy.json before boot.
+    const POLICY_PATH: &str = "/workspace/.garden-policy.json";
+    let policy = match tokio::fs::read_to_string(POLICY_PATH).await {
+        Ok(json) => match serde_json::from_str::<garden_ebpf::policy::SecurityPolicy>(&json) {
+            Ok(p) => {
+                tracing::info!("Loaded policy '{}' ({} rules)", p.name, p.rules.len());
+                p
+            }
+            Err(e) => {
+                tracing::warn!("Bad policy at {}: {} — default-observe", POLICY_PATH, e);
+                garden_ebpf::policy::SecurityPolicy::default_observe()
+            }
+        },
+        Err(_) => {
+            tracing::info!("No policy at {} — default-observe", POLICY_PATH);
+            garden_ebpf::policy::SecurityPolicy::default_observe()
+        }
+    };
 
-    match garden_ebpf::tracer::start_tracer(default_policy).await {
+    match garden_ebpf::tracer::start_tracer(policy).await {
         Ok((handle, mut rx)) => {
             tracing::info!("eBPF tracer started successfully");
             // Leak the handle so programs stay attached for VM lifetime

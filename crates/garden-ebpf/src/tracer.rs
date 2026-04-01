@@ -408,22 +408,13 @@ fn populate_policy_maps(
     use aya::maps::{HashMap, LpmTrie};
     use super::policy::{PolicyAction, PolicyRule};
 
-    let mut denied_paths: HashMap<_, [u8; 256], u8> =
-        HashMap::try_from(ebpf.map_mut("DENIED_PATHS").ok_or_else(|| {
-            anyhow::anyhow!("BPF map 'DENIED_PATHS' not found")
-        })?)?;
-    let mut allowed_paths: HashMap<_, [u8; 256], u8> =
-        HashMap::try_from(ebpf.map_mut("ALLOWED_PATHS").ok_or_else(|| {
-            anyhow::anyhow!("BPF map 'ALLOWED_PATHS' not found")
-        })?)?;
-    let mut denied_nets: LpmTrie<_, [u8; 8], u8> =
-        LpmTrie::try_from(ebpf.map_mut("DENIED_NETS").ok_or_else(|| {
-            anyhow::anyhow!("BPF map 'DENIED_NETS' not found")
-        })?)?;
-    let mut allowed_nets: LpmTrie<_, [u8; 8], u8> =
-        LpmTrie::try_from(ebpf.map_mut("ALLOWED_NETS").ok_or_else(|| {
-            anyhow::anyhow!("BPF map 'ALLOWED_NETS' not found")
-        })?)?;
+    // Collect keys first so we can insert into each map one at a time.
+    // aya 0.13 requires exclusive access per map and cannot hold multiple
+    // map handles simultaneously (borrow checker).
+    let mut file_deny:  Vec<[u8; 256]>                      = Vec::new();
+    let mut file_allow: Vec<[u8; 256]>                      = Vec::new();
+    let mut net_deny:   Vec<aya::maps::lpm_trie::Key<u32>>  = Vec::new();
+    let mut net_allow:  Vec<aya::maps::lpm_trie::Key<u32>>  = Vec::new();
 
     for rule in &policy.rules {
         match rule {
@@ -436,34 +427,20 @@ fn populate_policy_maps(
                 }
                 let key = path_to_map_key(pattern);
                 match action {
-                    PolicyAction::Deny => {
-                        denied_paths.insert(key, 1u8, 0)?;
-                        tracing::debug!("BPF-LSM: DENIED_PATHS += {}", pattern);
-                    }
-                    PolicyAction::Allow => {
-                        allowed_paths.insert(key, 1u8, 0)?;
-                        tracing::debug!("BPF-LSM: ALLOWED_PATHS += {}", pattern);
-                    }
-                    PolicyAction::Log => {}
+                    PolicyAction::Deny  => file_deny.push(key),
+                    PolicyAction::Allow => file_allow.push(key),
+                    PolicyAction::Log   => {}
                 }
             }
             PolicyRule::Network { dest, port: None, action } => {
                 // Port-specific rules can't be enforced per-port by CIDR LPM trie;
                 // those fall back to kill-on-detect.
                 match cidr_to_lpm_key(dest) {
-                    Ok(key) => {
-                        match action {
-                            PolicyAction::Deny => {
-                                denied_nets.insert(&key, 1u8, 0)?;
-                                tracing::debug!("BPF-LSM: DENIED_NETS += {}", dest);
-                            }
-                            PolicyAction::Allow => {
-                                allowed_nets.insert(&key, 1u8, 0)?;
-                                tracing::debug!("BPF-LSM: ALLOWED_NETS += {}", dest);
-                            }
-                            PolicyAction::Log => {}
-                        }
-                    }
+                    Ok(key) => match action {
+                        PolicyAction::Deny  => net_deny.push(key),
+                        PolicyAction::Allow => net_allow.push(key),
+                        PolicyAction::Log   => {}
+                    },
                     Err(e) => {
                         tracing::warn!("Failed to parse CIDR '{}' for BPF-LSM map: {}", dest, e);
                     }
@@ -475,6 +452,45 @@ fn populate_policy_maps(
             PolicyRule::Syscall { .. } => {
                 // Syscall rules are handled by seccomp, not BPF-LSM maps.
             }
+        }
+    }
+
+    // Insert into each map separately — one mutable borrow at a time.
+    {
+        let mut m: HashMap<_, [u8; 256], u8> =
+            HashMap::try_from(ebpf.map_mut("DENIED_PATHS").ok_or_else(|| {
+                anyhow::anyhow!("BPF map 'DENIED_PATHS' not found")
+            })?)?;
+        for key in file_deny {
+            tracing::debug!("BPF-LSM: DENIED_PATHS += {} bytes", key[..key.iter().position(|&b| b == 0).unwrap_or(255)].len());
+            m.insert(key, 1u8, 0)?;
+        }
+    }
+    {
+        let mut m: HashMap<_, [u8; 256], u8> =
+            HashMap::try_from(ebpf.map_mut("ALLOWED_PATHS").ok_or_else(|| {
+                anyhow::anyhow!("BPF map 'ALLOWED_PATHS' not found")
+            })?)?;
+        for key in file_allow {
+            m.insert(key, 1u8, 0)?;
+        }
+    }
+    {
+        let mut m: LpmTrie<_, u32, u8> =
+            LpmTrie::try_from(ebpf.map_mut("DENIED_NETS").ok_or_else(|| {
+                anyhow::anyhow!("BPF map 'DENIED_NETS' not found")
+            })?)?;
+        for key in net_deny {
+            m.insert(&key, 1u8, 0)?;
+        }
+    }
+    {
+        let mut m: LpmTrie<_, u32, u8> =
+            LpmTrie::try_from(ebpf.map_mut("ALLOWED_NETS").ok_or_else(|| {
+                anyhow::anyhow!("BPF map 'ALLOWED_NETS' not found")
+            })?)?;
+        for key in net_allow {
+            m.insert(&key, 1u8, 0)?;
         }
     }
 
@@ -491,12 +507,13 @@ fn path_to_map_key(path: &str) -> [u8; 256] {
     key
 }
 
-/// Convert a CIDR string (e.g. "10.0.0.0/8") to a BPF LPM trie key.
+/// Convert a CIDR string (e.g. "10.0.0.0/8") to an aya LPM trie key.
 ///
-/// Key format: `[prefix_len: u32 LE][ipv4: u32 in network byte order]`.
-/// This matches the kernel's `struct bpf_lpm_trie_key` followed by 4-byte data.
+/// Returns `Key<u32>` = `{ prefix_len: u32, data: u32 }` (8 bytes total) where
+/// `data` is the masked IPv4 address in network byte order, matching the kernel's
+/// `struct bpf_lpm_trie_key { __u32 prefixlen; __u8 data[0]; }` ABI.
 #[cfg(target_os = "linux")]
-fn cidr_to_lpm_key(cidr: &str) -> anyhow::Result<[u8; 8]> {
+fn cidr_to_lpm_key(cidr: &str) -> anyhow::Result<aya::maps::lpm_trie::Key<u32>> {
     let (net_str, prefix_len) = if let Some((net, bits)) = cidr.split_once('/') {
         let bits: u32 = bits.parse().map_err(|_| anyhow::anyhow!("invalid prefix length in '{}'", cidr))?;
         (net, bits)
@@ -516,10 +533,9 @@ fn cidr_to_lpm_key(cidr: &str) -> anyhow::Result<[u8; 8]> {
         ip_u32 & (!0u32 << (32 - prefix_len))
     };
 
-    let mut key = [0u8; 8];
-    key[0..4].copy_from_slice(&prefix_len.to_ne_bytes()); // LE on aarch64
-    key[4..8].copy_from_slice(&masked.to_be_bytes());     // network byte order
-    Ok(key)
+    // .to_be() converts host-byte-order u32 to big-endian, matching the BPF probe's
+    // u32::from_ne_bytes(sin_addr bytes) which also preserves network byte order.
+    Ok(aya::maps::lpm_trie::Key::new(prefix_len, masked.to_be()))
 }
 
 /// Parse a dotted-quad IPv4 address into a host-byte-order u32.

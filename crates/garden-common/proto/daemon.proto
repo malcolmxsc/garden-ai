@@ -31,6 +31,9 @@ message BootVmRequest {
 
     // Memory in MB (0 = default: 512)
     uint64 memory_mb = 4;
+
+    // Optional security policy (JSON). Empty = guest uses default-observe.
+    string policy_json = 5;
 }
 
 message BootVmResponse {

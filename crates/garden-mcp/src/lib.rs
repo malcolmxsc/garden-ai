@@ -4,6 +4,7 @@
 //! allowing AI clients like Claude Desktop, Cursor, and LangChain agents
 //! to connect and execute commands inside Garden sandboxes.
 
+pub mod prompts;
 pub mod resources;
 pub mod server;
 pub mod tools;

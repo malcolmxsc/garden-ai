@@ -55,6 +55,10 @@ enum Commands {
         /// Host directories to share (format: host_path:mount_tag)
         #[arg(long)]
         share: Vec<String>,
+
+        /// Path to a JSON security policy file
+        #[arg(long)]
+        policy: Option<String>,
     },
 
     /// Execute a command inside the running sandbox
@@ -108,6 +112,7 @@ async fn main() -> anyhow::Result<()> {
             memory,
             cpus,
             share,
+            policy,
         } => {
             tracing::info!(
                 kernel = %kernel,
@@ -118,6 +123,22 @@ async fn main() -> anyhow::Result<()> {
                 "Booting sandbox VM..."
             );
 
+            let policy_json = match policy {
+                Some(path) => {
+                    let json = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| {
+                            eprintln!("Cannot read policy file {}: {}", path, e);
+                            std::process::exit(1);
+                        });
+                    if serde_json::from_str::<serde_json::Value>(&json).is_err() {
+                        eprintln!("Invalid JSON in policy file: {}", path);
+                        std::process::exit(1);
+                    }
+                    json
+                }
+                None => String::new(),
+            };
+
             let mut client = garden_common::daemon::daemon_service_client::DaemonServiceClient::connect("http://127.0.0.1:9000")
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to connect to daemon on :9000: {}", e))?;
@@ -127,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
                 initrd_path: rootfs,
                 cpus,
                 memory_mb: memory,
+                policy_json,
             });
 
             let response = client.boot_vm(request).await?.into_inner();
