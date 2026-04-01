@@ -17,6 +17,10 @@ use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
 
+use crate::resources::{
+    read_recent_events, read_sandbox_status, read_violations, URI_SANDBOX_STATUS,
+    URI_SECURITY_EVENTS, URI_SECURITY_VIOLATIONS,
+};
 use crate::tools::*;
 
 /// Configuration for the MCP server.
@@ -176,7 +180,10 @@ impl ServerHandler for GardenMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             protocol_version: ProtocolVersion::LATEST,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            capabilities: ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
             server_info: Implementation {
                 name: "garden-ai".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
@@ -184,10 +191,95 @@ impl ServerHandler for GardenMcpServer {
             },
             instructions: Some(
                 "Garden AI sandbox server. Execute commands, read/write files, \
-                 and list directories inside a hardware-isolated Linux micro-VM."
+                 and list directories inside a hardware-isolated Linux micro-VM. \
+                 Use resources to inspect sandbox status and security telemetry."
                     .to_string(),
             ),
         }
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::ListResourcesResult, rmcp::model::ErrorData> {
+        use rmcp::model::{Annotated, ListResourcesResult, RawResource};
+
+        let make = |uri: &str, name: &str, title: &str, desc: &str| -> Annotated<RawResource> {
+            Annotated::new(
+                RawResource {
+                    uri: uri.to_string(),
+                    name: name.to_string(),
+                    title: Some(title.to_string()),
+                    description: Some(desc.to_string()),
+                    mime_type: Some("text/plain".to_string()),
+                    size: None,
+                    icons: None,
+                    meta: None,
+                },
+                None,
+            )
+        };
+
+        let resources = vec![
+            make(
+                URI_SANDBOX_STATUS,
+                "Sandbox Status",
+                "VM running state and uptime",
+                "Current status of the Garden micro-VM: whether it is running, \
+                 how long it has been up, and which kernel it booted.",
+            ),
+            make(
+                URI_SECURITY_EVENTS,
+                "Security Events",
+                "Recent eBPF security telemetry",
+                "The last 50 security events captured by eBPF probes inside the VM: \
+                 file opens, network connections, process executions, credential changes, \
+                 and more.",
+            ),
+            make(
+                URI_SECURITY_VIOLATIONS,
+                "Security Violations",
+                "Policy violations detected by the host",
+                "Events that triggered a host-side policy violation: privilege escalation, \
+                 data exfiltration, large downloads, kernel module loads, and mount attempts.",
+            ),
+        ];
+
+        Ok(ListResourcesResult {
+            meta: None,
+            resources,
+            next_cursor: None,
+        })
+    }
+
+    async fn read_resource(
+        &self,
+        request: rmcp::model::ReadResourceRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::ReadResourceResult, rmcp::model::ErrorData> {
+        use rmcp::model::{ErrorData, ReadResourceResult, ResourceContents};
+
+        let text = match request.uri.as_str() {
+            URI_SANDBOX_STATUS => read_sandbox_status().await,
+            URI_SECURITY_EVENTS => read_recent_events(),
+            URI_SECURITY_VIOLATIONS => read_violations(),
+            other => {
+                return Err(ErrorData::resource_not_found(
+                    format!("unknown resource URI: {other}"),
+                    None,
+                ));
+            }
+        };
+
+        Ok(ReadResourceResult {
+            contents: vec![ResourceContents::TextResourceContents {
+                uri: request.uri,
+                mime_type: Some("text/plain".to_string()),
+                text,
+                meta: None,
+            }],
+        })
     }
 }
 
