@@ -62,13 +62,19 @@ docker run --rm \
         FAILED=0
         for cfg in CONFIG_BPF_SYSCALL CONFIG_DEBUG_INFO_BTF CONFIG_KPROBES \
                    CONFIG_FTRACE_SYSCALLS CONFIG_PERF_EVENTS CONFIG_VSOCKETS \
-                   CONFIG_VIRTIO_VSOCKETS CONFIG_BPF_LSM; do
+                   CONFIG_VIRTIO_VSOCKETS CONFIG_BPF_LSM CONFIG_SECURITY; do
             if ! grep -q \"^\${cfg}=y\" .config; then
                 echo \"❌ FATAL: \${cfg} was dropped by olddefconfig!\"
                 grep \"\${cfg}\" .config || echo \"  (not found at all)\"
                 FAILED=1
             fi
         done
+        # Verify CONFIG_LSM string includes "bpf"
+        if ! grep -q 'CONFIG_LSM=.*bpf' .config; then
+            echo '❌ FATAL: CONFIG_LSM does not include bpf!'
+            grep 'CONFIG_LSM' .config || echo '  (not found)'
+            FAILED=1
+        fi
         if [ \"\$FAILED\" -eq 1 ]; then
             echo ''
             echo '🔍 Full BPF/debug config for diagnosis:'
