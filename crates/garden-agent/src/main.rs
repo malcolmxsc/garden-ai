@@ -120,7 +120,7 @@ impl Default for GardenAgentImpl {
 /// never need and represent significant escalation or escape vectors.
 #[cfg(target_os = "linux")]
 fn build_seccomp_baseline() -> anyhow::Result<seccompiler::BpfProgram> {
-    use seccompiler::{SeccompAction, SeccompFilter, SeccompRule, TargetArch};
+    use seccompiler::{SeccompAction, SeccompFilter, TargetArch};
     use std::collections::BTreeMap;
 
     // aarch64 syscall numbers for blocked operations
@@ -142,17 +142,17 @@ fn build_seccomp_baseline() -> anyhow::Result<seccompiler::BpfProgram> {
         241, // perf_event_open — side-channel / kernel introspection
     ];
 
-    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    let mut rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = BTreeMap::new();
     for &nr in blocked_syscalls {
-        // In seccompiler 0.4+, SeccompRule::new() takes only conditions;
-        // the action is specified as match_action on the SeccompFilter.
-        rules.insert(nr, vec![SeccompRule::new(vec![])?]);
+        // Empty Vec means "match this syscall unconditionally".
+        // The per-match action is SeccompAction::Errno set as match_action below.
+        rules.insert(nr, vec![]);
     }
 
     let filter = SeccompFilter::new(
         rules,
-        SeccompAction::Allow,                    // mismatch_action: allow syscalls NOT in rules
-        SeccompAction::Errno(libc::EPERM as u32), // match_action: deny syscalls IN rules
+        SeccompAction::Allow,                     // mismatch_action: allow all other syscalls
+        SeccompAction::Errno(libc::EPERM as u32), // match_action: block listed syscalls
         TargetArch::aarch64,
     )?;
 
@@ -168,7 +168,7 @@ fn build_seccomp_allow_all() -> seccompiler::BpfProgram {
     let filter = SeccompFilter::new(
         BTreeMap::new(),
         SeccompAction::Allow,
-        SeccompAction::Allow,
+        SeccompAction::KillThread, // match_action unused — no rules in map
         TargetArch::aarch64,
     )
     .expect("allow-all seccomp filter should never fail");

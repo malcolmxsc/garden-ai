@@ -88,9 +88,10 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Initialize tracing
+    // Initialize tracing — MCP stdio transport owns stdout, so always log to stderr
     let filter = if cli.verbose { "debug" } else { "info" };
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(filter)
         .init();
 
