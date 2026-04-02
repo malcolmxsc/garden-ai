@@ -18,6 +18,58 @@ struct ActionResult: Decodable {
     let message: String
 }
 
+struct SessionInfo: Decodable, Identifiable {
+    let id: String
+    let start_ts: String
+    let event_count: UInt64
+
+    // Human-readable date from Unix ms timestamp string
+    var displayDate: String {
+        guard let ms = Double(start_ts) else { return start_ts }
+        let date = Date(timeIntervalSince1970: ms / 1000)
+        let f = DateFormatter()
+        f.dateFormat = "MMM d, HH:mm:ss"
+        return f.string(from: date)
+    }
+}
+
+struct LogEntry: Decodable, Identifiable {
+    let id = UUID()
+    let ts: String
+    let seq: UInt64
+    let pid: UInt32
+    let comm: String
+    let event: WireEvent
+    let violation: LogViolation?
+
+    private enum CodingKeys: String, CodingKey {
+        case ts, seq, pid, comm, event, violation
+    }
+
+    func toSecurityEvent() -> SecurityEvent? {
+        var se = event.toSecurityEvent()
+        // Override isViolation from the authoritative host-side violation field
+        if let v = violation, var base = se {
+            se = SecurityEvent(
+                id: base.id,
+                timestamp: base.timestamp,
+                pid: base.pid,
+                comm: base.comm,
+                kind: base.kind,
+                isViolation: true,
+                violationMessage: v.message
+            )
+        }
+        return se
+    }
+}
+
+struct LogViolation: Decodable {
+    let severity: String
+    let rule: String
+    let message: String
+}
+
 enum DaemonClientError: Error {
     case unreachable(Error)
     case badStatus(Int)
@@ -46,6 +98,14 @@ struct DaemonClient {
 
     static func stop() async throws -> ActionResult {
         try await post("/api/stop")
+    }
+
+    static func sessions() async throws -> [SessionInfo] {
+        try await get("/api/sessions")
+    }
+
+    static func sessionEvents(id: String) async throws -> [LogEntry] {
+        try await get("/api/sessions/\(id)/events")
     }
 
     // MARK: - Helpers

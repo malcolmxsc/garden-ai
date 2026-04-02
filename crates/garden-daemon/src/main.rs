@@ -561,6 +561,59 @@ struct ApiActionResponse {
     message: String,
 }
 
+// ---------------------------------------------------------------------------
+// Session log endpoints
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+struct SessionInfo {
+    id: String,
+    start_ts: String,
+    event_count: u64,
+}
+
+async fn api_list_sessions() -> axum::Json<Vec<SessionInfo>> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let sessions_dir = std::path::Path::new(&home).join(".garden").join("sessions");
+    let mut sessions = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
+        for entry in entries.flatten() {
+            let id = entry.file_name().to_string_lossy().to_string();
+            // Only allow numeric session IDs (Unix ms timestamps) — prevent path traversal
+            if !id.chars().all(|c| c.is_ascii_digit()) { continue; }
+            let events_path = entry.path().join("events.ndjson");
+            let event_count = std::fs::read_to_string(&events_path)
+                .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count() as u64)
+                .unwrap_or(0);
+            sessions.push(SessionInfo { id: id.clone(), start_ts: id, event_count });
+        }
+    }
+    sessions.sort_by(|a, b| b.id.cmp(&a.id)); // newest first
+    axum::Json(sessions)
+}
+
+async fn api_get_session_events(
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> axum::Json<Vec<serde_json::Value>> {
+    // Validate: only numeric IDs (Unix ms timestamps)
+    if !id.chars().all(|c| c.is_ascii_digit()) {
+        return axum::Json(vec![]);
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let events_path = std::path::Path::new(&home)
+        .join(".garden").join("sessions").join(&id).join("events.ndjson");
+    let mut events = Vec::new();
+    if let Ok(content) = std::fs::read_to_string(&events_path) {
+        for line in content.lines() {
+            if line.trim().is_empty() { continue; }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                events.push(v);
+            }
+        }
+    }
+    axum::Json(events)
+}
+
 async fn run_http_api(engine: &'static Virtualizer, state: Arc<VmState>) {
     use axum::{routing, Router};
 
@@ -629,9 +682,11 @@ async fn run_http_api(engine: &'static Virtualizer, state: Arc<VmState>) {
     };
 
     let app = Router::new()
-        .route("/api/status", routing::get(status_handler))
-        .route("/api/boot",   routing::post(boot_handler))
-        .route("/api/stop",   routing::post(stop_handler));
+        .route("/api/status",                   routing::get(status_handler))
+        .route("/api/boot",                     routing::post(boot_handler))
+        .route("/api/stop",                     routing::post(stop_handler))
+        .route("/api/sessions",                 routing::get(api_list_sessions))
+        .route("/api/sessions/{id}/events",     routing::get(api_get_session_events));
 
     let listener = match tokio::net::TcpListener::bind("127.0.0.1:9001").await {
         Ok(l) => l,

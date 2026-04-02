@@ -3,6 +3,9 @@ import SwiftUI
 struct ContentView: View {
     @EnvironmentObject var appState: AppState
     @State private var contentOpacity: Double = 1.0
+    @State private var activeTab: Tab = .live
+
+    enum Tab { case live, sessions }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -17,9 +20,20 @@ struct ContentView: View {
 
             thinDivider
 
-            // Zone 2 — Security Feed (takes all remaining space)
-            SecurityFeedView()
-                .frame(maxHeight: .infinity)
+            // Tab picker
+            tabPicker
+
+            thinDivider
+
+            // Zone 2 — Live Feed or Sessions (takes all remaining space)
+            Group {
+                if activeTab == .live {
+                    SecurityFeedView()
+                } else {
+                    SessionsView()
+                }
+            }
+            .frame(maxHeight: .infinity)
 
             thinDivider
 
@@ -28,7 +42,6 @@ struct ContentView: View {
                 .background(.regularMaterial)
         }
         .opacity(contentOpacity)
-        // Wake flash: briefly dims and returns to full brightness on .running
         .onChange(of: appState.wakeFlash) { fired in
             guard fired else { return }
             appState.wakeFlash = false
@@ -37,12 +50,53 @@ struct ContentView: View {
                 contentOpacity = 1.0
             }
         }
-        // Dim content when stopped
         .onChange(of: appState.vmState) { state in
             withAnimation(.easeInOut(duration: 0.4)) {
                 contentOpacity = state == .stopped ? 0.85 : 1.0
             }
         }
+    }
+
+    // MARK: - Tab Picker
+
+    private var tabPicker: some View {
+        HStack(spacing: 0) {
+            tabButton("Live", tab: .live, icon: "waveform")
+            tabButton("Sessions", tab: .sessions, icon: "clock")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 6)
+        .background(.regularMaterial)
+    }
+
+    private func tabButton(_ label: String, tab: Tab, icon: String) -> some View {
+        let isActive = activeTab == tab
+        return Button {
+            withAnimation(.spring(duration: 0.3, bounce: 0.2)) {
+                activeTab = tab
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: icon)
+                    .font(.system(size: 10, weight: .medium))
+                Text(label)
+                    .font(.system(size: 11, weight: .medium))
+            }
+            .foregroundStyle(isActive ? .primary : .secondary)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background {
+                if isActive {
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(.ultraThinMaterial)
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                .strokeBorder(.white.opacity(0.15), lineWidth: 0.5)
+                        }
+                }
+            }
+        }
+        .buttonStyle(.borderless)
     }
 
     private var thinDivider: some View {
@@ -65,8 +119,9 @@ struct SettingsView: View {
             Divider()
 
             Label("Daemon gRPC:  127.0.0.1:9000", systemImage: "bolt.fill")
+            Label("HTTP API:     127.0.0.1:9001", systemImage: "network")
             Label("Agent proxy:  127.0.0.1:10000", systemImage: "cpu")
-            Label("Telemetry:   127.0.0.1:10001", systemImage: "chart.xyaxis.line")
+            Label("Telemetry:    127.0.0.1:10001", systemImage: "chart.xyaxis.line")
 
             Spacer()
         }
