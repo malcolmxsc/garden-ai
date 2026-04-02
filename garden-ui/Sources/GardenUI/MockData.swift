@@ -45,7 +45,7 @@ enum MockData {
             case ..<0.74: kind = .tcpSend(bytes: Int.random(in: 200...16_384))
             case ..<0.82: kind = .tcpRecv(bytes: Int.random(in: 1_024...131_072))
             case ..<0.90: kind = .processFork(childPid: pid + Int.random(in: 1...5), childComm: processes.randomElement()!)
-            default:      kind = .processExit(code: [0, 0, 0, 1].randomElement()!)
+            default:      kind = .processExit(exitStatus: [0, 0, 0, 1].randomElement()!, exitSignal: 0)
             }
         }
 

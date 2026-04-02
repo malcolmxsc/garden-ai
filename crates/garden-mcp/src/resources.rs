@@ -157,8 +157,13 @@ fn describe_event_kind(kind: &serde_json::Value) -> String {
             format!("fork -> pid={child_pid} ({child_comm})")
         }
         "process_exit" => {
-            let code = kind["exit_code"].as_u64().unwrap_or(0);
-            format!("exit code={code}")
+            let sig = kind["exit_signal"].as_u64().unwrap_or(0);
+            let status = kind["exit_status"].as_u64().unwrap_or(0);
+            if sig > 0 {
+                format!("exit signal={sig}")
+            } else {
+                format!("exit status={status}")
+            }
         }
         "dns_query" => {
             let domain = kind["domain"].as_str().unwrap_or("?");

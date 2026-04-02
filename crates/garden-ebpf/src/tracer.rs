@@ -17,6 +17,60 @@ use tokio::sync::mpsc;
 pub struct TracerHandle {
     #[cfg(target_os = "linux")]
     _ebpf: aya::Ebpf,
+    /// BPF link fds for LSM hooks attached via BPF_LINK_CREATE.
+    /// Must be kept alive for the duration of tracing — dropping closes the link.
+    #[cfg(target_os = "linux")]
+    _lsm_links: Vec<std::os::fd::OwnedFd>,
+}
+
+/// Attach a loaded BPF LSM program using BPF_LINK_CREATE.
+///
+/// Aya 0.13 uses `bpf_raw_tracepoint_open` for LSM attachment, which returns
+/// ENOTSUPP (524) on Linux 6.x where BPF_LINK_CREATE is required for LSM
+/// programs. This function makes the syscall directly.
+///
+/// The returned `OwnedFd` is the link fd — keep it alive to maintain attachment.
+#[cfg(target_os = "linux")]
+fn lsm_link_create(prog_fd: std::os::fd::RawFd) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    const BPF_LINK_CREATE: libc::c_long = 28;
+    const BPF_LSM_MAC: u32 = 27; // bpf_attach_type::BPF_LSM_MAC = 27 (not 29)
+
+    // The kernel's bpf_attr union — we only fill in the fields for LSM link creation.
+    // The hook's BTF ID was already stored in the prog during BPF_PROG_LOAD (via aya's load()),
+    // so the kernel uses prog->aux->attach_btf_id; we do not need to repeat it here.
+    #[repr(C, align(8))]
+    struct BpfAttrLinkCreate {
+        prog_fd: u32,
+        target_fd: u32,
+        attach_type: u32,
+        flags: u32,
+        _rest: [u8; 48], // pad union to 64 bytes; cookie/target_btf_id default to 0
+    }
+
+    let attr = BpfAttrLinkCreate {
+        prog_fd: prog_fd as u32,
+        target_fd: 0, // 0 = system-wide (not cgroup-scoped)
+        attach_type: BPF_LSM_MAC,
+        flags: 0,
+        _rest: [0u8; 48],
+    };
+
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_LINK_CREATE,
+            &attr as *const BpfAttrLinkCreate as *mut libc::c_void,
+            std::mem::size_of::<BpfAttrLinkCreate>() as libc::c_ulong,
+        )
+    };
+
+    if ret < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(ret as i32) })
+    }
 }
 
 /// Decode a DNS query name from a raw DNS packet stored in `args`.
@@ -110,9 +164,16 @@ fn convert_raw_event(raw: &RawSecurityEvent) -> Option<SecurityEvent> {
             child_pid: raw.flags,
             child_comm: bytes_to_str(&raw.path[..MAX_COMM_LEN]).to_string(),
         },
-        EventKind::Exit => SecurityEventKind::ProcessExit {
-            exit_code: raw.flags,
-        },
+        EventKind::Exit => {
+            // Decode raw kernel task->exit_code (same encoding as waitpid status):
+            // lower 7 bits = signal number, bits 8-15 = exit status
+            let sig = raw.flags & 0x7F;
+            let status = (raw.flags >> 8) & 0xFF;
+            SecurityEventKind::ProcessExit {
+                exit_status: status,
+                exit_signal: sig,
+            }
+        }
         EventKind::CredsChanged => SecurityEventKind::CredsChanged {
             old_uid: raw.aux as u32,
             new_uid: raw.flags,
@@ -262,11 +323,22 @@ pub async fn start_tracer(
     // LSM programs enforce policy synchronously — before syscalls complete —
     // by returning -EPERM from the hook. They require BTF (loaded from
     // /sys/kernel/btf/vmlinux) for CO-RE relocation at load time.
-    let btf = Btf::from_sys_fs().unwrap_or_else(|e| {
-        tracing::warn!("Failed to load BTF from /sys/kernel/btf/vmlinux: {} — LSM probes may not load", e);
-        // Safety: we'll fail at load time below if BTF is missing
-        unsafe { core::mem::zeroed() }
-    });
+
+    // Diagnose what LSMs are actually active at runtime.
+    match std::fs::read_to_string("/sys/kernel/security/lsm") {
+        Ok(active) => tracing::info!("Active LSMs: {}", active.trim()),
+        Err(e) => tracing::warn!("Could not read /sys/kernel/security/lsm: {}", e),
+    }
+
+    let btf_result = Btf::from_sys_fs();
+    if let Err(ref e) = btf_result {
+        tracing::error!("Failed to load BTF from /sys/kernel/btf/vmlinux: {} — LSM probes will be skipped", e);
+        // Check if the BTF file exists at all
+        match std::fs::metadata("/sys/kernel/btf/vmlinux") {
+            Ok(m) => tracing::info!("  /sys/kernel/btf/vmlinux exists ({} bytes)", m.len()),
+            Err(e2) => tracing::error!("  /sys/kernel/btf/vmlinux does NOT exist: {}", e2),
+        }
+    }
 
     let lsm_hooks: &[(&str, &str, bool)] = &[
         ("lsm_file_open",      "file_open",           false),
@@ -276,30 +348,43 @@ pub async fn start_tracer(
     ];
 
     let mut lsm_attached = 0u32;
-    for (name, hook, required) in lsm_hooks {
-        let result = (|| -> anyhow::Result<()> {
-            let program: &mut Lsm = ebpf
-                .program_mut(name)
-                .ok_or_else(|| anyhow::anyhow!("BPF program '{}' not found in ELF", name))?
-                .try_into()?;
-            program.load(hook, &btf)?;
-            program.attach()?;
-            Ok(())
-        })();
+    let mut lsm_links: Vec<std::os::fd::OwnedFd> = Vec::new();
+    if let Ok(ref btf) = btf_result {
+        for (name, hook, required) in lsm_hooks {
+            let result = (|| -> anyhow::Result<()> {
+                use std::os::fd::{AsFd, AsRawFd};
+                let program: &mut Lsm = ebpf
+                    .program_mut(name)
+                    .ok_or_else(|| anyhow::anyhow!("BPF program '{}' not found in ELF", name))?
+                    .try_into()?;
+                program.load(hook, btf)?;
+                // Aya uses bpf_raw_tracepoint_open for LSM attachment, but Linux 6.x
+                // requires BPF_LINK_CREATE. Call the syscall directly.
+                let prog_fd = program.fd()?.as_fd().as_raw_fd();
+                let link = lsm_link_create(prog_fd)
+                    .map_err(|e| anyhow::anyhow!("BPF_LINK_CREATE for {}: {}", hook, e))?;
+                lsm_links.push(link);
+                Ok(())
+            })();
 
-        match result {
-            Ok(()) => {
-                tracing::info!("Attached BPF-LSM hook: {}", hook);
-                lsm_attached += 1;
-            }
-            Err(e) if *required => {
-                return Err(e.context(format!("Required LSM hook {} failed", hook)));
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Optional LSM hook {} unavailable (need CONFIG_BPF_LSM=y + 'bpf' in CONFIG_LSM): {}",
-                    hook, e
-                );
+            match result {
+                Ok(()) => {
+                    tracing::info!("Attached BPF-LSM hook: {}", hook);
+                    lsm_attached += 1;
+                }
+                Err(e) if *required => {
+                    return Err(e.context(format!("Required LSM hook {} failed", hook)));
+                }
+                Err(e) => {
+                    // Write full verifier log to /tmp to avoid tracing truncation
+                    let full_err = format!("{:#}", e);
+                    let _ = std::fs::write(
+                        format!("/tmp/lsm_{}_error.txt", hook.replace('/', "_")),
+                        &full_err,
+                    );
+                    tracing::warn!("LSM hook '{}' failed (full log: /tmp/lsm_{}_error.txt): {}",
+                        hook, hook.replace('/', "_"), &full_err[..full_err.len().min(500)]);
+                }
             }
         }
     }
@@ -389,7 +474,7 @@ pub async fn start_tracer(
 
     tracing::info!("eBPF tracer started — tracepoints, kprobes, and BPF-LSM hooks active");
 
-    Ok((TracerHandle { _ebpf: ebpf }, rx))
+    Ok((TracerHandle { _ebpf: ebpf, _lsm_links: lsm_links }, rx))
 }
 
 /// Populate BPF-LSM policy maps from the given security policy.

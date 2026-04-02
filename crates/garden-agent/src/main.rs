@@ -205,14 +205,20 @@ impl AgentService for GardenAgentImpl {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        // Apply the seccomp baseline filter to the child process.
-        // pre_exec runs after fork() but before exec() in the child, so it
-        // cannot affect the agent process itself.
+        // Apply the seccomp baseline filter and drop root privileges in the child
+        // process. pre_exec runs after fork() but before exec(), so changes here
+        // only affect the child — the agent itself keeps uid 0 for eBPF and mount ops.
         #[cfg(target_os = "linux")]
         {
             let filter = self.seccomp_filter.clone();
             unsafe {
                 command.pre_exec(move || {
+                    // Drop to uid/gid 1000 (unprivileged user) before exec.
+                    // setgid must come before setuid — once we drop uid we can't setgid.
+                    nix::unistd::setgid(nix::unistd::Gid::from_raw(1000))
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
+                    nix::unistd::setuid(nix::unistd::Uid::from_raw(1000))
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
                     seccompiler::apply_filter(&filter)
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
                 });

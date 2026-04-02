@@ -16,7 +16,7 @@ struct SecurityEvent: Identifiable, Equatable {
         case networkConnect(ip: String, port: Int, allowed: Bool)
         case processExec(binary: String, allowed: Bool)
         case processFork(childPid: Int, childComm: String)
-        case processExit(code: Int)
+        case processExit(exitStatus: Int, exitSignal: Int)
         case dnsQuery(domain: String)
         case credsChanged(oldUID: Int, newUID: Int)
         case tcpSend(bytes: Int)
@@ -45,7 +45,8 @@ struct SecurityEvent: Identifiable, Equatable {
             case .fileAccess(_, let allowed):        return allowed ? .blue   : .red
             case .networkConnect(_, _, let allowed): return allowed ? .purple : .red
             case .processExec(_, let allowed):       return allowed ? .green  : .red
-            case .processFork, .processExit:         return .secondary
+            case .processFork:                          return .secondary
+            case .processExit(_, let signal):           return signal > 0 ? .red : .secondary
             case .dnsQuery:                          return .purple
             case .credsChanged:                      return .orange
             case .tcpSend, .tcpRecv:                 return .cyan
@@ -64,8 +65,8 @@ struct SecurityEvent: Identifiable, Equatable {
                 return "\(allowed ? "exec" : "BLOCKED") \(binary)"
             case .processFork(let pid, let comm):
                 return "fork → pid=\(pid) (\(comm))"
-            case .processExit(let code):
-                return "exit code=\(code)"
+            case .processExit(let status, let signal):
+                return signal > 0 ? "exit signal=\(signal)" : "exit status=\(status)"
             case .dnsQuery(let domain):
                 return "dns \(domain)"
             case .credsChanged(let old, let new):

@@ -30,6 +30,7 @@ use aya_ebpf::{
         bpf_d_path, bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
         bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes,
         bpf_probe_read_user_buf, bpf_probe_read_user_str_bytes,
+        gen::{bpf_get_current_task, bpf_send_signal},
     },
     macros::{kprobe, lsm, map, tracepoint},
     maps::{lpm_trie::Key as LpmKey, HashMap, LpmTrie, PerCpuArray, PerfEventArray},
@@ -57,6 +58,167 @@ fn get_scratch_event() -> Option<&'static mut RawSecurityEvent> {
     // Zero the struct for reuse
     *event = RawSecurityEvent::zeroed();
     Some(event)
+}
+
+// ===========================================================================
+// Inline enforcement helpers — called synchronously from tracepoint context
+// to send SIGKILL before the syscall returns, eliminating the userspace race.
+// All functions take &[u8; 256] path and do fixed-length byte comparisons only
+// (no loops) to satisfy the BPF verifier.
+// ===========================================================================
+
+/// True if path starts with `/proc/` followed by a decimal digit.
+/// Matches `/proc/<pid>/...` while allowing `/proc/cpuinfo`, `/proc/sys/`, etc.
+#[inline(always)]
+fn path_starts_with_proc_pid(p: &[u8; 256]) -> bool {
+    p[0] == b'/' && p[1] == b'p' && p[2] == b'r' && p[3] == b'o'
+        && p[4] == b'c' && p[5] == b'/' && p[6] >= b'0' && p[6] <= b'9'
+}
+
+/// True if byte at `i` starts one of the known-dangerous `/proc/<pid>/` entries:
+/// `mem`, `maps`, `pagemap`, `smaps`, `fd/`
+#[inline(always)]
+fn is_proc_danger_at(p: &[u8; 256], i: usize) -> bool {
+    // "mem\0"
+    if p[i] == b'm' && p[i+1] == b'e' && p[i+2] == b'm'
+        && (p[i+3] == 0 || p[i+3] == b'/') { return true; }
+    // "maps\0"
+    if p[i] == b'm' && p[i+1] == b'a' && p[i+2] == b'p' && p[i+3] == b's'
+        && (p[i+4] == 0 || p[i+4] == b'/') { return true; }
+    // "pagemap\0"
+    if p[i] == b'p' && p[i+1] == b'a' && p[i+2] == b'g' && p[i+3] == b'e'
+        && p[i+4] == b'm' && p[i+5] == b'a' && p[i+6] == b'p'
+        && (p[i+7] == 0 || p[i+7] == b'/') { return true; }
+    // "smaps\0"
+    if p[i] == b's' && p[i+1] == b'm' && p[i+2] == b'a' && p[i+3] == b'p'
+        && p[i+4] == b's' && (p[i+5] == 0 || p[i+5] == b'/') { return true; }
+    // "fd/"
+    if p[i] == b'f' && p[i+1] == b'd' && p[i+2] == b'/' { return true; }
+    // "ns/" — namespace entries (/proc/<pid>/ns/ipc, /ns/mnt, etc.)
+    if p[i] == b'n' && p[i+1] == b's' && p[i+2] == b'/' { return true; }
+    false
+}
+
+/// Scan offsets 7..14 (covers PIDs with 1–7 digits) for a `/` followed by a
+/// dangerous proc file name.  Fully unrolled — verifier-friendly.
+#[inline(always)]
+fn path_has_proc_danger(p: &[u8; 256]) -> bool {
+    // pid length 1: slash at offset 7, file starts at 8
+    if p[7] == b'/' && is_proc_danger_at(p, 8)  { return true; }
+    // pid length 2: slash at offset 8
+    if p[8] == b'/' && is_proc_danger_at(p, 9)  { return true; }
+    // pid length 3
+    if p[9] == b'/' && is_proc_danger_at(p, 10) { return true; }
+    // pid length 4
+    if p[10] == b'/' && is_proc_danger_at(p, 11) { return true; }
+    // pid length 5
+    if p[11] == b'/' && is_proc_danger_at(p, 12) { return true; }
+    // pid length 6
+    if p[12] == b'/' && is_proc_danger_at(p, 13) { return true; }
+    // pid length 7
+    if p[13] == b'/' && is_proc_danger_at(p, 14) { return true; }
+    false
+}
+
+/// True if flags indicate write intent: O_WRONLY (1) or O_RDWR (2).
+#[inline(always)]
+fn has_write_intent(flags: u32) -> bool {
+    let mode = flags & 3;
+    mode == 1 || mode == 2
+}
+
+/// True if path starts with `/workspace`.
+#[inline(always)]
+fn path_starts_with_workspace(p: &[u8; 256]) -> bool {
+    p[0] == b'/' && p[1] == b'w' && p[2] == b'o' && p[3] == b'r'
+        && p[4] == b'k' && p[5] == b's' && p[6] == b'p' && p[7] == b'a'
+        && p[8] == b'c' && p[9] == b'e'
+}
+
+/// True if path starts with `/dev/` (device files — writes are always allowed).
+#[inline(always)]
+fn path_starts_with_dev(p: &[u8; 256]) -> bool {
+    p[0] == b'/' && p[1] == b'd' && p[2] == b'e' && p[3] == b'v' && p[4] == b'/'
+}
+
+/// True if path starts with `/tmp/` (temp files — writes are allowed).
+#[inline(always)]
+fn path_starts_with_tmp(p: &[u8; 256]) -> bool {
+    p[0] == b'/' && p[1] == b't' && p[2] == b'm' && p[3] == b'p' && p[4] == b'/'
+}
+
+/// True if path starts with `/proc/self/` (self-introspection — allowed).
+#[inline(always)]
+fn path_starts_with_proc_self(p: &[u8; 256]) -> bool {
+    p[0] == b'/' && p[1] == b'p' && p[2] == b'r' && p[3] == b'o'
+        && p[4] == b'c' && p[5] == b'/' && p[6] == b's' && p[7] == b'e'
+        && p[8] == b'l' && p[9] == b'f' && p[10] == b'/'
+}
+
+/// True if the last path component is a known privilege-escalation binary:
+/// su, sudo, newuidmap, newgidmap, pkexec.
+/// Checks up to 4 candidate positions of the last `/` (paths up to ~100 bytes).
+#[inline(always)]
+fn path_is_privesc_binary(p: &[u8; 256]) -> bool {
+    // Walk path forward to find last slash position (unrolled, max 128 bytes).
+    // We compute last_slash as the largest index < 128 where p[i] == b'/'.
+    // After the loop, name starts at last_slash + 1.
+    let mut last_slash: usize = 0;
+    // Fully unrolled scan of first 128 bytes; constant time for verifier.
+    if p[1] == b'/'   { last_slash = 1;   }
+    if p[2] == b'/'   { last_slash = 2;   }
+    if p[3] == b'/'   { last_slash = 3;   }
+    if p[4] == b'/'   { last_slash = 4;   }
+    if p[5] == b'/'   { last_slash = 5;   }
+    if p[6] == b'/'   { last_slash = 6;   }
+    if p[7] == b'/'   { last_slash = 7;   }
+    if p[8] == b'/'   { last_slash = 8;   }
+    if p[9] == b'/'   { last_slash = 9;   }
+    if p[10] == b'/'  { last_slash = 10;  }
+    if p[11] == b'/'  { last_slash = 11;  }
+    if p[12] == b'/'  { last_slash = 12;  }
+    if p[13] == b'/'  { last_slash = 13;  }
+    if p[14] == b'/'  { last_slash = 14;  }
+    if p[15] == b'/'  { last_slash = 15;  }
+    if p[16] == b'/'  { last_slash = 16;  }
+    if p[17] == b'/'  { last_slash = 17;  }
+    if p[18] == b'/'  { last_slash = 18;  }
+    if p[19] == b'/'  { last_slash = 19;  }
+    if p[20] == b'/'  { last_slash = 20;  }
+    if p[21] == b'/'  { last_slash = 21;  }
+    if p[22] == b'/'  { last_slash = 22;  }
+    if p[23] == b'/'  { last_slash = 23;  }
+    if p[24] == b'/'  { last_slash = 24;  }
+    if p[25] == b'/'  { last_slash = 25;  }
+    if p[26] == b'/'  { last_slash = 26;  }
+    if p[27] == b'/'  { last_slash = 27;  }
+    if p[28] == b'/'  { last_slash = 28;  }
+    if p[29] == b'/'  { last_slash = 29;  }
+    if p[30] == b'/'  { last_slash = 30;  }
+    let i = last_slash + 1;
+    // "su\0"
+    if p[i] == b's' && p[i+1] == b'u' && p[i+2] == 0 { return true; }
+    // "sudo\0"
+    if p[i] == b's' && p[i+1] == b'u' && p[i+2] == b'd' && p[i+3] == b'o'
+        && p[i+4] == 0 { return true; }
+    // "newuidmap\0"
+    if p[i] == b'n' && p[i+1] == b'e' && p[i+2] == b'w' && p[i+3] == b'u'
+        && p[i+4] == b'i' && p[i+5] == b'd' && p[i+6] == b'm' && p[i+7] == b'a'
+        && p[i+8] == b'p' && p[i+9] == 0 { return true; }
+    // "newgidmap\0"
+    if p[i] == b'n' && p[i+1] == b'e' && p[i+2] == b'w' && p[i+3] == b'g'
+        && p[i+4] == b'i' && p[i+5] == b'd' && p[i+6] == b'm' && p[i+7] == b'a'
+        && p[i+8] == b'p' && p[i+9] == 0 { return true; }
+    // "pkexec\0"
+    if p[i] == b'p' && p[i+1] == b'k' && p[i+2] == b'e' && p[i+3] == b'x'
+        && p[i+4] == b'e' && p[i+5] == b'c' && p[i+6] == 0 { return true; }
+    // "nsenter\0"
+    if p[i] == b'n' && p[i+1] == b's' && p[i+2] == b'e' && p[i+3] == b'n'
+        && p[i+4] == b't' && p[i+5] == b'e' && p[i+6] == b'r' && p[i+7] == 0 { return true; }
+    // "unshare\0"
+    if p[i] == b'u' && p[i+1] == b'n' && p[i+2] == b's' && p[i+3] == b'h'
+        && p[i+4] == b'a' && p[i+5] == b'r' && p[i+6] == b'e' && p[i+7] == 0 { return true; }
+    false
 }
 
 // ===========================================================================
@@ -113,6 +275,10 @@ fn try_trace_execve(ctx: &TracePointContext) -> Result<(), c_long> {
         }
     }
 
+    // Enforcement for privilege-escalation binaries is handled by the
+    // lsm_bprm_check hook (returns -EPERM synchronously, before exec).
+    // The tracepoint only emits telemetry.
+
     EVENTS.output(ctx, event, 0);
     Ok(())
 }
@@ -156,6 +322,20 @@ fn try_trace_openat(ctx: &TracePointContext) -> Result<(), c_long> {
     // Read open flags
     let flags: u64 = unsafe { ctx.read_at(32)? };
     event.flags = flags as u32;
+
+    // /proc/<pid> enforcement is handled by the lsm_file_open hook (returns
+    // -EPERM synchronously). The tracepoint only sends SIGKILL for write-path
+    // violations that the LSM hook can't check (it lacks full-path + flags).
+    if event.pid != 1 {
+        if has_write_intent(event.flags)
+            && !path_starts_with_workspace(&event.path)
+            && !path_starts_with_dev(&event.path)
+            && !path_starts_with_tmp(&event.path)
+            && !path_starts_with_proc_self(&event.path)
+        {
+            unsafe { bpf_send_signal(9) };
+        }
+    }
 
     EVENTS.output(ctx, event, 0);
     Ok(())
@@ -532,6 +712,18 @@ fn try_trace_exit(ctx: &TracePointContext) -> Result<(), c_long> {
     event.comm[..8].copy_from_slice(&comm_lo.to_ne_bytes());
     event.comm[8..16].copy_from_slice(&comm_hi.to_ne_bytes());
 
+    // Read exit_code from task_struct (not in tracepoint args).
+    // For signal deaths: lower 7 bits = signal number (e.g. 9 for SIGKILL).
+    // For normal exits: bits 8-15 = exit code (same as WEXITSTATUS).
+    let task = unsafe { bpf_get_current_task() };
+    if task != 0 {
+        if let Ok(code) = unsafe {
+            bpf_probe_read_kernel((task + OFFSET_TASK_EXIT_CODE) as *const i32)
+        } {
+            event.flags = code as u32;
+        }
+    }
+
     EVENTS.output(ctx, event, 0);
     Ok(())
 }
@@ -722,21 +914,42 @@ static ALLOWED_NETS: LpmTrie<u32, u8> = LpmTrie::with_max_entries(256, 0);
 /// Linux EPERM errno value (permission denied).
 const EPERM: i32 = 1;
 
-/// Byte offset of `f_path` within `struct file` on aarch64 Linux 6.12.
-/// Verified via BTF: `pahole -C file vmlinux | grep f_path`.
-const OFFSET_FILE_F_PATH: usize = 16;
+// Struct offsets for aarch64 Linux 6.12.13 — verified via /sys/kernel/btf/vmlinux.
+//
+// struct file (size=184, btf_id=545):
+//   offset 0:   f_count (atomic_long_t)
+//   offset 8:   f_lock (spinlock_t)
+//   offset 12:  f_mode (fmode_t)
+//   offset 16:  f_op (const struct file_operations *)
+//   offset 24:  f_mapping (struct address_space *)
+//   offset 32:  private_data (void *)
+//   offset 40:  f_inode (struct inode *)
+//   offset 48:  f_flags (unsigned int)
+//   offset 52:  f_iocb_flags (unsigned int)
+//   offset 56:  f_cred (const struct cred *)
+//   offset 64:  f_path (struct path — mnt at +0, dentry at +8)
+//
+// struct dentry (size=192, btf_id=611):
+//   offset 0:   d_flags (unsigned int)
+//   offset 4:   d_seq (seqcount_spinlock_t)
+//   offset 8:   d_hash (hlist_bl_node)
+//   offset 24:  d_parent (struct dentry *)
+//   offset 32:  d_name (struct qstr — hash_len at +0, name ptr at +8)
+//   offset 48:  d_inode (struct inode *)
+const OFFSET_FILE_DENTRY: u64 = 72;       // file.f_path.dentry (64 + 8)
+const OFFSET_DENTRY_NAME: u64 = 40;       // dentry.d_name.name (32 + 8)
+const OFFSET_DENTRY_D_PARENT: u64 = 24;   // dentry.d_parent
+const OFFSET_TASK_EXIT_CODE: u64 = 1076;  // task_struct.exit_code (from BTF, kernel 6.12)
 
 // ---------------------------------------------------------------------------
-// LSM probe: file_open — block forbidden file access before open() returns
+// LSM probe: file_open — synchronous enforcement for dangerous paths
 // ---------------------------------------------------------------------------
 //
-// Hook fires synchronously when any process calls open()/openat(). We use
-// bpf_d_path() to resolve the full path (following symlinks and mounts),
-// then check ALLOWED_PATHS / DENIED_PATHS. Returns -EPERM immediately if
-// the path is denied — no SIGKILL needed.
-//
-// Limitation: glob patterns can't be evaluated in BPF, so only exact-path
-// rules are enforced here. Glob rules fall back to kill-on-detect.
+// bpf_d_path() can't be used here (arg(0) is struct file *, verifier needs
+// PTR_TO_BTF_ID for struct path). Instead we walk the dentry->d_parent chain
+// to reconstruct 3 path components and match /proc/<pid>/{mem,maps,...}.
+// Returns -EPERM synchronously — the open() syscall fails before any data
+// is read, eliminating the race window that bpf_send_signal has.
 
 #[lsm(hook = "file_open")]
 pub fn lsm_file_open(ctx: LsmContext) -> i32 {
@@ -746,44 +959,112 @@ pub fn lsm_file_open(ctx: LsmContext) -> i32 {
     }
 }
 
+/// Read up to 16 bytes of the dentry's d_name.name into a stack buffer.
+/// Infallible — buffer stays zeroed if any read fails.
+#[inline(always)]
+fn read_dentry_name(dentry_addr: u64, buf: &mut [u8; 16]) {
+    if let Ok(name_ptr) = unsafe {
+        bpf_probe_read_kernel((dentry_addr + OFFSET_DENTRY_NAME) as *const u64)
+    } {
+        if name_ptr != 0 {
+            let _ = unsafe { bpf_probe_read_kernel_str_bytes(name_ptr as *const u8, buf) };
+        }
+    }
+}
+
+/// Read dentry->d_parent pointer. Returns 0 if read fails or parent == self (root).
+#[inline(always)]
+fn read_dentry_parent(dentry_addr: u64) -> u64 {
+    match unsafe { bpf_probe_read_kernel((dentry_addr + OFFSET_DENTRY_D_PARENT) as *const u64) } {
+        Ok(parent) if parent != 0 && parent != dentry_addr => parent,
+        _ => 0,
+    }
+}
+
+/// True if the 16-byte name buffer matches a dangerous /proc/<pid>/ file:
+/// mem, maps, pagemap, smaps.
+#[inline(always)]
+fn is_proc_danger_name(n: &[u8; 16]) -> bool {
+    // "mem"
+    if n[0] == b'm' && n[1] == b'e' && n[2] == b'm' && n[3] == 0 { return true; }
+    // "maps"
+    if n[0] == b'm' && n[1] == b'a' && n[2] == b'p' && n[3] == b's' && n[4] == 0 { return true; }
+    // "pagemap"
+    if n[0] == b'p' && n[1] == b'a' && n[2] == b'g' && n[3] == b'e'
+        && n[4] == b'm' && n[5] == b'a' && n[6] == b'p' && n[7] == 0 { return true; }
+    // "smaps"
+    if n[0] == b's' && n[1] == b'm' && n[2] == b'a' && n[3] == b'p'
+        && n[4] == b's' && n[5] == 0 { return true; }
+    false
+}
+
+/// True if name buffer starts with an ASCII digit (PID directory).
+#[inline(always)]
+fn name_is_pid(n: &[u8; 16]) -> bool {
+    n[0] >= b'0' && n[0] <= b'9'
+}
+
+/// True if name buffer is "proc".
+#[inline(always)]
+fn name_is_proc(n: &[u8; 16]) -> bool {
+    n[0] == b'p' && n[1] == b'r' && n[2] == b'o' && n[3] == b'c' && n[4] == 0
+}
+
+/// True if name buffer is "fd" or "ns" (subdir patterns at depth 1 under /proc/<pid>/).
+#[inline(always)]
+fn name_is_fd_or_ns(n: &[u8; 16]) -> bool {
+    (n[0] == b'f' && n[1] == b'd' && n[2] == 0) ||
+    (n[0] == b'n' && n[1] == b's' && n[2] == 0)
+}
+
 fn try_lsm_file_open(ctx: &LsmContext) -> Result<i32, c_long> {
-    // Get path scratch buffer — avoids 256-byte local on stack
-    let path_buf_ptr = unsafe { PATH_SCRATCH.get_ptr_mut(0).ok_or(1i64)? };
-    // Zero the buffer so unused bytes don't pollute the map key
-    unsafe { core::ptr::write_bytes(path_buf_ptr as *mut u8, 0, 256) };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
 
-    // arg(0) is struct file *file — read as u64, cast to pointer
+    // Never block PID 1 (agent init) — it reads /proc/self/* during startup.
+    if pid == 1 { return Ok(0); }
+
     let file_addr: u64 = unsafe { ctx.arg(0) };
-    if file_addr == 0 {
-        return Ok(0);
-    }
+    if file_addr == 0 { return Ok(0); }
 
-    // f_path is at offset OFFSET_FILE_F_PATH in struct file (aarch64 Linux 6.12).
-    // bpf_d_path() resolves the vfsmount + dentry into a full path string.
-    let f_path_ptr = (file_addr as usize + OFFSET_FILE_F_PATH) as *mut core::ffi::c_void;
-    let ret = unsafe {
-        bpf_d_path(f_path_ptr as *mut _, path_buf_ptr as *mut u8, 256)
+    // Walk dentry chain: file->f_path.dentry -> d_parent -> d_parent -> d_parent
+    // All reads are infallible — buffers stay zeroed on failure, pattern won't match.
+    let d0 = match unsafe {
+        bpf_probe_read_kernel((file_addr + OFFSET_FILE_DENTRY) as *const u64)
+    } {
+        Ok(d) if d != 0 => d,
+        _ => return Ok(0),
     };
-    if ret < 0 {
-        return Ok(0); // fail open if path extraction fails
-    }
 
-    let path_key = unsafe { &*(path_buf_ptr as *const [u8; 256]) };
+    // Level 0: filename (e.g. "maps", "mem", "3", "mnt")
+    let mut n0 = [0u8; 16];
+    read_dentry_name(d0, &mut n0);
 
-    // Allow list takes precedence
-    if unsafe { ALLOWED_PATHS.get(path_key) }.is_some() {
-        return Ok(0);
-    }
+    // Level 1: parent dir (e.g. "1", "fd", "ns")
+    let d1 = read_dentry_parent(d0);
+    let mut n1 = [0u8; 16];
+    if d1 != 0 { read_dentry_name(d1, &mut n1); }
 
-    // Check deny list
-    if unsafe { DENIED_PATHS.get(path_key) }.is_some() {
-        let event = get_scratch_event().ok_or(1i64)?;
-        event.kind = EventKind::Openat as u32;
-        event.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        event.timestamp_ns = unsafe { bpf_ktime_get_ns() };
-        event.comm = bpf_get_current_comm()?;
-        event.path.copy_from_slice(path_key);
-        EVENTS.output(ctx, event, 0);
+    // Level 2: grandparent dir (e.g. "proc", "1")
+    let d2 = if d1 != 0 { read_dentry_parent(d1) } else { 0 };
+    let mut n2 = [0u8; 16];
+    if d2 != 0 { read_dentry_name(d2, &mut n2); }
+
+    // Pattern 1: /proc/<pid>/{mem,maps,pagemap,smaps}
+    //   n1=<digit> (PID dir), n0=danger file.
+    //   procfs root dentry has empty name, so n2 won't be "proc" — but
+    //   a numeric dir + danger filename is unique to procfs. No false positives.
+    let blocked = (name_is_pid(&n1) && is_proc_danger_name(&n0))
+    // Pattern 2: /proc/<pid>/fd/* or /proc/<pid>/ns/*
+    //   n2=<digit> (PID dir), n1="fd"|"ns", n0=target
+        || (name_is_pid(&n2) && name_is_fd_or_ns(&n1));
+
+    // LSM hook is enforcement-only — no telemetry emission here.
+    // The sys_enter_openat tracepoint already emits the telemetry event
+    // with the correct full path. Emitting here caused double-fire with
+    // mangled paths (///1/maps) that tripped write_outside_workspace.
+
+    if blocked {
+        unsafe { bpf_send_signal(9) };
         return Ok(-EPERM);
     }
 

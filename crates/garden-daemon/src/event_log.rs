@@ -44,15 +44,143 @@ pub struct Violation {
     pub message: String,
 }
 
+/// Returns true if the path targets cross-process memory inspection primitives.
+/// Covers /proc/<pid>/mem, /maps, /pagemap, /smaps, and /fd/ subdirectory.
+fn is_proc_memory_path(path: &str) -> bool {
+    let rest = match path.strip_prefix("/proc/") {
+        Some(r) => r,
+        None => return false,
+    };
+    let (pid_part, after_pid) = match rest.find('/') {
+        Some(pos) => (&rest[..pos], &rest[pos + 1..]),
+        None => return false,
+    };
+    let is_pid_or_self =
+        pid_part == "self" || pid_part.chars().all(|c| c.is_ascii_digit());
+    if !is_pid_or_self {
+        return false;
+    }
+    matches!(after_pid, "mem" | "maps" | "pagemap" | "smaps")
+        || after_pid.starts_with("fd/")
+        || after_pid.starts_with("ns/")
+}
+
+/// Returns true if the open flags indicate write intent (O_WRONLY or O_RDWR).
+fn is_write_intent(flags: u32) -> bool {
+    let mode = flags & 3;
+    mode == 1 || mode == 2
+}
+
+/// Standard device nodes that are safe to write to from any process.
+fn is_allowed_device_write(path: &str) -> bool {
+    matches!(
+        path,
+        "/dev/null" | "/dev/zero" | "/dev/urandom" | "/dev/random"
+            | "/dev/tty" | "/dev/stdin" | "/dev/stdout" | "/dev/stderr"
+            | "/dev/fd/1" | "/dev/fd/2"
+    )
+}
+
+/// Returns true if the binary basename is on the privileged-tool blocklist.
+fn is_privileged_binary(binary: &str) -> bool {
+    const BLOCKLIST: &[&str] = &[
+        "su", "sudo", "modprobe", "insmod", "rmmod",
+        "newuidmap", "newgidmap", "pkexec", "dbus-daemon",
+        "nsenter", "unshare",
+    ];
+    let basename = binary.rsplit('/').next().unwrap_or(binary);
+    BLOCKLIST.contains(&basename)
+}
+
 fn detect_violation(event: &SecurityEvent) -> Option<Violation> {
     match &event.kind {
-        SecurityEventKind::CredsChanged { new_uid, .. } if *new_uid == 0 => {
+        // Gap 1: cross-process memory access via /proc/<pid>/mem et al.
+        // Flag even when the kernel denies it — defense in depth.
+        SecurityEventKind::FileAccess { path, .. }
+            if event.pid != 1 && is_proc_memory_path(path) =>
+        {
+            Some(Violation {
+                severity: "high",
+                rule: "proc_memory_access",
+                message: format!(
+                    "process '{}' (pid {}) accessed cross-process memory path '{}'",
+                    event.comm, event.pid, path
+                ),
+            })
+        }
+
+        // Gap 2: write-intent open outside /workspace.
+        // The kernel may still deny the write, but the attempt is high signal.
+        SecurityEventKind::FileAccess { path, flags, .. }
+            if event.pid != 1
+                && is_write_intent(*flags)
+                && !path.starts_with("/workspace")
+                && !is_allowed_device_write(path) =>
+        {
+            Some(Violation {
+                severity: "medium",
+                rule: "write_outside_workspace",
+                message: format!(
+                    "process '{}' (pid {}) attempted to write to '{}' (outside /workspace)",
+                    event.comm, event.pid, path
+                ),
+            })
+        }
+
+        // Namespace escape: /proc/<pid>/ns/ path opened.
+        // Separate from proc_memory_access so it can carry its own rule name.
+        SecurityEventKind::FileAccess { path, .. }
+            if event.pid != 1
+                && path.contains("/ns/")
+                && {
+                    let rest = path.strip_prefix("/proc/").unwrap_or("");
+                    rest.find('/').map(|p| {
+                        let pid_part = &rest[..p];
+                        pid_part == "self" || pid_part.chars().all(|c| c.is_ascii_digit())
+                    }).unwrap_or(false)
+                } =>
+        {
+            Some(Violation {
+                severity: "high",
+                rule: "namespace_escape_attempt",
+                message: format!(
+                    "process '{}' (pid {}) accessed namespace entry '{}'",
+                    event.comm, event.pid, path
+                ),
+            })
+        }
+
+        // Gap 3: exec of a known privilege-escalation binary.
+        // Checks both the exec path (symlink case: /bin/nsenter) and argv[0]
+        // (direct busybox invocation: /bin/busybox with argv[0] = nsenter).
+        SecurityEventKind::ProcessExec { binary, args, .. }
+            if is_privileged_binary(binary)
+                || args.first().map(|a| is_privileged_binary(a)).unwrap_or(false) =>
+        {
+            let name = if is_privileged_binary(binary) {
+                binary.rsplit('/').next().unwrap_or(binary).to_string()
+            } else {
+                args.first()
+                    .map(|a| a.rsplit('/').next().unwrap_or(a).to_string())
+                    .unwrap_or_else(|| binary.clone())
+            };
+            Some(Violation {
+                severity: "high",
+                rule: "privileged_binary_exec",
+                message: format!(
+                    "process '{}' (pid {}) attempted to exec privileged binary '{}'",
+                    event.comm, event.pid, name
+                ),
+            })
+        }
+
+        SecurityEventKind::CredsChanged { old_uid, new_uid } if *old_uid != 0 && *new_uid == 0 => {
             Some(Violation {
                 severity: "critical",
                 rule: "privilege_escalation",
                 message: format!(
-                    "process '{}' (pid {}) escalated to root (uid 0)",
-                    event.comm, event.pid
+                    "process '{}' (pid {}) escalated to root (uid {} → 0)",
+                    event.comm, event.pid, old_uid
                 ),
             })
         }
@@ -215,7 +343,8 @@ impl EventLogger {
     }
 
     /// Write one event to the log, rotating if the file has reached `max_file_bytes`.
-    pub fn log(&self, event: &SecurityEvent) -> anyhow::Result<()> {
+    /// Log the event and return any violation detected, so callers can enforce.
+    pub fn log(&self, event: &SecurityEvent) -> anyhow::Result<Option<Violation>> {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
         let violation = detect_violation(event);
 
@@ -231,7 +360,7 @@ impl EventLogger {
             pid: event.pid,
             comm: &event.comm,
             event,
-            violation,
+            violation: violation.clone(),
         };
 
         let mut json = serde_json::to_string(&line)?;
@@ -247,7 +376,7 @@ impl EventLogger {
         rotating.file.write_all(json.as_bytes())?;
         rotating.current_bytes += json.len() as u64;
 
-        Ok(())
+        Ok(violation)
     }
 
     /// Rotate log files:
@@ -504,7 +633,7 @@ mod tests {
         rotating.current_bytes = 9999;
         drop(rotating);
         logger
-            .log(&make_event(1, "test", SecurityEventKind::ProcessExit { exit_code: 0 }))
+            .log(&make_event(1, "test", SecurityEventKind::ProcessExit { exit_status: 0, exit_signal: 0 }))
             .unwrap();
 
         // events.1.ndjson should now exist (the original events.ndjson was rotated)
@@ -539,7 +668,7 @@ mod tests {
         };
 
         logger
-            .log(&make_event(1, "test", SecurityEventKind::ProcessExit { exit_code: 0 }))
+            .log(&make_event(1, "test", SecurityEventKind::ProcessExit { exit_status: 0, exit_signal: 0 }))
             .unwrap();
 
         // events.3.ndjson should have been deleted (was the oldest beyond max_files=3)

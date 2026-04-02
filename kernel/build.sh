@@ -61,7 +61,8 @@ docker run --rm \
         echo '🔍 Verifying critical configs survived olddefconfig...'
         FAILED=0
         for cfg in CONFIG_BPF_SYSCALL CONFIG_DEBUG_INFO_BTF CONFIG_KPROBES \
-                   CONFIG_FTRACE_SYSCALLS CONFIG_PERF_EVENTS CONFIG_VSOCKETS \
+                   CONFIG_FUNCTION_TRACER CONFIG_DYNAMIC_FTRACE CONFIG_FTRACE_SYSCALLS \
+                   CONFIG_PERF_EVENTS CONFIG_VSOCKETS \
                    CONFIG_VIRTIO_VSOCKETS CONFIG_BPF_LSM CONFIG_SECURITY; do
             if ! grep -q \"^\${cfg}=y\" .config; then
                 echo \"❌ FATAL: \${cfg} was dropped by olddefconfig!\"

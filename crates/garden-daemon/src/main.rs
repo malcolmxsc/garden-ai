@@ -285,7 +285,13 @@ fn main() {
     });
 
     println!("🔄 Daemon handing control to macOS CFRunLoop. Press Ctrl+C to stop.");
-    Virtualizer::run_loop();
+    // run_loop() returns when the VM stops. Keep looping so the daemon stays
+    // alive and the gRPC/HTTP servers can accept a subsequent `garden boot`.
+    loop {
+        Virtualizer::run_loop();
+        println!("🔄 VM stopped — daemon staying alive, waiting for next boot command.");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
 }
 
 // =====================================================================
@@ -460,33 +466,92 @@ async fn process_telemetry_stream(
     let mut lines = reader.lines();
 
     while let Ok(Some(line)) = lines.next_line().await {
-        // Broadcast raw NDJSON line to TCP proxy clients (with newline)
-        let _ = broadcast_tx.send(format!("{}\n", line));
-
         match serde_json::from_str::<garden_ebpf::events::SecurityEvent>(&line) {
             Ok(event) => {
-                // Persist to session log (includes violation detection)
-                if let Err(e) = logger.log(&event) {
-                    eprintln!("📋 Failed to write session log: {}", e);
+                // Persist to session log; get back any violation for enforcement.
+                let violation = match logger.log(&event) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("📋 Failed to write session log: {}", e);
+                        None
+                    }
+                };
+
+                // Broadcast enriched event (with violation info) to TCP proxy
+                // clients so the SwiftUI app can filter violations.
+                let enriched = serde_json::json!({
+                    "timestamp_ns": event.timestamp_ns,
+                    "pid": event.pid,
+                    "comm": event.comm,
+                    "kind": event.kind,
+                    "violation": violation,
+                });
+                let _ = broadcast_tx.send(format!("{}\n", enriched));
+
+                // Enforce hardcoded violations: SIGKILL the offending process.
+                if let Some(ref v) = violation {
+                    let should_kill = matches!(v.severity, "critical" | "high");
+                    if should_kill && event.pid != 1 {
+                        eprintln!(
+                            "🚨 ENFORCING [{}] rule={} pid={} comm={} — sending SIGKILL",
+                            v.severity, v.rule, event.pid, event.comm
+                        );
+                        let pid = event.pid;
+                        tokio::spawn(async move {
+                            if let Ok(mut client) =
+                                garden_common::ipc::agent_service_client::AgentServiceClient::connect(
+                                    "http://127.0.0.1:10000",
+                                )
+                                .await
+                            {
+                                let req = tonic::Request::new(garden_common::ipc::CommandRequest {
+                                    command: "kill".to_string(),
+                                    args: vec!["-9".to_string(), pid.to_string()],
+                                    cwd: ".".to_string(),
+                                });
+                                let _ = client.execute_command(req).await;
+                            }
+                        });
+                    }
                 }
 
+                // Enforce configurable policy (JSON policy file).
                 let action = policy.evaluate(&event);
                 match action {
                     garden_ebpf::policy::PolicyAction::Deny => {
                         eprintln!(
-                            "🚨 DENIED: pid={} comm={} {:?}",
+                            "🚨 POLICY DENY: pid={} comm={} {:?}",
                             event.pid, event.comm, event.kind
                         );
+                        if event.pid != 1 {
+                            let pid = event.pid;
+                            tokio::spawn(async move {
+                                if let Ok(mut client) =
+                                    garden_common::ipc::agent_service_client::AgentServiceClient::connect(
+                                        "http://127.0.0.1:10000",
+                                    )
+                                    .await
+                                {
+                                    let req = tonic::Request::new(garden_common::ipc::CommandRequest {
+                                        command: "kill".to_string(),
+                                        args: vec!["-9".to_string(), pid.to_string()],
+                                        cwd: ".".to_string(),
+                                    });
+                                    let _ = client.execute_command(req).await;
+                                }
+                            });
+                        }
                     }
                     garden_ebpf::policy::PolicyAction::Log => {
-                        println!(
-                            "📊 [telemetry] pid={} comm={} {:?}",
-                            event.pid, event.comm, event.kind
-                        );
+                        if violation.is_none() {
+                            println!(
+                                "📊 [telemetry] pid={} comm={} {:?}",
+                                event.pid, event.comm, event.kind
+                            );
+                        }
                     }
-                    garden_ebpf::policy::PolicyAction::Allow => {
-                        // Silent pass — allowed events are not printed
-                    }
+                    #[allow(unreachable_patterns)]
+                    garden_ebpf::policy::PolicyAction::Allow => {}
                 }
             }
             Err(e) => {

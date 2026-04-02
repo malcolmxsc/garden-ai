@@ -83,8 +83,10 @@ pub enum SecurityEventKind {
     },
     /// A process exited.
     ProcessExit {
-        /// Exit code / signal number.
-        exit_code: u32,
+        /// Exit status (0-255) from exit(). Only meaningful when exit_signal is 0.
+        exit_status: u32,
+        /// Signal number that killed the process (e.g. 9 = SIGKILL). 0 = normal exit.
+        exit_signal: u32,
     },
     /// Process credentials changed (commit_creds kprobe).
     CredsChanged {
@@ -207,7 +209,7 @@ mod tests {
                 child_pid: 101,
                 child_comm: "bash".into(),
             },
-            SecurityEventKind::ProcessExit { exit_code: 0 },
+            SecurityEventKind::ProcessExit { exit_status: 0, exit_signal: 0 },
             SecurityEventKind::CredsChanged {
                 old_uid: 1000,
                 new_uid: 0,

@@ -54,3 +54,10 @@ pub struct ListDirectoryParams {
     #[serde(default = "default_cwd")]
     pub path: String,
 }
+
+/// Parameters for the `investigate_process` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct InvestigateProcessParams {
+    /// The guest PID to investigate (e.g. "42")
+    pub pid: String,
+}

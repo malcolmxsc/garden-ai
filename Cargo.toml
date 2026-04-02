@@ -37,7 +37,7 @@ thiserror = "2"
 anyhow = "1"
 
 # MCP Protocol
-rmcp = { version = "0.15", features = ["server", "macros", "transport-streamable-http-server", "transport-io"] }
+rmcp = { version = "1.3", features = ["server", "macros", "transport-io"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }

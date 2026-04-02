@@ -10,6 +10,13 @@ struct WireEvent: Decodable {
     let pid: UInt32
     let comm: String
     let kind: WireKind
+    let violation: WireViolation?
+}
+
+struct WireViolation: Decodable {
+    let severity: String
+    let rule: String
+    let message: String
 }
 
 struct WireKind: Decodable {
@@ -33,7 +40,8 @@ struct WireKind: Decodable {
     let child_pid: UInt32?
     let child_comm: String?
     // process_exit
-    let exit_code: UInt32?
+    let exit_status: UInt32?
+    let exit_signal: UInt32?
     // creds_changed
     let old_uid: UInt32?
     let new_uid: UInt32?
@@ -60,7 +68,7 @@ struct WireKind: Decodable {
         case binary, args
         case server_ip, domain
         case parent_pid, child_pid, child_comm
-        case exit_code
+        case exit_status, exit_signal
         case old_uid, new_uid
         case bytes
         case target, source
@@ -85,7 +93,7 @@ extension WireEvent {
         case "process_fork":
             eventKind = .processFork(childPid: Int(k.child_pid ?? 0), childComm: k.child_comm ?? "?")
         case "process_exit":
-            eventKind = .processExit(code: Int(k.exit_code ?? 0))
+            eventKind = .processExit(exitStatus: Int(k.exit_status ?? 0), exitSignal: Int(k.exit_signal ?? 0))
         case "dns_query":
             eventKind = .dnsQuery(domain: k.domain ?? "?")
         case "creds_changed":
@@ -102,24 +110,9 @@ extension WireEvent {
             return nil
         }
 
-        let isViolation: Bool
-        let violationMessage: String?
-        switch eventKind {
-        case .fileAccess(_, let allowed) where !allowed:
-            isViolation = true; violationMessage = "File access denied by policy"
-        case .networkConnect(_, _, let allowed) where !allowed:
-            isViolation = true; violationMessage = "Network connection blocked by policy"
-        case .processExec(_, let allowed) where !allowed:
-            isViolation = true; violationMessage = "Process exec blocked by policy"
-        case .mountAttempt:
-            isViolation = true; violationMessage = "Mount attempt detected"
-        case .bpfSyscall:
-            isViolation = true; violationMessage = "BPF syscall from agent process"
-        case .credsChanged(let old, let new) where new == 0 && old != 0:
-            isViolation = true; violationMessage = "Privilege escalation to root"
-        default:
-            isViolation = false; violationMessage = nil
-        }
+        // Use daemon's host-side violation detection (same rules as session log).
+        let isViolation = violation != nil
+        let violationMessage = violation.map { "[\($0.severity)] \($0.rule): \($0.message)" }
 
         return SecurityEvent(
             id: UUID(),

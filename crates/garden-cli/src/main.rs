@@ -36,12 +36,12 @@ enum Commands {
 
     /// Boot a new sandbox VM
     Boot {
-        /// Path to the Linux kernel image
-        #[arg(long, default_value = "guest/kernel/bzImage")]
+        /// Path to the Linux kernel image (leave empty to use daemon default)
+        #[arg(long, default_value = "")]
         kernel: String,
 
-        /// Path to the root filesystem
-        #[arg(long, default_value = "guest/rootfs/rootfs.img")]
+        /// Path to the initramfs image (leave empty to use daemon default)
+        #[arg(long, default_value = "")]
         rootfs: String,
 
         /// Memory allocation in MB

@@ -43,20 +43,42 @@ impl Default for McpServerConfig {
 
 /// The MCP server that bridges AI client tool calls to the Garden sandbox.
 ///
-/// Holds a gRPC client connection to the daemon's TCP proxy (127.0.0.1:10000),
-/// which forwards requests to the guest agent via vSock.
+/// The gRPC connection to the daemon proxy (127.0.0.1:10000) is established
+/// lazily on the first tool call, so the MCP server starts successfully even
+/// when the daemon is not yet running (prompts and resources work offline).
 #[derive(Clone)]
 pub struct GardenMcpServer {
-    grpc_client: Arc<Mutex<AgentServiceClient<Channel>>>,
+    /// Lazily-established gRPC client. None until first tool call.
+    grpc_client: Arc<Mutex<Option<AgentServiceClient<Channel>>>>,
     tool_router: ToolRouter<Self>,
 }
 
 impl GardenMcpServer {
-    pub fn new(grpc_client: AgentServiceClient<Channel>) -> Self {
+    pub fn new() -> Self {
         Self {
-            grpc_client: Arc::new(Mutex::new(grpc_client)),
+            grpc_client: Arc::new(Mutex::new(None)),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Return a connected gRPC client, connecting now if not yet connected.
+    async fn client(&self) -> std::result::Result<tokio::sync::MutexGuard<Option<AgentServiceClient<Channel>>>, String> {
+        let mut guard = self.grpc_client.lock().await;
+        if guard.is_none() {
+            match AgentServiceClient::connect("http://127.0.0.1:10000").await {
+                Ok(c) => {
+                    tracing::info!("Connected to Garden daemon gRPC proxy.");
+                    *guard = Some(c);
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Garden sandbox is not running. Start garden-daemon first. ({})",
+                        e
+                    ));
+                }
+            }
+        }
+        Ok(guard)
     }
 
     /// Execute a command in the guest VM via gRPC.
@@ -66,7 +88,8 @@ impl GardenMcpServer {
         args: &[&str],
         cwd: &str,
     ) -> std::result::Result<(i32, String, String), String> {
-        let mut client = self.grpc_client.lock().await;
+        let mut guard = self.client().await?;
+        let client = guard.as_mut().unwrap();
         let request = tonic::Request::new(CommandRequest {
             command: command.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
@@ -81,7 +104,11 @@ impl GardenMcpServer {
                     String::from_utf8_lossy(&resp.stderr).to_string(),
                 ))
             }
-            Err(status) => Err(format!("gRPC error: {}", status.message())),
+            Err(e) => {
+                // Connection may have dropped — clear it so next call reconnects
+                *guard = None;
+                Err(format!("gRPC error: {}", e.message()))
+            }
         }
     }
 }
@@ -174,30 +201,114 @@ impl GardenMcpServer {
             Err(e) => format!("Error: {}", e),
         }
     }
+
+    #[tool(
+        description = "Analyse recent eBPF security events and policy violations from the Garden \
+                       sandbox. Summarises what the AI workload has been doing, flags suspicious \
+                       patterns, rates overall risk (LOW/MEDIUM/HIGH), and recommends policy changes."
+    )]
+    async fn analyze_security(&self) -> String {
+        let events = read_recent_events();
+        let violations = read_violations();
+        format!(
+            "## Recent Security Events\n\n{events}\n\n## Policy Violations\n\n{violations}"
+        )
+    }
+
+    #[tool(
+        description = "Full sandbox health report: VM running state, uptime, kernel version, \
+                       recent security events, and any policy violations."
+    )]
+    async fn sandbox_report(&self) -> String {
+        let status = read_sandbox_status().await;
+        let events = read_recent_events();
+        let violations = read_violations();
+        format!(
+            "## Sandbox Status\n\n{status}\n\n\
+             ## Recent Security Events (last 50)\n\n{events}\n\n\
+             ## Policy Violations\n\n{violations}"
+        )
+    }
+
+    #[tool(
+        description = "Retrieve all eBPF security events for a specific guest process ID. \
+                       Useful for investigating what a particular process was doing."
+    )]
+    async fn investigate_process(
+        &self,
+        Parameters(params): Parameters<InvestigateProcessParams>,
+    ) -> String {
+        use crate::resources::find_latest_session_log;
+        use std::io::{BufRead, BufReader};
+
+        let pid: u64 = match params.pid.parse() {
+            Ok(n) => n,
+            Err(_) => return format!("Invalid PID '{}': must be a non-negative integer.", params.pid),
+        };
+
+        match find_latest_session_log() {
+            None => "No session log found. The Garden daemon may not have been started yet.".to_string(),
+            Some(path) => {
+                let file = match std::fs::File::open(&path) {
+                    Ok(f) => f,
+                    Err(e) => return format!("Could not open session log: {e}"),
+                };
+                let matching: Vec<String> = BufReader::new(file)
+                    .lines()
+                    .filter_map(|l| l.ok())
+                    .filter(|line| {
+                        serde_json::from_str::<serde_json::Value>(line)
+                            .ok()
+                            .and_then(|v| v["pid"].as_u64())
+                            .map(|p| p == pid)
+                            .unwrap_or(false)
+                    })
+                    .collect();
+
+                if matching.is_empty() {
+                    format!("No events found for PID {pid} in the current session.")
+                } else {
+                    format!(
+                        "Events for PID {pid} ({} total):\n\n{}",
+                        matching.len(),
+                        matching.join("\n")
+                    )
+                }
+            }
+        }
+    }
 }
 
 #[tool_handler]
 impl ServerHandler for GardenMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::LATEST,
-            capabilities: ServerCapabilities::builder()
+        // Advertise 2025-11-25 so Claude Desktop shows MCP prompts in the `/` menu.
+        // rmcp 1.3's LATEST constant is 2025-06-18; we deserialize the newer version string
+        // since ProtocolVersion accepts unknown versions via its Deserialize impl.
+        let protocol_version: rmcp::model::ProtocolVersion =
+            serde_json::from_value(serde_json::json!("2025-11-25")).unwrap();
+        ServerInfo::new(
+            ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
                 .enable_prompts()
                 .build(),
-            server_info: Implementation {
-                name: "garden-ai".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                ..Default::default()
-            },
-            instructions: Some(
-                "Garden AI sandbox server. Execute commands, read/write files, \
-                 and list directories inside a hardware-isolated Linux micro-VM. \
-                 Use resources to inspect sandbox status and security telemetry."
-                    .to_string(),
-            ),
-        }
+        )
+        .with_server_info(Implementation::new("garden-ai", env!("CARGO_PKG_VERSION")))
+        .with_instructions(
+            "Garden AI sandbox server — a hardware-isolated Linux micro-VM for AI workloads.\n\n\
+             TOOLS: run_command, read_file, write_file, list_directory — execute and manage \
+             files inside the sandbox VM.\n\n\
+             RESOURCES (read with read_resource):\n\
+             - garden://sandbox/status — VM running state and uptime\n\
+             - garden://security/events — last 50 eBPF security events\n\
+             - garden://security/violations — policy violations detected by host\n\n\
+             PROMPTS (invoke with get_prompt or tell the user to select from the / menu):\n\
+             - analyze-security — analyse recent events and flag suspicious activity\n\
+             - sandbox-report — full health report: VM state + security summary\n\
+             - investigate-process (arg: pid) — all events for a specific guest PID",
+        )
+        .with_protocol_version(protocol_version)
     }
 
     async fn list_resources(
@@ -248,11 +359,7 @@ impl ServerHandler for GardenMcpServer {
             ),
         ];
 
-        Ok(ListResourcesResult {
-            meta: None,
-            resources,
-            next_cursor: None,
-        })
+        Ok(ListResourcesResult::with_all_items(resources))
     }
 
     async fn read_resource(
@@ -274,14 +381,14 @@ impl ServerHandler for GardenMcpServer {
             }
         };
 
-        Ok(ReadResourceResult {
-            contents: vec![ResourceContents::TextResourceContents {
+        Ok(ReadResourceResult::new(vec![
+            ResourceContents::TextResourceContents {
                 uri: request.uri,
                 mime_type: Some("text/plain".to_string()),
                 text,
                 meta: None,
-            }],
-        })
+            },
+        ]))
     }
 
     async fn list_prompts(
@@ -303,14 +410,13 @@ impl ServerHandler for GardenMcpServer {
 
 /// Start the MCP server using stdio transport.
 ///
-/// Connects to the daemon's gRPC proxy at 127.0.0.1:10000, then listens
-/// for MCP JSON-RPC messages on stdin/stdout (standard for Claude Desktop).
+/// The gRPC connection to the daemon is established lazily on first tool use,
+/// so this returns immediately and Claude Desktop can use prompts/resources
+/// even when the Garden daemon is not yet running.
 pub async fn start_server(_config: McpServerConfig) -> Result<()> {
-    tracing::info!("Connecting to Garden daemon gRPC proxy...");
-    let grpc_client = AgentServiceClient::connect("http://127.0.0.1:10000").await?;
-    tracing::info!("Connected. Starting MCP server on stdio...");
+    tracing::info!("Starting Garden AI MCP server on stdio (lazy daemon connection)...");
 
-    let server = GardenMcpServer::new(grpc_client);
+    let server = GardenMcpServer::new();
     let transport = rmcp::transport::stdio();
     let service = server.serve(transport).await?;
     service.waiting().await?;

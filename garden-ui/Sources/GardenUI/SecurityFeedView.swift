@@ -40,16 +40,40 @@ struct SecurityFeedView: View {
 
             Spacer()
 
-            // Violations toggle
-            Toggle(isOn: $appState.showViolationsOnly.animation(.spring(duration: 0.3))) {
-                Label("Violations only", systemImage: "exclamationmark.triangle.fill")
-                    .font(.system(size: 10, weight: .medium))
-                    .labelStyle(.iconOnly)
-                    .foregroundStyle(appState.showViolationsOnly ? .red : .secondary)
+            // Violations filter pill
+            let violationCount = appState.events.filter(\.isViolation).count
+            Button {
+                withAnimation(.spring(duration: 0.3)) {
+                    appState.showViolationsOnly.toggle()
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 9, weight: .semibold))
+                    if violationCount > 0 {
+                        Text("\(violationCount)")
+                            .font(.system(size: 10, weight: .bold).monospacedDigit())
+                    } else {
+                        Text("Violations")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                }
+                .foregroundStyle(appState.showViolationsOnly ? .white : (violationCount > 0 ? .red : .secondary))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background {
+                    Capsule()
+                        .fill(appState.showViolationsOnly ? Color.red : Color.red.opacity(violationCount > 0 ? 0.12 : 0.0))
+                        .overlay {
+                            Capsule()
+                                .strokeBorder(Color.red.opacity(appState.showViolationsOnly ? 0 : (violationCount > 0 ? 0.35 : 0.2)), lineWidth: 0.5)
+                        }
+                }
             }
-            .toggleStyle(.button)
             .buttonStyle(.borderless)
             .help("Show violations only")
+            .animation(.spring(duration: 0.25), value: appState.showViolationsOnly)
+            .animation(.spring(duration: 0.25), value: violationCount)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)

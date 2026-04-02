@@ -66,6 +66,7 @@ final class AppState: ObservableObject {
     init() {
         // Poll daemon for current status on launch so UI reflects real VM state
         Task { await syncStatusFromDaemon() }
+        startStatusPolling()
     }
 
     func boot() async {
@@ -148,12 +149,55 @@ final class AppState: ObservableObject {
         }
     }
 
+    // MARK: - Persistent status polling
+
+    /// Fires every 5 s — detects terminal-initiated VM boots/stops and keeps telemetry live.
+    private func startStatusPolling() {
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.pollDaemonStatus()
+            }
+        }
+    }
+
+    private func pollDaemonStatus() async {
+        do {
+            let status = try await DaemonClient.status()
+            daemonReachable = true
+
+            if status.running {
+                if vmState == .stopped || vmState == .error {
+                    // Terminal did `garden boot` while UI wasn't watching — reattach
+                    vmState = .running
+                    uptimeSeconds = Int(status.uptime_seconds)
+                    startUptimeTimer()
+                    startTelemetryStream()
+                    withAnimation(.easeIn) { wakeFlash = true }
+                } else if vmState == .running && telemetry == nil {
+                    // VM still running but stream dropped — reconnect
+                    startTelemetryStream()
+                }
+            } else if vmState == .running || vmState == .booting {
+                // Terminal did `garden stop` — reflect in UI
+                stopAll()
+                vmState = .stopped
+                uptimeSeconds = 0
+                memoryMB = 0
+                cpuHistory = Array(repeating: 0.0, count: 30)
+                withAnimation(.easeOut(duration: 0.4)) { events = [] }
+            }
+        } catch {
+            daemonReachable = false
+        }
+    }
+
     // MARK: - Timers
 
     private var uptimeTimer: Timer?
     private var mockTimer: Timer?
     private var telemetry: TelemetryStream?
     private var statusPollTask: Task<Void, Never>?
+    private var pollTimer: Timer?  // persistent — NOT stopped by stopAll()
 
     private func startUptimeTimer() {
         uptimeTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in

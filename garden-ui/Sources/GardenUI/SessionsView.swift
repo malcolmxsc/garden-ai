@@ -8,8 +8,13 @@ struct SessionsView: View {
     @State private var sessions: [SessionInfo] = []
     @State private var selectedSession: SessionInfo?
     @State private var sessionEvents: [SecurityEvent] = []
+    @State private var showViolationsOnly = false
     @State private var isLoading = false
     @State private var errorMsg: String?
+
+    private var displayedEvents: [SecurityEvent] {
+        showViolationsOnly ? sessionEvents.filter(\.isViolation) : sessionEvents
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -33,6 +38,7 @@ struct SessionsView: View {
                     withAnimation(.spring(duration: 0.3)) {
                         selectedSession = nil
                         sessionEvents = []
+                        showViolationsOnly = false
                     }
                 } label: {
                     Image(systemName: "chevron.left")
@@ -61,19 +67,38 @@ struct SessionsView: View {
                 }
                 .buttonStyle(.borderless)
             } else {
-                let violations = sessionEvents.filter(\.isViolation).count
-                if violations > 0 {
-                    Text("\(violations) violation\(violations == 1 ? "" : "s")")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Capsule().fill(.red))
-                } else {
-                    Text("\(sessionEvents.count) events")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
+                let violationCount = sessionEvents.filter(\.isViolation).count
+                Button {
+                    withAnimation(.spring(duration: 0.3)) {
+                        showViolationsOnly.toggle()
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 9, weight: .semibold))
+                        if violationCount > 0 {
+                            Text("\(violationCount)")
+                                .font(.system(size: 10, weight: .bold).monospacedDigit())
+                        } else {
+                            Text("Violations")
+                                .font(.system(size: 10, weight: .medium))
+                        }
+                    }
+                    .foregroundStyle(showViolationsOnly ? .white : (violationCount > 0 ? .red : .secondary))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background {
+                        Capsule()
+                            .fill(showViolationsOnly ? Color.red : Color.red.opacity(violationCount > 0 ? 0.12 : 0.0))
+                            .overlay {
+                                Capsule()
+                                    .strokeBorder(Color.red.opacity(showViolationsOnly ? 0 : (violationCount > 0 ? 0.35 : 0.2)), lineWidth: 0.5)
+                            }
+                    }
                 }
+                .buttonStyle(.borderless)
+                .animation(.spring(duration: 0.25), value: showViolationsOnly)
+                .animation(.spring(duration: 0.25), value: violationCount)
             }
         }
         .padding(.horizontal, 14)
@@ -125,24 +150,25 @@ struct SessionsView: View {
     private var sessionDetail: some View {
         if isLoading {
             centerState { ProgressView().scaleEffect(0.7) }
-        } else if sessionEvents.isEmpty {
+        } else if displayedEvents.isEmpty {
             centerState {
                 VStack(spacing: 8) {
-                    Image(systemName: "tray")
+                    Image(systemName: showViolationsOnly ? "exclamationmark.triangle" : "tray")
                         .font(.system(size: 24)).foregroundStyle(.tertiary)
-                    Text("No events in this session.")
+                    Text(showViolationsOnly ? "No violations in this session." : "No events in this session.")
                         .font(.callout).foregroundStyle(.tertiary)
                 }
             }
         } else {
             ScrollView(.vertical, showsIndicators: false) {
                 LazyVStack(spacing: 3) {
-                    ForEach(sessionEvents) { event in
+                    ForEach(displayedEvents) { event in
                         EventRowView(event: event)
                     }
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
+                .animation(.spring(duration: 0.4, bounce: 0.25), value: displayedEvents.map(\.id))
             }
         }
     }

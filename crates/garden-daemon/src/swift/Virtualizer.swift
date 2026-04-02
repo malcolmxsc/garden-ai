@@ -48,7 +48,7 @@ public class GardenVirtualizer: NSObject {
         
         // Command line arguments passed directly into the Linux kernel on boot.
         // "console=hvc0" forces Linux to print its boot logs to the virtual serial port!
-        bootloader.commandLine = "console=hvc0 console=ttyAMA0,115200 earlycon"
+        bootloader.commandLine = "console=hvc0 console=ttyAMA0,115200 earlycon lsm=bpf"
         self.bootloader = bootloader
         
         // 2. Set up the Hardware Configuration
@@ -123,21 +123,53 @@ public class GardenVirtualizer: NSObject {
         guard let config = self.config else {
             throw NSError(domain: "GardenVirtualizer", code: 2, userInfo: [NSLocalizedDescriptionKey: "Machine not configured."])
         }
-        
-        // 1. Create the Physical Virtual Machine object using our validated config
-        let machine = VZVirtualMachine(configuration: config)
-        machine.delegate = self
-        self.machine = machine
-        
-        // 2. Ask Apple to boot the hypervisor asynchronously.
-        machine.start { result in
-            switch result {
-            case .success:
-                print("✅ [Swift] VZVirtualMachine hardware launched successfully!")
-                fflush(stdout)
-            case .failure(let error):
-                print("❌ [Swift] VZVirtualMachine failed to boot: \(error)")
-                fflush(stdout)
+
+        if Thread.isMainThread {
+            // Initial boot path: called before run_loop(); completion fires when run loop starts.
+            let machine = VZVirtualMachine(configuration: config)
+            machine.delegate = self
+            self.machine = machine
+            machine.start { result in
+                switch result {
+                case .success:
+                    print("✅ [Swift] VZVirtualMachine hardware launched successfully!")
+                    fflush(stdout)
+                case .failure(let error):
+                    print("❌ [Swift] VZVirtualMachine failed to boot: \(error)")
+                    fflush(stdout)
+                }
+            }
+        } else {
+            // Re-boot path: called from gRPC handler thread while run_loop() is active.
+            // VZVirtualMachine must be created and started on the main thread.
+            let semaphore = DispatchSemaphore(value: 0)
+            var startError: Error? = nil
+
+            DispatchQueue.main.async {
+                let machine = VZVirtualMachine(configuration: config)
+                machine.delegate = self
+                self.machine = machine
+                machine.start { result in
+                    switch result {
+                    case .success:
+                        print("✅ [Swift] VZVirtualMachine hardware launched successfully!")
+                        fflush(stdout)
+                    case .failure(let error):
+                        print("❌ [Swift] VZVirtualMachine failed to boot: \(error)")
+                        fflush(stdout)
+                        startError = error
+                    }
+                    semaphore.signal()
+                }
+            }
+
+            let timeout = DispatchTime.now() + .seconds(30)
+            if semaphore.wait(timeout: timeout) == .timedOut {
+                throw NSError(domain: "GardenVirtualizer", code: 4,
+                    userInfo: [NSLocalizedDescriptionKey: "VM start timed out after 30s."])
+            }
+            if let error = startError {
+                throw error
             }
         }
     }

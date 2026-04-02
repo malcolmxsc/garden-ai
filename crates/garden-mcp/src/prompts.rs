@@ -29,7 +29,8 @@ pub fn build_list_prompts_result() -> ListPromptsResult {
                  and flags anything suspicious.",
             ),
             None,
-        ),
+        )
+        .with_title("Analyze Security Events"),
         Prompt::new(
             "sandbox-report",
             Some(
@@ -37,27 +38,23 @@ pub fn build_list_prompts_result() -> ListPromptsResult {
                  summary of recent security telemetry.",
             ),
             None,
-        ),
+        )
+        .with_title("Sandbox Report"),
         Prompt::new(
             "investigate-process",
             Some(
                 "Retrieve all security events associated with a specific guest PID. \
                  Useful for tracing the activity of a suspicious process.",
             ),
-            Some(vec![PromptArgument {
-                name: "pid".to_string(),
-                title: Some("Process ID".to_string()),
-                description: Some("The guest PID to investigate (e.g. 42)".to_string()),
-                required: Some(true),
-            }]),
-        ),
+            Some(vec![PromptArgument::new("pid")
+                .with_title("Process ID")
+                .with_description("The guest PID to investigate (e.g. 42)")
+                .with_required(true)]),
+        )
+        .with_title("Investigate Process"),
     ];
 
-    ListPromptsResult {
-        meta: None,
-        next_cursor: None,
-        prompts,
-    }
+    ListPromptsResult::with_all_items(prompts)
 }
 
 // ---------------------------------------------------------------------------
@@ -138,10 +135,8 @@ fn prompt_analyze_security() -> GetPromptResult {
          4. Recommend any policy changes if warranted."
     );
 
-    GetPromptResult {
-        description: Some("Security event analysis".to_string()),
-        messages: vec![PromptMessage::new_text(PromptMessageRole::User, text)],
-    }
+    GetPromptResult::new(vec![PromptMessage::new_text(PromptMessageRole::User, text)])
+        .with_description("Security event analysis")
 }
 
 async fn prompt_sandbox_report() -> GetPromptResult {
@@ -164,10 +159,8 @@ async fn prompt_sandbox_report() -> GetPromptResult {
          - Overall health: HEALTHY / DEGRADED / CRITICAL"
     );
 
-    GetPromptResult {
-        description: Some("Sandbox status and security report".to_string()),
-        messages: vec![PromptMessage::new_text(PromptMessageRole::User, text)],
-    }
+    GetPromptResult::new(vec![PromptMessage::new_text(PromptMessageRole::User, text)])
+        .with_description("Sandbox status and security report")
 }
 
 fn prompt_investigate_process(pid: &str) -> GetPromptResult {
@@ -219,18 +212,14 @@ fn prompt_investigate_process(pid: &str) -> GetPromptResult {
          3. Determine whether this process poses a security risk."
     );
 
-    GetPromptResult {
-        description: Some(format!("Process investigation for PID {pid}")),
-        messages: vec![PromptMessage::new_text(PromptMessageRole::User, text)],
-    }
+    GetPromptResult::new(vec![PromptMessage::new_text(PromptMessageRole::User, text)])
+        .with_description(format!("Process investigation for PID {pid}"))
 }
 
 fn error_result(msg: &str) -> GetPromptResult {
-    GetPromptResult {
-        description: Some("Error".to_string()),
-        messages: vec![PromptMessage::new_text(
-            PromptMessageRole::User,
-            format!("Error: {msg}"),
-        )],
-    }
+    GetPromptResult::new(vec![PromptMessage::new_text(
+        PromptMessageRole::User,
+        format!("Error: {msg}"),
+    )])
+    .with_description("Error")
 }
