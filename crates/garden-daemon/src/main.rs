@@ -271,6 +271,19 @@ fn main() {
         });
     });
 
+    // 8. Start HTTP REST API on port 9001 for Swift UI thin client
+    // =================================================================
+    // Exposes: GET /api/status, POST /api/boot, POST /api/stop
+    println!("🌐 Starting HTTP API on 127.0.0.1:9001...");
+    let http_state = vm_state.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to build tokio runtime for HTTP API");
+        rt.block_on(run_http_api(engine, http_state));
+    });
+
     println!("🔄 Daemon handing control to macOS CFRunLoop. Press Ctrl+C to stop.");
     Virtualizer::run_loop();
 }
@@ -522,6 +535,110 @@ async fn run_telemetry_tcp_proxy(broadcast_tx: tokio::sync::broadcast::Sender<St
             println!("📊 Telemetry consumer disconnected from {}", addr);
         });
     }
+}
+
+// =====================================================================
+// HTTP REST API (port 9001) — for the Swift UI thin client
+// =====================================================================
+// Three endpoints:
+//   GET  /api/status  → {"running":bool,"uptime_seconds":u64,"kernel_path":str}
+//   POST /api/boot    → {"success":bool,"message":str}
+//   POST /api/stop    → {"success":bool,"message":str}
+//
+// The engine pointer is `&'static Virtualizer` (Box::leaked in main) so it
+// is safe to move into the axum handler closures.
+
+#[derive(serde::Serialize)]
+struct ApiStatusResponse {
+    running: bool,
+    uptime_seconds: u64,
+    kernel_path: String,
+}
+
+#[derive(serde::Serialize)]
+struct ApiActionResponse {
+    success: bool,
+    message: String,
+}
+
+async fn run_http_api(engine: &'static Virtualizer, state: Arc<VmState>) {
+    use axum::{routing, Router};
+
+    let st = state.clone();
+    let status_handler = move || {
+        let running = st.running.load(Ordering::SeqCst);
+        let uptime = st.boot_time.lock().unwrap()
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        let kernel_path = st.kernel_path.lock().unwrap().clone();
+        async move {
+            axum::Json(ApiStatusResponse { running, uptime_seconds: uptime, kernel_path })
+        }
+    };
+
+    let st_boot = state.clone();
+    let boot_handler = move || {
+        let st = st_boot.clone();
+        async move {
+            if st.running.load(Ordering::SeqCst) {
+                return axum::Json(ApiActionResponse {
+                    success: false,
+                    message: "VM is already running".into(),
+                });
+            }
+            let kernel = "/Users/malcolmgriffin/.gemini/antigravity/scratch/garden-ai/guest/kernel/kernel".to_string();
+            let initrd  = "/Users/malcolmgriffin/.gemini/antigravity/scratch/garden-ai/guest/kernel/garden-initrd.cpio.gz".to_string();
+            if let Err(e) = engine.configure(&kernel, &initrd, 2, 512) {
+                return axum::Json(ApiActionResponse { success: false, message: format!("Configure failed: {}", e) });
+            }
+            if let Err(e) = engine.start() {
+                return axum::Json(ApiActionResponse { success: false, message: format!("Start failed: {}", e) });
+            }
+            st.running.store(true, Ordering::SeqCst);
+            *st.boot_time.lock().unwrap() = Some(Instant::now());
+            *st.kernel_path.lock().unwrap() = kernel;
+            // Start proxies
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                run_tcp_vsock_proxy(engine, 6000);
+            });
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                run_telemetry_receiver(engine);
+            });
+            axum::Json(ApiActionResponse { success: true, message: "VM booted".into() })
+        }
+    };
+
+    let st_stop = state.clone();
+    let stop_handler = move || {
+        let st = st_stop.clone();
+        async move {
+            if !st.running.load(Ordering::SeqCst) {
+                return axum::Json(ApiActionResponse { success: false, message: "No VM running".into() });
+            }
+            match engine.stop() {
+                Ok(_) => {
+                    st.running.store(false, Ordering::SeqCst);
+                    *st.boot_time.lock().unwrap() = None;
+                    axum::Json(ApiActionResponse { success: true, message: "VM stopped".into() })
+                }
+                Err(e) => axum::Json(ApiActionResponse { success: false, message: format!("Stop failed: {}", e) }),
+            }
+        }
+    };
+
+    let app = Router::new()
+        .route("/api/status", routing::get(status_handler))
+        .route("/api/boot",   routing::post(boot_handler))
+        .route("/api/stop",   routing::post(stop_handler));
+
+    let listener = match tokio::net::TcpListener::bind("127.0.0.1:9001").await {
+        Ok(l) => l,
+        Err(e) => { eprintln!("❌ HTTP API bind failed: {}", e); return; }
+    };
+    println!("✅ HTTP API listening on 127.0.0.1:9001");
+    axum::serve(listener, app).await.unwrap_or_else(|e| eprintln!("❌ HTTP API error: {}", e));
 }
 
 // =====================================================================
