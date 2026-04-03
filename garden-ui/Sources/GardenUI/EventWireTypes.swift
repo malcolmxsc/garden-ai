@@ -7,6 +7,7 @@ import Foundation
 
 struct WireEvent: Decodable {
     let timestamp_ns: UInt64
+    let wall_time: Double?
     let pid: UInt32
     let comm: String
     let kind: WireKind
@@ -116,7 +117,7 @@ extension WireEvent {
 
         return SecurityEvent(
             id: UUID(),
-            timestamp: Date(timeIntervalSince1970: Double(timestamp_ns) / 1_000_000_000),
+            timestamp: wall_time.map { Date(timeIntervalSince1970: $0) } ?? Date(),
             pid: Int(pid),
             comm: comm,
             kind: eventKind,

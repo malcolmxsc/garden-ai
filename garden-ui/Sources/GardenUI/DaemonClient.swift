@@ -47,20 +47,26 @@ struct LogEntry: Decodable, Identifiable {
     }
 
     func toSecurityEvent() -> SecurityEvent? {
-        var se = event.toSecurityEvent()
+        guard var base = event.toSecurityEvent() else { return nil }
+
+        // Parse the daemon's wall-clock ts (ISO 8601 UTC) for correct display time.
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let wallTime = formatter.date(from: ts) ?? base.timestamp
+
         // Override isViolation from the authoritative host-side violation field
-        if let v = violation, var base = se {
-            se = SecurityEvent(
-                id: base.id,
-                timestamp: base.timestamp,
-                pid: base.pid,
-                comm: base.comm,
-                kind: base.kind,
-                isViolation: true,
-                violationMessage: v.message
-            )
-        }
-        return se
+        let isViolation = violation != nil
+        let violationMsg = violation.map { $0.message }
+
+        return SecurityEvent(
+            id: base.id,
+            timestamp: wallTime,
+            pid: base.pid,
+            comm: base.comm,
+            kind: base.kind,
+            isViolation: isViolation,
+            violationMessage: violationMsg
+        )
     }
 }
 

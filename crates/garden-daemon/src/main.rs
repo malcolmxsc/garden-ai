@@ -492,8 +492,15 @@ async fn process_telemetry_stream(
                         }
                     }
                 }
+                // Wall-clock seconds since Unix epoch for UI display.
+                // timestamp_ns is CLOCK_MONOTONIC (since VM boot), not wall time.
+                let wall_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
                 let enriched = serde_json::json!({
                     "timestamp_ns": event.timestamp_ns,
+                    "wall_time": wall_secs,
                     "pid": event.pid,
                     "comm": event.comm,
                     "kind": kind_json,
