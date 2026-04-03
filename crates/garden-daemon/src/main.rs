@@ -465,6 +465,7 @@ async fn process_telemetry_stream(
     let reader = BufReader::new(stream);
     let mut lines = reader.lines();
 
+
     while let Ok(Some(line)) = lines.next_line().await {
         match serde_json::from_str::<garden_ebpf::events::SecurityEvent>(&line) {
             Ok(event) => {
@@ -501,8 +502,18 @@ async fn process_telemetry_stream(
                 let _ = broadcast_tx.send(format!("{}\n", enriched));
 
                 // Enforce hardcoded violations: SIGKILL the offending process.
+                // Rules with in-kernel enforcement (LSM -EPERM + bpf_send_signal)
+                // don't need a redundant reactive kill — the process is already dead
+                // by the time this event reaches the daemon.
                 if let Some(ref v) = violation {
-                    let should_kill = matches!(v.severity, "critical" | "high");
+                    let kernel_enforced = matches!(
+                        v.rule,
+                        "proc_memory_access"
+                        | "namespace_escape_attempt"
+                        | "write_outside_workspace"
+                        | "privileged_binary_exec"
+                    );
+                    let should_kill = matches!(v.severity, "critical" | "high") && !kernel_enforced;
                     if should_kill && event.pid != 1 {
                         eprintln!(
                             "🚨 ENFORCING [{}] rule={} pid={} comm={} — sending SIGKILL",
