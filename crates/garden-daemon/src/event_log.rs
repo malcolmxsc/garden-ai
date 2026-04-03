@@ -353,13 +353,24 @@ impl EventLogger {
             .expect("system time before epoch");
         let ts = format_iso8601(now.as_secs(), now.subsec_millis());
 
+        // If there's a violation, override "allowed" to false in the event —
+        // the tracepoint fires before the LSM and doesn't know the LSM will
+        // block. This makes the log accurately reflect enforcement.
+        let corrected_event;
+        let event_ref = if violation.is_some() {
+            corrected_event = event.with_allowed_false();
+            &corrected_event
+        } else {
+            event
+        };
+
         let line = LogLine {
             ts,
             session_id: &self.session_id,
             seq,
-            pid: event.pid,
-            comm: &event.comm,
-            event,
+            pid: event_ref.pid,
+            comm: &event_ref.comm,
+            event: event_ref,
             violation: violation.clone(),
         };
 

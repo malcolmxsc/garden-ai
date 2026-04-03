@@ -15,6 +15,20 @@ pub struct SecurityEvent {
     pub kind: SecurityEventKind,
 }
 
+impl SecurityEvent {
+    /// Return a copy with `allowed` set to false on applicable event kinds.
+    pub fn with_allowed_false(&self) -> SecurityEvent {
+        let mut e = self.clone();
+        match &mut e.kind {
+            SecurityEventKind::FileAccess { allowed, .. }
+            | SecurityEventKind::NetworkConnect { allowed, .. }
+            | SecurityEventKind::ProcessExec { allowed, .. } => *allowed = false,
+            _ => {}
+        }
+        e
+    }
+}
+
 /// Categories of security events.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

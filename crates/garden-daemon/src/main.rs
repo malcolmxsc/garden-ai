@@ -479,11 +479,23 @@ async fn process_telemetry_stream(
 
                 // Broadcast enriched event (with violation info) to TCP proxy
                 // clients so the SwiftUI app can filter violations.
+                // Override "allowed" to false when there's a violation — the
+                // tracepoint fires before the LSM hook and doesn't know the
+                // LSM will return -EPERM, so it reports allowed=true.
+                let mut kind_json = serde_json::to_value(&event.kind)
+                    .unwrap_or(serde_json::Value::Null);
+                if violation.is_some() {
+                    if let Some(obj) = kind_json.as_object_mut() {
+                        if obj.contains_key("allowed") {
+                            obj.insert("allowed".into(), serde_json::Value::Bool(false));
+                        }
+                    }
+                }
                 let enriched = serde_json::json!({
                     "timestamp_ns": event.timestamp_ns,
                     "pid": event.pid,
                     "comm": event.comm,
-                    "kind": event.kind,
+                    "kind": kind_json,
                     "violation": violation,
                 });
                 let _ = broadcast_tx.send(format!("{}\n", enriched));
