@@ -109,6 +109,23 @@ fn detect_violation(event: &SecurityEvent) -> Option<Violation> {
             })
         }
 
+        // Raw physical memory access devices. These don't exist in the VM
+        // (initramfs only creates safe device nodes), but DAC is not a security
+        // boundary — flag the attempt so telemetry is explicit.
+        SecurityEventKind::FileAccess { path, .. }
+            if event.pid != 1
+                && matches!(path.as_str(), "/dev/mem" | "/dev/kmem" | "/dev/port") =>
+        {
+            Some(Violation {
+                severity: "critical",
+                rule: "raw_memory_device",
+                message: format!(
+                    "process '{}' (pid {}) attempted to open raw memory device '{}'",
+                    event.comm, event.pid, path
+                ),
+            })
+        }
+
         // Gap 2: write-intent open outside /workspace.
         // The kernel may still deny the write, but the attempt is high signal.
         SecurityEventKind::FileAccess { path, flags, .. }
