@@ -1013,10 +1013,20 @@ fn is_proc_danger_name(n: &[u8; 16]) -> bool {
     false
 }
 
-/// True if name buffer starts with an ASCII digit (PID directory).
+/// True if name buffer is a numeric string (PID directory).
+/// Checks all characters are digits up to the null terminator.
+/// PIDs are at most 7 digits (max 4194304 on 64-bit Linux).
 #[inline(always)]
 fn name_is_pid(n: &[u8; 16]) -> bool {
-    n[0] >= b'0' && n[0] <= b'9'
+    if n[0] < b'0' || n[0] > b'9' { return false; }
+    let mut i = 1u8;
+    while i < 8 {
+        let c = n[i as usize];
+        if c == 0 { return true; }
+        if c < b'0' || c > b'9' { return false; }
+        i += 1;
+    }
+    true
 }
 
 /// True if name buffer is "proc".
