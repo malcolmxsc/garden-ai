@@ -60,7 +60,8 @@ fn is_proc_memory_path(path: &str) -> bool {
     if !is_pid_or_self {
         return false;
     }
-    matches!(after_pid, "mem" | "maps" | "pagemap" | "smaps")
+    matches!(after_pid, "mem" | "maps" | "pagemap" | "smaps"
+        | "status" | "cmdline" | "wchan" | "stack" | "syscall")
         || after_pid.starts_with("fd/")
         || after_pid.starts_with("ns/")
 }
@@ -109,18 +110,19 @@ fn detect_violation(event: &SecurityEvent) -> Option<Violation> {
             })
         }
 
-        // Raw physical memory access devices. These don't exist in the VM
-        // (initramfs only creates safe device nodes), but DAC is not a security
-        // boundary — flag the attempt so telemetry is explicit.
+        // Sensitive kernel interfaces: raw memory devices, kernel log,
+        // symbol table. Most don't exist or are DAC-denied in the VM,
+        // but flag the attempt for defense-in-depth visibility.
         SecurityEventKind::FileAccess { path, .. }
             if event.pid != 1
-                && matches!(path.as_str(), "/dev/mem" | "/dev/kmem" | "/dev/port") =>
+                && matches!(path.as_str(), "/dev/mem" | "/dev/kmem" | "/dev/port"
+                    | "/dev/kmsg" | "/proc/kallsyms" | "/proc/kcore") =>
         {
             Some(Violation {
                 severity: "critical",
-                rule: "raw_memory_device",
+                rule: "sensitive_kernel_access",
                 message: format!(
-                    "process '{}' (pid {}) attempted to open raw memory device '{}'",
+                    "process '{}' (pid {}) attempted to open sensitive kernel interface '{}'",
                     event.comm, event.pid, path
                 ),
             })

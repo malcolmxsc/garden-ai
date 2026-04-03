@@ -512,7 +512,7 @@ async fn process_telemetry_stream(
                         | "namespace_escape_attempt"
                         | "write_outside_workspace"
                         | "privileged_binary_exec"
-                        | "raw_memory_device"
+                        | "sensitive_kernel_access"
                     );
                     let should_kill = matches!(v.severity, "critical" | "high") && !kernel_enforced;
                     if should_kill && event.pid != 1 {

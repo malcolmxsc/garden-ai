@@ -273,6 +273,15 @@ async fn async_main() -> anyhow::Result<()> {
     let _ = std::process::Command::new("/bin/busybox").args(["mount", "-t", "devtmpfs", "dev", "/dev"]).status();
     tracing::info!("Mounted /proc, /sys, /dev");
 
+    // Harden kernel interfaces:
+    // - kptr_restrict=2: hide kernel symbol addresses from all users
+    // - dmesg_restrict=1: restrict dmesg to root (agent drops to uid 1000)
+    // - Remove /dev/kmsg: prevents reading kernel log ring buffer
+    let _ = std::fs::write("/proc/sys/kernel/kptr_restrict", "2");
+    let _ = std::fs::write("/proc/sys/kernel/dmesg_restrict", "1");
+    let _ = std::fs::remove_file("/dev/kmsg");
+    tracing::info!("Applied kernel hardening sysctls");
+
     // 0.2. Mount the VirtioFS Workspace
     // =========================================================
     // The macOS host shares ~/GardenBox via VirtioFS with the tag "garden_workspace".

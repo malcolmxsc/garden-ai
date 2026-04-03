@@ -981,8 +981,8 @@ fn read_dentry_parent(dentry_addr: u64) -> u64 {
     }
 }
 
-/// True if the 16-byte name buffer matches a dangerous /proc/<pid>/ file:
-/// mem, maps, pagemap, smaps.
+/// True if the 16-byte name buffer matches a dangerous /proc/<pid>/ file.
+/// Covers memory inspection, recon (status/cmdline), and kernel interfaces.
 #[inline(always)]
 fn is_proc_danger_name(n: &[u8; 16]) -> bool {
     // "mem"
@@ -995,6 +995,21 @@ fn is_proc_danger_name(n: &[u8; 16]) -> bool {
     // "smaps"
     if n[0] == b's' && n[1] == b'm' && n[2] == b'a' && n[3] == b'p'
         && n[4] == b's' && n[5] == 0 { return true; }
+    // "status" — exposes capabilities, UIDs, memory layout
+    if n[0] == b's' && n[1] == b't' && n[2] == b'a' && n[3] == b't'
+        && n[4] == b'u' && n[5] == b's' && n[6] == 0 { return true; }
+    // "cmdline" — reveals process arguments
+    if n[0] == b'c' && n[1] == b'm' && n[2] == b'd' && n[3] == b'l'
+        && n[4] == b'i' && n[5] == b'n' && n[6] == b'e' && n[7] == 0 { return true; }
+    // "wchan"
+    if n[0] == b'w' && n[1] == b'c' && n[2] == b'h' && n[3] == b'a'
+        && n[4] == b'n' && n[5] == 0 { return true; }
+    // "stack"
+    if n[0] == b's' && n[1] == b't' && n[2] == b'a' && n[3] == b'c'
+        && n[4] == b'k' && n[5] == 0 { return true; }
+    // "syscall"
+    if n[0] == b's' && n[1] == b'y' && n[2] == b's' && n[3] == b'c'
+        && n[4] == b'a' && n[5] == b'l' && n[6] == b'l' && n[7] == 0 { return true; }
     false
 }
 
