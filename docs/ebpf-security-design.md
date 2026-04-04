@@ -2,7 +2,7 @@
 
 ## Overview
 
-Garden AI uses eBPF as the observability and enforcement backbone for a hardware-isolated micro-VM sandbox running on Apple Silicon. The system runs AI agent workloads inside an aarch64 Linux VM (managed by Apple's Virtualization.framework) and monitors them for security policy violations. This document explains the eBPF architecture, probe selection rationale, and the two-layer enforcement model.
+Garden AI uses eBPF as the observability and enforcement backbone for a hardware-isolated micro-VM sandbox running on Apple Silicon. The system runs AI agent workloads inside an aarch64 Linux VM (managed by Apple's Virtualization.framework) and monitors them for security policy violations. This document explains the eBPF architecture, probe selection rationale, and the three-layer enforcement model.
 
 ---
 
@@ -82,7 +82,7 @@ These probes require the kernel config additions (`CONFIG_KPROBES`, `CONFIG_DEBU
 | Probe | Type | Kernel hook | What it captures |
 |-------|------|------------|-----------------|
 | `trace_fork` | tracepoint | `sched/sched_process_fork` | Process fork: parent PID/comm and child PID/comm |
-| `trace_exit` | tracepoint | `sched/sched_process_exit` | Process exit with exit code |
+| `trace_exit` | tracepoint | `sched/sched_process_exit` | Process exit with decoded exit status and signal (read from `task_struct->exit_code` via BTF) |
 | `trace_oom_victim` | tracepoint | `oom/mark_victim` | OOM killer selection: victim PID and comm |
 | `trace_commit_creds` | kprobe | `commit_creds()` | Credential change: old UID → new UID (privilege escalation detection) |
 | `trace_tcp_sendmsg` | kprobe | `tcp_sendmsg()` | TCP bytes sent per call (data exfiltration volume) |
@@ -117,7 +117,9 @@ Guest kernel
   │  BPF-LSM hooks (synchronous, pre-syscall)
   │  → look up DENIED_PATHS / DENIED_NETS / ALLOWED_* maps
   │  → return -EPERM if denied (syscall never completes)
-  │  → emit event to EVENTS ring buffer for telemetry
+  │  → bpf_send_signal(9) to kill the violating process
+  │  → some hooks emit to EVENTS ring buffer; file_open does not
+  │      (the tracepoint already covers telemetry for that path)
   │
   │  eBPF tracepoints + kprobes (async, post-syscall)
   │  → fill RawSecurityEvent in PerCpuArray scratch
@@ -127,10 +129,7 @@ Garden agent (guest userspace, PID 1)
   │
   │  Per-CPU async tasks drain PerfEventArray
   │  → convert_raw_event() → SecurityEvent (typed)
-  │  → policy.evaluate() → PolicyAction
-  │  → if Deny AND stateful (TcpSend/TcpRecv):
-  │      libc::kill(pid, SIGKILL)   ← stateful-only kill-on-detect
-  │  → mpsc channel → NDJSON serializer
+  │  → serialize as NDJSON
   │
   │  vSock port 6001 → host daemon
   │
@@ -139,8 +138,10 @@ Garden daemon (host, macOS)
   │  Receives NDJSON stream
   │  → parse SecurityEvent
   │  → detect_violation() → Option<Violation>
+  │  → if violated: override allowed=false in event
+  │  → enrich with wall_time (Unix epoch seconds)
   │  → write to ~/.garden/sessions/{id}/events.ndjson
-  │  → broadcast to :10001 TCP (UI / external tools)
+  │  → broadcast to :10001 TCP (SwiftUI + MCP + external tools)
 ```
 
 ---
@@ -149,7 +150,7 @@ Garden daemon (host, macOS)
 
 ### Layer 1 — BPF-LSM (synchronous, single-operation policy violations)
 
-BPF-LSM programs run as Linux Security Module hooks. They execute *synchronously inside the kernel*, before the syscall completes, and can return `-EPERM` to deny the operation. The process never sees a successful result — the syscall fails immediately.
+BPF-LSM programs run as Linux Security Module hooks. They execute *synchronously inside the kernel*, before the syscall completes, and can return `-EPERM` to deny the operation. The process never sees a successful result — the syscall fails immediately. In addition to returning `-EPERM`, the hooks call `bpf_send_signal(9)` to deliver an asynchronous `SIGKILL` to the violating process, ensuring it cannot retry.
 
 Four LSM hooks are attached:
 

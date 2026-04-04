@@ -45,7 +45,7 @@ Garden AI is a sandbox runtime that combines **hardware VM isolation** with **ke
 | BPF-LSM | Synchronous `-EPERM` + `SIGKILL` before syscall completes | File access, network, exec, mount |
 | Kill-on-detect | `SIGKILL` from perf event loop | TCP byte thresholds (exfiltration) |
 | Seccomp | BPF filter on child processes | `ptrace`, `mount`, `kexec`, `reboot`, etc. |
-| Host policy engine | Violation detection on daemon side | Proc recon, kernel access, privilege escalation |
+| Host policy engine | Violation detection on daemon side | Proc recon, kernel device access, privilege escalation |
 | Filesystem | VirtioFS with path traversal prevention | Only `~/GardenBox` exposed |
 
 ## Getting Started
