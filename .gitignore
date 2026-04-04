@@ -34,8 +34,14 @@ guest/kernel/bzImage
 guest/rootfs/*.img
 guest/rootfs/*.tar.gz
 
-# === Local notes (not for repo) ===
+# === Local notes / historical artifacts (not for repo) ===
 docs/ebpf-bugs-resolved.md
+docs/architecture.html
+architecture_diagram*.md
+architecture_comparison.*
+garden-ai-*-prompt.md
+roadmap.md
+MCP_SETUP.md
 
 # === Generated FFI headers ===
 crates/garden-ffi/garden_ffi.h
