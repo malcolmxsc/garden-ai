@@ -47,7 +47,7 @@ struct LogEntry: Decodable, Identifiable {
     }
 
     func toSecurityEvent() -> SecurityEvent? {
-        guard var base = event.toSecurityEvent() else { return nil }
+        guard let base = event.toSecurityEvent() else { return nil }
 
         // Parse the daemon's wall-clock ts (ISO 8601 UTC) for correct display time.
         let formatter = ISO8601DateFormatter()

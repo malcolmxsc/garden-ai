@@ -42,17 +42,17 @@ struct ContentView: View {
                 .background(.regularMaterial)
         }
         .opacity(contentOpacity)
-        .onChange(of: appState.wakeFlash) { fired in
-            guard fired else { return }
+        .onChange(of: appState.wakeFlash) {
+            guard appState.wakeFlash else { return }
             appState.wakeFlash = false
             contentOpacity = 0.82
             withAnimation(.easeIn(duration: 0.45)) {
                 contentOpacity = 1.0
             }
         }
-        .onChange(of: appState.vmState) { state in
+        .onChange(of: appState.vmState) {
             withAnimation(.easeInOut(duration: 0.4)) {
-                contentOpacity = state == .stopped ? 0.85 : 1.0
+                contentOpacity = appState.vmState == .stopped ? 0.85 : 1.0
             }
         }
     }
