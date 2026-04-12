@@ -45,25 +45,62 @@ pub struct Violation {
     pub message: String,
 }
 
-/// Returns true if the path targets cross-process memory inspection primitives.
-/// Covers /proc/<pid>/mem, /maps, /pagemap, /smaps, and /fd/ subdirectory.
-fn is_proc_memory_path(path: &str) -> bool {
-    let rest = match path.strip_prefix("/proc/") {
-        Some(r) => r,
-        None => return false,
-    };
+/// Lexically normalize a path by collapsing `.` and `..` segments without
+/// touching the filesystem. Prevents traversal bypass of prefix-based checks
+/// (e.g. `/workspace/../../etc/shadow` → `/etc/shadow`).
+pub(crate) fn normalize_path(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut stack: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => continue,
+            ".." => {
+                if absolute {
+                    stack.pop();
+                } else if stack.last().map(|s| *s != "..").unwrap_or(false) {
+                    stack.pop();
+                } else {
+                    stack.push("..");
+                }
+            }
+            _ => stack.push(part),
+        }
+    }
+    let joined = stack.join("/");
+    if absolute {
+        if joined.is_empty() { "/".to_string() } else { format!("/{}", joined) }
+    } else if joined.is_empty() {
+        ".".to_string()
+    } else {
+        joined
+    }
+}
+
+/// Whether an access to `/proc/<target>/...` is self-introspection or
+/// cross-process. Returned only if the path matches a known-sensitive leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcTarget { Self_, Other }
+
+/// Classify a proc path against the sensitive-leaf list, after normalization.
+/// Returns `None` if the path is not under `/proc/<pid_or_self>/<sensitive>`.
+fn classify_proc_memory_path(path: &str) -> Option<ProcTarget> {
+    let norm = normalize_path(path);
+    let rest = norm.strip_prefix("/proc/")?;
     let (pid_part, after_pid) = match rest.find('/') {
         Some(pos) => (&rest[..pos], &rest[pos + 1..]),
-        None => return false,
+        None => return None,
     };
-    let is_pid_or_self =
-        pid_part == "self" || pid_part.chars().all(|c| c.is_ascii_digit());
-    if !is_pid_or_self {
-        return false;
-    }
-    matches!(after_pid, "mem" | "maps" | "pagemap" | "smaps"
-        | "status" | "cmdline" | "wchan" | "stack" | "syscall")
-        || after_pid.starts_with("ns/")
+    let target = if pid_part == "self" {
+        ProcTarget::Self_
+    } else if !pid_part.is_empty() && pid_part.chars().all(|c| c.is_ascii_digit()) {
+        ProcTarget::Other
+    } else {
+        return None;
+    };
+    let is_sensitive = matches!(after_pid, "mem" | "maps" | "pagemap" | "smaps"
+        | "status" | "cmdline" | "wchan" | "stack" | "syscall" | "environ")
+        || after_pid.starts_with("ns/");
+    if is_sensitive { Some(target) } else { None }
 }
 
 /// Returns true if the open flags indicate write intent (O_WRONLY or O_RDWR).
@@ -73,23 +110,21 @@ fn is_write_intent(flags: u32) -> bool {
 }
 
 /// Standard device nodes that are safe to write to from any process.
-fn is_allowed_device_write(path: &str) -> bool {
-    // Standard device nodes safe for any process to write to
+/// Takes the already-normalized path so `..` traversal cannot smuggle
+/// `/workspace/../../etc/shadow` past this check.
+fn is_allowed_device_write(norm: &str) -> bool {
     if matches!(
-        path,
+        norm,
         "/dev/null" | "/dev/zero" | "/dev/urandom" | "/dev/random"
             | "/dev/tty" | "/dev/stdin" | "/dev/stdout" | "/dev/stderr"
             | "/dev/fd/1" | "/dev/fd/2"
     ) {
         return true;
     }
-    // Allow /proc/self/fd/* writes — DHCP scripts and other system tools
-    // legitimately write to these (they're just dup'd file descriptors).
-    if path.starts_with("/proc/self/fd/") {
+    if norm.starts_with("/proc/self/fd/") {
         return true;
     }
-    // Allow /tmp and /run writes — ephemeral runtime state
-    if path.starts_with("/tmp/") || path.starts_with("/run/") {
+    if norm.starts_with("/tmp/") || norm.starts_with("/run/") {
         return true;
     }
     false
@@ -108,14 +143,58 @@ fn is_privileged_binary(binary: &str) -> bool {
 
 fn detect_violation(event: &SecurityEvent) -> Option<Violation> {
     match &event.kind {
-        // Gap 1: cross-process memory access via /proc/<pid>/mem et al.
-        // Flag even when the kernel denies it — defense in depth.
+        // Namespace escape: /proc/<pid>/ns/ path opened. Checked before the
+        // proc_memory arms because the ns/ path also matches sensitive_leaf.
         SecurityEventKind::FileAccess { path, .. }
-            if event.pid != 1 && is_proc_memory_path(path) =>
+            if event.pid != 1 && {
+                let norm = normalize_path(path);
+                if let Some(rest) = norm.strip_prefix("/proc/") {
+                    if let Some(slash) = rest.find('/') {
+                        let pid_part = &rest[..slash];
+                        let after = &rest[slash + 1..];
+                        (pid_part == "self"
+                            || (!pid_part.is_empty()
+                                && pid_part.chars().all(|c| c.is_ascii_digit())))
+                            && after.starts_with("ns/")
+                    } else { false }
+                } else { false }
+            } =>
         {
             Some(Violation {
                 severity: "high",
-                rule: "proc_memory_access",
+                rule: "namespace_escape_attempt",
+                message: format!(
+                    "process '{}' (pid {}) accessed namespace entry '{}'",
+                    event.comm, event.pid, path
+                ),
+            })
+        }
+
+        // Self-introspection: /proc/self/{mem,maps,status,environ,...}.
+        // Still a sandbox leak (ASLR, capset, env vars, ...) — different
+        // rule name so it's not conflated with cross-process memory reads.
+        SecurityEventKind::FileAccess { path, .. }
+            if event.pid != 1
+                && classify_proc_memory_path(path) == Some(ProcTarget::Self_) =>
+        {
+            Some(Violation {
+                severity: "high",
+                rule: "self_process_introspection",
+                message: format!(
+                    "process '{}' (pid {}) inspected own process state via '{}'",
+                    event.comm, event.pid, path
+                ),
+            })
+        }
+
+        // Cross-process memory access via /proc/<other-pid>/mem et al.
+        SecurityEventKind::FileAccess { path, .. }
+            if event.pid != 1
+                && classify_proc_memory_path(path) == Some(ProcTarget::Other) =>
+        {
+            Some(Violation {
+                severity: "high",
+                rule: "cross_process_memory",
                 message: format!(
                     "process '{}' (pid {}) accessed cross-process memory path '{}'",
                     event.comm, event.pid, path
@@ -124,12 +203,16 @@ fn detect_violation(event: &SecurityEvent) -> Option<Violation> {
         }
 
         // Sensitive kernel interfaces: raw memory devices, kernel log,
-        // symbol table. Most don't exist or are DAC-denied in the VM,
-        // but flag the attempt for defense-in-depth visibility.
+        // symbol table, sysrq trigger. Kernel blocks the common ones via
+        // lsm_file_open; this arm catches any that slipped past (e.g.
+        // new targets not yet in the in-kernel block list) and classifies
+        // sysrq-trigger correctly rather than as a generic write.
         SecurityEventKind::FileAccess { path, .. }
             if event.pid != 1
-                && matches!(path.as_str(), "/dev/mem" | "/dev/kmem" | "/dev/port"
-                    | "/dev/kmsg" | "/proc/kallsyms" | "/proc/kcore") =>
+                && matches!(normalize_path(path).as_str(),
+                    "/dev/mem" | "/dev/kmem" | "/dev/port"
+                    | "/dev/kmsg" | "/proc/kallsyms" | "/proc/kcore"
+                    | "/proc/sysrq-trigger") =>
         {
             Some(Violation {
                 severity: "critical",
@@ -142,41 +225,20 @@ fn detect_violation(event: &SecurityEvent) -> Option<Violation> {
         }
 
         // Gap 2: write-intent open outside /workspace.
-        // The kernel may still deny the write, but the attempt is high signal.
+        // Normalize before prefix-check so `/workspace/../etc/shadow` is
+        // not accidentally allowlisted by the literal `/workspace` prefix.
         SecurityEventKind::FileAccess { path, flags, .. }
-            if event.pid != 1
-                && is_write_intent(*flags)
-                && !path.starts_with("/workspace")
-                && !is_allowed_device_write(path) =>
+            if event.pid != 1 && is_write_intent(*flags) && {
+                let norm = normalize_path(path);
+                !(norm == "/workspace" || norm.starts_with("/workspace/"))
+                    && !is_allowed_device_write(&norm)
+            } =>
         {
             Some(Violation {
                 severity: "medium",
                 rule: "write_outside_workspace",
                 message: format!(
                     "process '{}' (pid {}) attempted to write to '{}' (outside /workspace)",
-                    event.comm, event.pid, path
-                ),
-            })
-        }
-
-        // Namespace escape: /proc/<pid>/ns/ path opened.
-        // Separate from proc_memory_access so it can carry its own rule name.
-        SecurityEventKind::FileAccess { path, .. }
-            if event.pid != 1
-                && path.contains("/ns/")
-                && {
-                    let rest = path.strip_prefix("/proc/").unwrap_or("");
-                    rest.find('/').map(|p| {
-                        let pid_part = &rest[..p];
-                        pid_part == "self" || pid_part.chars().all(|c| c.is_ascii_digit())
-                    }).unwrap_or(false)
-                } =>
-        {
-            Some(Violation {
-                severity: "high",
-                rule: "namespace_escape_attempt",
-                message: format!(
-                    "process '{}' (pid {}) accessed namespace entry '{}'",
                     event.comm, event.pid, path
                 ),
             })
@@ -244,7 +306,7 @@ fn detect_violation(event: &SecurityEvent) -> Option<Violation> {
                 event.comm, event.pid, request, target_pid
             ),
         }),
-        SecurityEventKind::BpfSyscall { cmd } if *cmd == 5 => Some(Violation {
+        SecurityEventKind::BpfSyscall { cmd } if *cmd == 5 && event.pid != 1 => Some(Violation {
             severity: "high",
             rule: "bpf_prog_load",
             message: format!(
@@ -820,6 +882,92 @@ mod tests {
             "python",
             SecurityEventKind::FileAccess {
                 path: "/tmp/scratch.txt".into(),
+                flags: 1,
+                allowed: true,
+            },
+        );
+        assert!(detect_violation(&ev).is_none());
+    }
+
+    // ---- path normalization + policy hardening fixes ----
+
+    #[test]
+    fn test_normalize_path_collapses_dotdot() {
+        assert_eq!(normalize_path("/workspace/../etc/shadow"), "/etc/shadow");
+        assert_eq!(normalize_path("/workspace/../../etc/shadow"), "/etc/shadow");
+        assert_eq!(normalize_path("/workspace/./a//b/"), "/workspace/a/b");
+        assert_eq!(normalize_path("/a/b/../../c"), "/c");
+        assert_eq!(normalize_path("/"), "/");
+        assert_eq!(normalize_path("/workspace"), "/workspace");
+    }
+
+    #[test]
+    fn test_path_traversal_not_allowlisted_as_workspace() {
+        let ev = make_event(
+            50,
+            "sh",
+            SecurityEventKind::FileAccess {
+                path: "/workspace/../../etc/shadow".into(),
+                flags: 1, // O_WRONLY
+                allowed: true,
+            },
+        );
+        let v = detect_violation(&ev).expect("traversal should be flagged");
+        assert_eq!(v.rule, "write_outside_workspace");
+    }
+
+    #[test]
+    fn test_proc_self_environ_is_self_introspection() {
+        let ev = make_event(
+            50,
+            "sh",
+            SecurityEventKind::FileAccess {
+                path: "/proc/self/environ".into(),
+                flags: 0,
+                allowed: true,
+            },
+        );
+        let v = detect_violation(&ev).expect("environ should be flagged");
+        assert_eq!(v.rule, "self_process_introspection");
+    }
+
+    #[test]
+    fn test_proc_other_pid_mem_is_cross_process() {
+        let ev = make_event(
+            50,
+            "sh",
+            SecurityEventKind::FileAccess {
+                path: "/proc/1234/mem".into(),
+                flags: 0,
+                allowed: true,
+            },
+        );
+        let v = detect_violation(&ev).expect("cross-pid mem should be flagged");
+        assert_eq!(v.rule, "cross_process_memory");
+    }
+
+    #[test]
+    fn test_sysrq_trigger_is_sensitive_kernel_access() {
+        let ev = make_event(
+            50,
+            "sh",
+            SecurityEventKind::FileAccess {
+                path: "/proc/sysrq-trigger".into(),
+                flags: 1,
+                allowed: true,
+            },
+        );
+        let v = detect_violation(&ev).expect("sysrq-trigger should be flagged");
+        assert_eq!(v.rule, "sensitive_kernel_access");
+    }
+
+    #[test]
+    fn test_workspace_subdir_still_allowed() {
+        let ev = make_event(
+            50,
+            "sh",
+            SecurityEventKind::FileAccess {
+                path: "/workspace/data/out.txt".into(),
                 flags: 1,
                 allowed: true,
             },

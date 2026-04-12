@@ -1214,6 +1214,38 @@ fn is_proc_danger_name(n: &[u8; 16]) -> bool {
         && n[4] == b'k' && n[5] == 0 { return true; }
     if n[0] == b's' && n[1] == b'y' && n[2] == b's' && n[3] == b'c'
         && n[4] == b'a' && n[5] == b'l' && n[6] == b'l' && n[7] == 0 { return true; }
+    if n[0] == b'e' && n[1] == b'n' && n[2] == b'v' && n[3] == b'i'
+        && n[4] == b'r' && n[5] == b'o' && n[6] == b'n' && n[7] == 0 { return true; }
+    false
+}
+
+#[inline(always)]
+fn name_is_dev(n: &[u8; 16]) -> bool {
+    n[0] == b'd' && n[1] == b'e' && n[2] == b'v' && n[3] == 0
+}
+
+#[inline(always)]
+fn is_proc_sensitive_leaf(n: &[u8; 16]) -> bool {
+    // kallsyms
+    if n[0] == b'k' && n[1] == b'a' && n[2] == b'l' && n[3] == b'l'
+        && n[4] == b's' && n[5] == b'y' && n[6] == b'm' && n[7] == b's'
+        && n[8] == 0 { return true; }
+    // kcore
+    if n[0] == b'k' && n[1] == b'c' && n[2] == b'o' && n[3] == b'r'
+        && n[4] == b'e' && n[5] == 0 { return true; }
+    false
+}
+
+#[inline(always)]
+fn is_dev_sensitive_leaf(n: &[u8; 16]) -> bool {
+    // mem
+    if n[0] == b'm' && n[1] == b'e' && n[2] == b'm' && n[3] == 0 { return true; }
+    // kmem
+    if n[0] == b'k' && n[1] == b'm' && n[2] == b'e' && n[3] == b'm' && n[4] == 0 { return true; }
+    // port
+    if n[0] == b'p' && n[1] == b'o' && n[2] == b'r' && n[3] == b't' && n[4] == 0 { return true; }
+    // kmsg
+    if n[0] == b'k' && n[1] == b'm' && n[2] == b's' && n[3] == b'g' && n[4] == 0 { return true; }
     false
 }
 
@@ -1267,7 +1299,9 @@ fn try_lsm_file_open(ctx: &LsmContext) -> Result<i32, c_long> {
     if d2 != 0 { read_dentry_name(d2, &mut n2); }
 
     let blocked = (name_is_pid(&n1) && is_proc_danger_name(&n0))
-        || (name_is_pid(&n2) && name_is_fd_or_ns(&n1));
+        || (name_is_pid(&n2) && name_is_fd_or_ns(&n1))
+        || (name_is_proc(&n1) && is_proc_sensitive_leaf(&n0))
+        || (name_is_dev(&n1) && is_dev_sensitive_leaf(&n0));
 
     if blocked {
         unsafe { bpf_send_signal(9) };
