@@ -9,6 +9,7 @@
 //! On macOS (the host), this crate compiles as a stub with only the
 //! type definitions — the actual eBPF functionality requires a Linux kernel.
 
+pub mod btf_offsets;
 pub mod events;
 pub mod policy;
 pub mod tracer;

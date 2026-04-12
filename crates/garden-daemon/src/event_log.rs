@@ -17,6 +17,7 @@
 //!
 //! Runs host-side inside `log()` — it cannot be tampered with by the guest.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -62,7 +63,6 @@ fn is_proc_memory_path(path: &str) -> bool {
     }
     matches!(after_pid, "mem" | "maps" | "pagemap" | "smaps"
         | "status" | "cmdline" | "wchan" | "stack" | "syscall")
-        || after_pid.starts_with("fd/")
         || after_pid.starts_with("ns/")
 }
 
@@ -74,12 +74,25 @@ fn is_write_intent(flags: u32) -> bool {
 
 /// Standard device nodes that are safe to write to from any process.
 fn is_allowed_device_write(path: &str) -> bool {
-    matches!(
+    // Standard device nodes safe for any process to write to
+    if matches!(
         path,
         "/dev/null" | "/dev/zero" | "/dev/urandom" | "/dev/random"
             | "/dev/tty" | "/dev/stdin" | "/dev/stdout" | "/dev/stderr"
             | "/dev/fd/1" | "/dev/fd/2"
-    )
+    ) {
+        return true;
+    }
+    // Allow /proc/self/fd/* writes — DHCP scripts and other system tools
+    // legitimately write to these (they're just dup'd file descriptors).
+    if path.starts_with("/proc/self/fd/") {
+        return true;
+    }
+    // Allow /tmp and /run writes — ephemeral runtime state
+    if path.starts_with("/tmp/") || path.starts_with("/run/") {
+        return true;
+    }
+    false
 }
 
 /// Returns true if the binary basename is on the privileged-tool blocklist.
@@ -203,32 +216,32 @@ fn detect_violation(event: &SecurityEvent) -> Option<Violation> {
                 ),
             })
         }
-        SecurityEventKind::TcpSend { bytes } if *bytes > 10_000_000 => {
-            Some(Violation {
-                severity: "high",
-                rule: "data_exfiltration",
-                message: format!(
-                    "process '{}' (pid {}) sent {} bytes over TCP (>10MB threshold)",
-                    event.comm, event.pid, bytes
-                ),
-            })
-        }
-        SecurityEventKind::TcpRecv { bytes } if *bytes > 50_000_000 => {
-            Some(Violation {
-                severity: "medium",
-                rule: "large_download",
-                message: format!(
-                    "process '{}' (pid {}) received {} bytes over TCP (>50MB threshold)",
-                    event.comm, event.pid, bytes
-                ),
-            })
-        }
+
+        // Note: TcpSend/TcpRecv per-event checks are removed — cumulative
+        // tracking in EventLogger.check_cumulative_bytes() handles this now.
+
         SecurityEventKind::ModuleLoad { .. } => Some(Violation {
             severity: "high",
             rule: "module_load",
             message: format!(
                 "process '{}' (pid {}) attempted to load a kernel module (CONFIG_MODULES=n)",
                 event.comm, event.pid
+            ),
+        }),
+        SecurityEventKind::FinitModuleLoad { .. } => Some(Violation {
+            severity: "high",
+            rule: "finit_module_load",
+            message: format!(
+                "process '{}' (pid {}) attempted finit_module — kernel module load via fd",
+                event.comm, event.pid
+            ),
+        }),
+        SecurityEventKind::PtraceAttempt { request, target_pid } => Some(Violation {
+            severity: "high",
+            rule: "ptrace_attempt",
+            message: format!(
+                "process '{}' (pid {}) called ptrace(request={}, target_pid={}) — process injection attempt",
+                event.comm, event.pid, request, target_pid
             ),
         }),
         SecurityEventKind::BpfSyscall { cmd } if *cmd == 5 => Some(Violation {
@@ -247,6 +260,35 @@ fn detect_violation(event: &SecurityEvent) -> Option<Violation> {
                 event.comm, event.pid, target
             ),
         }),
+
+        // Destructive file ops on critical system paths
+        SecurityEventKind::FileDelete { path, .. }
+            if event.pid != 1
+                && (path.starts_with("/etc/") || path.starts_with("/usr/") || path.starts_with("/bin/") || path.starts_with("/sbin/")) =>
+        {
+            Some(Violation {
+                severity: "high",
+                rule: "critical_file_delete",
+                message: format!(
+                    "process '{}' (pid {}) deleted critical system file '{}'",
+                    event.comm, event.pid, path
+                ),
+            })
+        }
+        SecurityEventKind::FileRename { old_path, new_path, .. }
+            if event.pid != 1
+                && (old_path.starts_with("/etc/") || old_path.starts_with("/usr/")) =>
+        {
+            Some(Violation {
+                severity: "high",
+                rule: "critical_file_rename",
+                message: format!(
+                    "process '{}' (pid {}) renamed critical system file '{}' → '{}'",
+                    event.comm, event.pid, old_path, new_path
+                ),
+            })
+        }
+
         _ => None,
     }
 }
@@ -317,6 +359,9 @@ pub struct EventLogger {
     max_file_bytes: u64,
     /// Keep at most this many rotated files (plus the active one).
     max_files: usize,
+    /// Cumulative per-PID byte counters for data exfiltration detection (#11).
+    /// Key: pid, Value: (total_sent, total_received)
+    byte_counters: Mutex<HashMap<u32, (u64, u64)>>,
 }
 
 impl EventLogger {
@@ -349,6 +394,7 @@ impl EventLogger {
             seq: AtomicU64::new(0),
             max_file_bytes,
             max_files,
+            byte_counters: Mutex::new(HashMap::new()),
         })
     }
 
@@ -357,6 +403,7 @@ impl EventLogger {
         &self.session_dir
     }
 
+    #[allow(dead_code)]
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
@@ -365,7 +412,16 @@ impl EventLogger {
     /// Log the event and return any violation detected, so callers can enforce.
     pub fn log(&self, event: &SecurityEvent) -> anyhow::Result<Option<Violation>> {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
-        let violation = detect_violation(event);
+
+        // Check for static violations first
+        let mut violation = detect_violation(event);
+
+        // Issue #11: Cumulative per-PID byte tracking for data exfiltration.
+        // Individual TcpSend/TcpRecv events carry per-call byte counts, but
+        // we need to accumulate over the process lifetime to detect exfil.
+        if violation.is_none() {
+            violation = self.check_cumulative_bytes(event);
+        }
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -407,6 +463,55 @@ impl EventLogger {
         rotating.current_bytes += json.len() as u64;
 
         Ok(violation)
+    }
+
+    /// Accumulate TCP bytes per PID and check against exfiltration thresholds.
+    ///
+    /// Returns a violation if the cumulative bytes cross the threshold.
+    /// This replaces the old per-event threshold checks — a process sending
+    /// 1000 × 10KB writes should still trigger at 10MB total.
+    fn check_cumulative_bytes(&self, event: &SecurityEvent) -> Option<Violation> {
+        const SEND_THRESHOLD: u64 = 10_000_000;  // 10 MB
+        const RECV_THRESHOLD: u64 = 50_000_000;  // 50 MB
+
+        let (send_delta, recv_delta) = match &event.kind {
+            SecurityEventKind::TcpSend { bytes } => (*bytes, 0u64),
+            SecurityEventKind::TcpRecv { bytes } => (0u64, *bytes),
+            _ => return None,
+        };
+
+        let mut counters = self.byte_counters.lock().unwrap();
+        let entry = counters.entry(event.pid).or_insert((0, 0));
+
+        let was_below_send = entry.0 < SEND_THRESHOLD;
+        let was_below_recv = entry.1 < RECV_THRESHOLD;
+
+        entry.0 = entry.0.saturating_add(send_delta);
+        entry.1 = entry.1.saturating_add(recv_delta);
+
+        // Only fire the violation once — when crossing the threshold
+        if was_below_send && entry.0 >= SEND_THRESHOLD {
+            return Some(Violation {
+                severity: "high",
+                rule: "data_exfiltration",
+                message: format!(
+                    "process '{}' (pid {}) cumulative TCP send reached {} bytes (>{}B threshold)",
+                    event.comm, event.pid, entry.0, SEND_THRESHOLD
+                ),
+            });
+        }
+        if was_below_recv && entry.1 >= RECV_THRESHOLD {
+            return Some(Violation {
+                severity: "medium",
+                rule: "large_download",
+                message: format!(
+                    "process '{}' (pid {}) cumulative TCP recv reached {} bytes (>{}B threshold)",
+                    event.comm, event.pid, entry.1, RECV_THRESHOLD
+                ),
+            });
+        }
+
+        None
     }
 
     /// Rotate log files:
@@ -491,6 +596,7 @@ mod tests {
         SecurityEvent {
             timestamp_ns: 0,
             pid,
+            uid: 1000,
             comm: comm.into(),
             kind,
         }
@@ -541,11 +647,25 @@ mod tests {
     }
 
     #[test]
-    fn test_data_exfiltration_detected() {
-        let ev = make_event(200, "curl", SecurityEventKind::TcpSend { bytes: 15_000_000 });
-        let v = detect_violation(&ev).unwrap();
-        assert_eq!(v.severity, "high");
-        assert_eq!(v.rule, "data_exfiltration");
+    fn test_cumulative_data_exfiltration_detected() {
+        // Cumulative tracking is in EventLogger, not detect_violation
+        let logger = EventLogger::with_limits(10 * 1024 * 1024, 5).unwrap();
+
+        // Send 9 events of 1.5MB each — total = 13.5MB, should trigger at 10MB
+        for i in 0..9 {
+            let ev = make_event(200, "curl", SecurityEventKind::TcpSend { bytes: 1_500_000 });
+            let result = logger.log(&ev).unwrap();
+            if i < 6 {
+                // Below 10MB threshold
+                assert!(result.is_none(), "Event {} should not trigger violation", i);
+            } else if i == 6 {
+                // 7 × 1.5MB = 10.5MB — crosses threshold
+                assert!(result.is_some(), "Event {} should trigger violation", i);
+                let v = result.unwrap();
+                assert_eq!(v.rule, "data_exfiltration");
+            }
+            // After first trigger, no more violations (one-shot)
+        }
     }
 
     #[test]
@@ -555,11 +675,19 @@ mod tests {
     }
 
     #[test]
-    fn test_large_download_detected() {
-        let ev = make_event(300, "wget", SecurityEventKind::TcpRecv { bytes: 60_000_000 });
-        let v = detect_violation(&ev).unwrap();
-        assert_eq!(v.severity, "medium");
-        assert_eq!(v.rule, "large_download");
+    fn test_large_download_cumulative() {
+        let logger = EventLogger::with_limits(10 * 1024 * 1024, 5).unwrap();
+        // Send 10 events of 6MB each — total crosses 50MB at event index 8
+        for i in 0..10 {
+            let ev = make_event(300, "wget", SecurityEventKind::TcpRecv { bytes: 6_000_000 });
+            let result = logger.log(&ev).unwrap();
+            if i < 8 {
+                assert!(result.is_none(), "Event {} should not trigger", i);
+            } else if i == 8 {
+                assert!(result.is_some(), "Event {} should trigger large_download", i);
+                assert_eq!(result.unwrap().rule, "large_download");
+            }
+        }
     }
 
     #[test]
@@ -612,6 +740,93 @@ mod tests {
         assert!(detect_violation(&ev).is_none());
     }
 
+    #[test]
+    fn test_finit_module_violation() {
+        let ev = make_event(
+            700,
+            "modprobe",
+            SecurityEventKind::FinitModuleLoad { flags: 0, args: "".into() },
+        );
+        let v = detect_violation(&ev).unwrap();
+        assert_eq!(v.rule, "finit_module_load");
+    }
+
+    #[test]
+    fn test_ptrace_violation() {
+        let ev = make_event(
+            800,
+            "gdb",
+            SecurityEventKind::PtraceAttempt { request: 16, target_pid: 42 },
+        );
+        let v = detect_violation(&ev).unwrap();
+        assert_eq!(v.rule, "ptrace_attempt");
+    }
+
+    #[test]
+    fn test_critical_file_delete_violation() {
+        let ev = make_event(
+            900,
+            "rm",
+            SecurityEventKind::FileDelete { path: "/etc/passwd".into(), flags: 0 },
+        );
+        let v = detect_violation(&ev).unwrap();
+        assert_eq!(v.rule, "critical_file_delete");
+    }
+
+    #[test]
+    fn test_workspace_file_delete_no_violation() {
+        let ev = make_event(
+            900,
+            "rm",
+            SecurityEventKind::FileDelete { path: "/workspace/test.txt".into(), flags: 0 },
+        );
+        assert!(detect_violation(&ev).is_none());
+    }
+
+    #[test]
+    fn test_critical_file_rename_violation() {
+        let ev = make_event(
+            1000,
+            "mv",
+            SecurityEventKind::FileRename {
+                old_path: "/etc/shadow".into(),
+                new_path: "/etc/shadow.bak".into(),
+                flags: 0,
+            },
+        );
+        let v = detect_violation(&ev).unwrap();
+        assert_eq!(v.rule, "critical_file_rename");
+    }
+
+    #[test]
+    fn test_proc_self_fd_write_allowed() {
+        let ev = make_event(
+            50,
+            "dhcp",
+            SecurityEventKind::FileAccess {
+                path: "/proc/self/fd/3".into(),
+                flags: 1, // O_WRONLY
+                allowed: true,
+            },
+        );
+        // Should NOT trigger write_outside_workspace because /proc/self/fd is allowed
+        assert!(detect_violation(&ev).is_none());
+    }
+
+    #[test]
+    fn test_tmp_write_allowed() {
+        let ev = make_event(
+            50,
+            "python",
+            SecurityEventKind::FileAccess {
+                path: "/tmp/scratch.txt".into(),
+                flags: 1,
+                allowed: true,
+            },
+        );
+        assert!(detect_violation(&ev).is_none());
+    }
+
     // ---- ISO 8601 formatting ----
 
     #[test]
@@ -633,7 +848,7 @@ mod tests {
     fn test_rotation_creates_rotated_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         // Tiny limit: 100 bytes per file, keep 3
-        let logger = EventLogger::with_limits(100, 3).unwrap();
+        let _logger = EventLogger::with_limits(100, 3).unwrap();
         // Override session_dir isn't exposed, so we test via a fresh logger
         // pointed at a temp dir using the internal helper directly.
         let _ = dir; // kept alive
@@ -656,6 +871,7 @@ mod tests {
             seq: AtomicU64::new(0),
             max_file_bytes: 100,
             max_files: 3,
+            byte_counters: Mutex::new(HashMap::new()),
         };
 
         // Trigger rotation by writing to a full logger
@@ -695,6 +911,7 @@ mod tests {
             seq: AtomicU64::new(0),
             max_file_bytes: 1, // force immediate rotation
             max_files: 3,
+            byte_counters: Mutex::new(HashMap::new()),
         };
 
         logger

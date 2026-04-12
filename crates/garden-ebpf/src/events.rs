@@ -9,6 +9,8 @@ pub struct SecurityEvent {
     pub timestamp_ns: u64,
     /// Process ID that triggered the event.
     pub pid: u32,
+    /// User ID that triggered the event.
+    pub uid: u32,
     /// Process name.
     pub comm: String,
     /// The specific event type.
@@ -39,7 +41,7 @@ pub enum SecurityEventKind {
         flags: u32,
         allowed: bool,
     },
-    /// A network connection was attempted.
+    /// A network connection was attempted (IPv4 or IPv6).
     NetworkConnect {
         dest_ip: String,
         dest_port: u16,
@@ -80,6 +82,36 @@ pub enum SecurityEventKind {
         /// Module arguments if any.
         args: String,
     },
+    /// A kernel module load via fd was attempted — should never fire.
+    FinitModuleLoad {
+        /// Module flags.
+        flags: u32,
+        /// Module arguments if any.
+        args: String,
+    },
+    /// A ptrace syscall was invoked — process inspection/injection attempt.
+    PtraceAttempt {
+        /// Ptrace request code (0=TRACEME, 16=ATTACH, etc.).
+        request: u32,
+        /// Target PID of the ptrace call.
+        target_pid: u32,
+    },
+    /// A file was deleted (unlinkat).
+    FileDelete {
+        /// Path of the deleted file.
+        path: String,
+        /// Unlinkat flags (AT_REMOVEDIR = 0x200 means rmdir).
+        flags: u32,
+    },
+    /// A file was renamed (renameat2).
+    FileRename {
+        /// Original file path.
+        old_path: String,
+        /// New file path.
+        new_path: String,
+        /// Rename flags (RENAME_NOREPLACE, RENAME_EXCHANGE, etc.).
+        flags: u32,
+    },
     /// A syscall was invoked that matches a security policy.
     SyscallTrace {
         syscall_nr: u64,
@@ -116,7 +148,7 @@ pub enum SecurityEventKind {
     },
     /// TCP data was received.
     TcpRecv {
-        /// Bytes requested in this receive call.
+        /// Bytes actually received in this call (from kretprobe return value).
         bytes: u64,
     },
     /// The OOM killer selected a victim process.
@@ -137,6 +169,7 @@ mod tests {
         let event = SecurityEvent {
             timestamp_ns: 123456789,
             pid: 42,
+            uid: 1000,
             comm: "curl".into(),
             kind: SecurityEventKind::NetworkConnect {
                 dest_ip: "93.184.216.34".into(),
@@ -148,6 +181,7 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let parsed: SecurityEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.pid, 42);
+        assert_eq!(parsed.uid, 1000);
         assert_eq!(parsed.comm, "curl");
         assert_eq!(parsed.timestamp_ns, 123456789);
         if let SecurityEventKind::NetworkConnect {
@@ -164,11 +198,11 @@ mod tests {
     #[test]
     fn test_ndjson_multiline_parsing() {
         let lines = concat!(
-            r#"{"timestamp_ns":1,"pid":1,"comm":"ls","kind":{"type":"file_access","path":"/tmp","flags":0,"allowed":true}}"#,
+            r#"{"timestamp_ns":1,"pid":1,"uid":0,"comm":"ls","kind":{"type":"file_access","path":"/tmp","flags":0,"allowed":true}}"#,
             "\n",
-            r#"{"timestamp_ns":2,"pid":2,"comm":"curl","kind":{"type":"network_connect","dest_ip":"1.2.3.4","dest_port":80,"protocol":"tcp","allowed":true}}"#,
+            r#"{"timestamp_ns":2,"pid":2,"uid":1000,"comm":"curl","kind":{"type":"network_connect","dest_ip":"1.2.3.4","dest_port":80,"protocol":"tcp","allowed":true}}"#,
             "\n",
-            r#"{"timestamp_ns":3,"pid":3,"comm":"sh","kind":{"type":"process_exec","binary":"/bin/sh","args":["-c","echo"],"allowed":true}}"#,
+            r#"{"timestamp_ns":3,"pid":3,"uid":1000,"comm":"sh","kind":{"type":"process_exec","binary":"/bin/sh","args":["-c","echo"],"allowed":true}}"#,
         );
         let events: Vec<SecurityEvent> = lines
             .lines()
@@ -213,6 +247,23 @@ mod tests {
                 size: 4096,
                 args: "".into(),
             },
+            SecurityEventKind::FinitModuleLoad {
+                flags: 0,
+                args: "".into(),
+            },
+            SecurityEventKind::PtraceAttempt {
+                request: 16,
+                target_pid: 42,
+            },
+            SecurityEventKind::FileDelete {
+                path: "/workspace/test.txt".into(),
+                flags: 0,
+            },
+            SecurityEventKind::FileRename {
+                old_path: "/workspace/old.txt".into(),
+                new_path: "/workspace/new.txt".into(),
+                flags: 0,
+            },
             SecurityEventKind::SyscallTrace {
                 syscall_nr: 59,
                 syscall_name: "execve".into(),
@@ -239,6 +290,7 @@ mod tests {
             let event = SecurityEvent {
                 timestamp_ns: 0,
                 pid: 1,
+                uid: 0,
                 comm: "test".into(),
                 kind,
             };

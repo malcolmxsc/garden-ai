@@ -1,6 +1,5 @@
 use std::process::Command;
 use std::env;
-use std::path::PathBuf;
 
 fn main() {
     // Only compile the Swift code if we are building for macOS

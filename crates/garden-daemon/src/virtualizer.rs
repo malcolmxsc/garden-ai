@@ -214,6 +214,7 @@ impl Virtualizer {
 }
 
 // Helper to extract the description string from an Objective-C NSError**
+#[allow(unexpected_cfgs)]
 unsafe fn extract_nserror_description(error_ptr: *mut c_void) -> String {
     if error_ptr.is_null() {
         return "Unknown Error".to_string();

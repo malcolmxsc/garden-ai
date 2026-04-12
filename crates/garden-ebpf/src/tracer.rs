@@ -4,9 +4,11 @@
 //! and attach them to tracepoints/kprobes. On macOS, it compiles as a
 //! no-op stub.
 
+#[allow(unused_imports)]
 use super::events::{SecurityEvent, SecurityEventKind};
 #[cfg(target_os = "linux")]
 use super::policy::PolicyAction;
+#[allow(unused_imports)]
 use garden_ebpf_common::{bytes_to_str, EventKind, RawSecurityEvent, MAX_COMM_LEN};
 use tokio::sync::mpsc;
 
@@ -77,6 +79,7 @@ fn lsm_link_create(prog_fd: std::os::fd::RawFd) -> std::io::Result<std::os::fd::
 ///
 /// DNS wire format: 12-byte header, then length-prefixed labels.
 /// e.g., `\x07example\x03com\x00` → "example.com"
+#[cfg(target_os = "linux")]
 fn decode_dns_query(raw: &[u8]) -> String {
     // DNS header is 12 bytes; query name starts at offset 12
     if raw.len() <= 12 {
@@ -111,7 +114,30 @@ fn decode_dns_query(raw: &[u8]) -> String {
     result
 }
 
+/// Format a 16-byte IPv6 address as a standard IPv6 string.
+#[cfg(target_os = "linux")]
+fn format_ipv6(bytes: &[u8; 16]) -> String {
+    let groups: [u16; 8] = [
+        u16::from_be_bytes([bytes[0], bytes[1]]),
+        u16::from_be_bytes([bytes[2], bytes[3]]),
+        u16::from_be_bytes([bytes[4], bytes[5]]),
+        u16::from_be_bytes([bytes[6], bytes[7]]),
+        u16::from_be_bytes([bytes[8], bytes[9]]),
+        u16::from_be_bytes([bytes[10], bytes[11]]),
+        u16::from_be_bytes([bytes[12], bytes[13]]),
+        u16::from_be_bytes([bytes[14], bytes[15]]),
+    ];
+
+    // Simple formatting without :: compression (always correct, easy to parse)
+    format!(
+        "{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
+        groups[0], groups[1], groups[2], groups[3],
+        groups[4], groups[5], groups[6], groups[7]
+    )
+}
+
 /// Convert a raw BPF event to a typed `SecurityEvent`.
+#[cfg(target_os = "linux")]
 fn convert_raw_event(raw: &RawSecurityEvent) -> Option<SecurityEvent> {
     let kind_enum = EventKind::from_u32(raw.kind)?;
     let comm = bytes_to_str(&raw.comm).to_string();
@@ -140,6 +166,19 @@ fn convert_raw_event(raw: &RawSecurityEvent) -> Option<SecurityEvent> {
                 allowed: true,
             }
         }
+        EventKind::ConnectV6 => {
+            let ip6_bytes: [u8; 16] = raw.dest_ip6;
+            SecurityEventKind::NetworkConnect {
+                dest_ip: format_ipv6(&ip6_bytes),
+                dest_port: raw.dest_port,
+                protocol: if raw.protocol == 17 {
+                    "udp".to_string()
+                } else {
+                    "tcp".to_string()
+                },
+                allowed: true,
+            }
+        }
         EventKind::DnsQuery => {
             let ip = raw.dest_ip.to_ne_bytes();
             SecurityEventKind::DnsQuery {
@@ -158,6 +197,23 @@ fn convert_raw_event(raw: &RawSecurityEvent) -> Option<SecurityEvent> {
         EventKind::ModuleLoad => SecurityEventKind::ModuleLoad {
             size: raw.flags,
             args: bytes_to_str(&raw.args).to_string(),
+        },
+        EventKind::FinitModule => SecurityEventKind::FinitModuleLoad {
+            flags: raw.flags,
+            args: bytes_to_str(&raw.args).to_string(),
+        },
+        EventKind::Ptrace => SecurityEventKind::PtraceAttempt {
+            request: raw.flags,
+            target_pid: raw.aux as u32,
+        },
+        EventKind::Unlink => SecurityEventKind::FileDelete {
+            path: bytes_to_str(&raw.path).to_string(),
+            flags: raw.flags,
+        },
+        EventKind::Rename => SecurityEventKind::FileRename {
+            old_path: bytes_to_str(&raw.path).to_string(),
+            new_path: bytes_to_str(&raw.args).to_string(),
+            flags: raw.flags,
         },
         EventKind::Fork => SecurityEventKind::ProcessFork {
             parent_pid: raw.pid,
@@ -193,9 +249,74 @@ fn convert_raw_event(raw: &RawSecurityEvent) -> Option<SecurityEvent> {
     Some(SecurityEvent {
         timestamp_ns: raw.timestamp_ns,
         pid: raw.pid,
+        uid: raw.uid,
         comm,
         kind,
     })
+}
+
+/// Simple deduplication cache for high-frequency events (e.g., openat).
+///
+/// Deduplicates by (pid, path) within a time window to reduce noise from
+/// repeated accesses (e.g., libc, ld.so lookups during a single exec).
+#[cfg(target_os = "linux")]
+struct EventDedup {
+    /// (pid, path_hash) → last seen timestamp_ns
+    seen: std::collections::HashMap<(u32, u64), u64>,
+    /// Dedup window in nanoseconds (100ms)
+    window_ns: u64,
+    /// Counter for periodic cleanup
+    ops: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl EventDedup {
+    fn new() -> Self {
+        Self {
+            seen: std::collections::HashMap::with_capacity(256),
+            window_ns: 100_000_000, // 100ms
+            ops: 0,
+        }
+    }
+
+    /// Returns true if this event should be emitted (not a duplicate).
+    fn should_emit(&mut self, event: &SecurityEvent) -> bool {
+        // Only dedup openat events — other event types are always emitted.
+        let path = match &event.kind {
+            SecurityEventKind::FileAccess { path, .. } => path,
+            _ => return true,
+        };
+
+        let path_hash = Self::hash_path(path);
+        let key = (event.pid, path_hash);
+
+        self.ops += 1;
+        // Periodic cleanup every 1000 operations to prevent unbounded growth
+        if self.ops % 1000 == 0 {
+            let cutoff = event.timestamp_ns.saturating_sub(self.window_ns * 10);
+            self.seen.retain(|_, ts| *ts > cutoff);
+        }
+
+        match self.seen.get(&key) {
+            Some(&last_ts) if event.timestamp_ns.saturating_sub(last_ts) < self.window_ns => {
+                false // duplicate within window
+            }
+            _ => {
+                self.seen.insert(key, event.timestamp_ns);
+                true
+            }
+        }
+    }
+
+    /// Simple FNV-1a hash for path strings (no_std friendly, fast).
+    fn hash_path(path: &str) -> u64 {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for byte in path.bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
 }
 
 /// Start the eBPF tracer with the given policy.
@@ -210,11 +331,10 @@ fn convert_raw_event(raw: &RawSecurityEvent) -> Option<SecurityEvent> {
 pub async fn start_tracer(
     policy: super::policy::SecurityPolicy,
 ) -> anyhow::Result<(TracerHandle, mpsc::Receiver<SecurityEvent>)> {
-    use aya::maps::perf::AsyncPerfEventArray;
+    use aya::maps::ring_buf::RingBuf;
     use aya::programs::{KProbe, Lsm, TracePoint};
-    use aya::util::online_cpus;
     use aya::Btf;
-    use bytes::BytesMut;
+    use tokio::io::unix::AsyncFd;
 
     tracing::info!("Loading eBPF probes...");
 
@@ -237,7 +357,13 @@ pub async fn start_tracer(
     // here and fall back to kill-on-detect in the perf event loop.
     populate_policy_maps(&mut ebpf, &policy)?;
 
-    // 2. Attach tracepoints (Tier 1 + Tier 2)
+    // 1c. Resolve kernel struct offsets via BTF and populate the OFFSETS map
+    // so probes can use runtime offsets instead of hardcoded constants.
+    // On kernels without CONFIG_DEBUG_INFO_BTF this silently no-ops and the
+    // probes fall back to their baked-in defaults.
+    populate_btf_offsets(&mut ebpf);
+
+    // 2. Attach tracepoints (Tier 1 + Tier 2 + new probes)
     //
     // Some probes may be unavailable if the kernel was built without the
     // corresponding syscall (e.g., init_module with CONFIG_MODULES=n).
@@ -252,6 +378,10 @@ pub async fn start_tracer(
         ("trace_mount", "syscalls", "sys_enter_mount", false),
         ("trace_bpf", "syscalls", "sys_enter_bpf", false),
         ("trace_init_module", "syscalls", "sys_enter_init_module", false),
+        ("trace_finit_module", "syscalls", "sys_enter_finit_module", false),
+        ("trace_ptrace", "syscalls", "sys_enter_ptrace", false),
+        ("trace_unlinkat", "syscalls", "sys_enter_unlinkat", false),
+        ("trace_renameat2", "syscalls", "sys_enter_renameat2", false),
         // Tier 3 — process lifecycle + OOM
         ("trace_fork", "sched", "sched_process_fork", false),
         ("trace_exit", "sched", "sched_process_exit", false),
@@ -286,10 +416,17 @@ pub async fn start_tracer(
     tracing::info!("Attached {}/{} eBPF tracepoints", attached, probes.len());
 
     // 3. Attach kprobes (Tier 3 — require CONFIG_KPROBES=y)
+    //
+    // Note: trace_tcp_recvmsg is a kretprobe (captures return value = actual
+    // bytes received), while the others are kprobes. Aya resolves the correct
+    // attachment type from the ELF section name (kprobe/ vs kretprobe/).
     let kprobes = [
         ("trace_commit_creds", "commit_creds", false),
         ("trace_tcp_sendmsg",  "tcp_sendmsg",  false),
         ("trace_tcp_recvmsg",  "tcp_recvmsg",  false),
+        // fix #16: catches DNS queries sent via connect()+send()/write() on UDP
+        // sockets, which don't hit the sys_enter_sendto tracepoint.
+        ("trace_udp_sendmsg",  "udp_sendmsg",  false),
     ];
 
     let mut kprobes_attached = 0u32;
@@ -390,84 +527,108 @@ pub async fn start_tracer(
     }
     tracing::info!("Attached {}/{} BPF-LSM hooks", lsm_attached, lsm_hooks.len());
 
-    // 5. Open PerfEventArray and spawn per-CPU polling tasks
+    // 5. Open the BPF ring buffer and spawn a single reader task.
+    //
+    // Unlike PerfEventArray (N per-CPU buffers, one reader task per CPU),
+    // BPF_MAP_TYPE_RINGBUF is a single shared, globally-ordered buffer drained
+    // by one reader. This eliminates the per-CPU fan-out and the `events.lost`
+    // bookkeeping — the kernel `ringbuf_output` helper returns an error if the
+    // buffer is full, which the BPF program can count directly.
     let policy = std::sync::Arc::new(policy);
     let (tx, rx) = mpsc::channel::<SecurityEvent>(1024);
 
-    let mut perf_array = AsyncPerfEventArray::try_from(
+    let ring_buf = RingBuf::try_from(
         ebpf.take_map("EVENTS")
             .ok_or_else(|| anyhow::anyhow!("BPF map 'EVENTS' not found"))?,
     )?;
+    let mut async_rb = AsyncFd::new(ring_buf)?;
 
-    // Note: `ebpf` must be kept alive for the duration of tracing.
-    // Moved into TracerHandle below.
+    tracing::info!("Starting BPF ring buffer reader (single task, globally ordered)");
 
-    let cpus = online_cpus().map_err(|e| anyhow::anyhow!("failed to get online CPUs: {:?}", e))?;
-    tracing::info!("Starting perf event readers on {} CPUs", cpus.len());
-
-    for cpu_id in cpus {
-        let mut buf = perf_array.open(cpu_id, Some(256))?;
+    {
         let tx = tx.clone();
         let policy = policy.clone();
-
         tokio::spawn(async move {
-            let mut buffers = (0..10)
-                .map(|_| BytesMut::with_capacity(core::mem::size_of::<RawSecurityEvent>()))
-                .collect::<Vec<_>>();
+            // Global deduplication cache (issue #20). Previously per-CPU —
+            // now one instance because the ring buffer is globally ordered,
+            // so duplicates that previously slipped across CPUs are caught.
+            let mut dedup = EventDedup::new();
+
+            // Per-CPU next-expected sequence number for drop detection (#24).
+            // SEQ is a PerCpuArray<u64>, and since BPF runs preemption-disabled
+            // each CPU issues a strictly increasing sequence. A gap means the
+            // ringbuf dropped an event on that CPU. Cross-CPU interleaving is
+            // irrelevant — we only compare within a single CPU's stream.
+            let mut next_seq: std::collections::HashMap<u32, u64> =
+                std::collections::HashMap::new();
+            let mut total_gaps: u64 = 0;
 
             loop {
-                let events = match buf.read_events(&mut buffers).await {
-                    Ok(events) => events,
+                let mut guard = match async_rb.readable_mut().await {
+                    Ok(g) => g,
                     Err(e) => {
-                        tracing::error!(
-                            "Error reading perf events on CPU {}: {}",
-                            cpu_id,
-                            e
-                        );
-                        // Brief backoff before retrying
+                        tracing::error!("ring buffer readable_mut error: {}", e);
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         continue;
                     }
                 };
+                let rb = guard.get_inner_mut();
+                while let Some(item) = rb.next() {
+                    if item.len() < core::mem::size_of::<RawSecurityEvent>() {
+                        continue;
+                    }
+                    let raw = unsafe { &*(item.as_ptr() as *const RawSecurityEvent) };
 
-                for i in 0..events.read {
-                    if buffers[i].len() >= core::mem::size_of::<RawSecurityEvent>() {
-                        let raw = unsafe {
-                            &*(buffers[i].as_ptr() as *const RawSecurityEvent)
-                        };
-                        if let Some(event) = convert_raw_event(raw) {
-                            // Kill-on-detect is now restricted to stateful violations that
-                            // BPF-LSM cannot handle at a single hook point:
-                            //   - TcpSend / TcpRecv: byte-count thresholds accumulated over
-                            //     multiple sends/receives; no single LSM hook covers them.
-                            //
-                            // All single-operation violations (file access, exec, connect,
-                            // mount) are now enforced synchronously by BPF-LSM hooks, which
-                            // return -EPERM before the syscall completes. Killing here for
-                            // those events would be redundant and racy.
-                            if policy.evaluate(&event) == PolicyAction::Deny {
-                                let is_stateful = matches!(
-                                    &event.kind,
-                                    SecurityEventKind::TcpSend { .. }
-                                        | SecurityEventKind::TcpRecv { .. }
-                                );
-                                if is_stateful {
-                                    unsafe {
-                                        libc::kill(event.pid as libc::pid_t, libc::SIGKILL);
-                                    }
-                                    tracing::warn!(
-                                        "STATEFUL KILL: pid={} comm={} {:?}",
-                                        event.pid, event.comm, event.kind
-                                    );
+                    // Sequence gap detection (#24), keyed by source CPU: the
+                    // BPF-side counter is per-CPU, so only same-CPU events form
+                    // a strictly-increasing stream. Cross-CPU interleaving into
+                    // the ringbuf is fine — each CPU's subsequence stays intact.
+                    let seq_key = raw.cpu_id;
+                    match next_seq.get(&seq_key).copied() {
+                        Some(expected) if raw.seq > expected => {
+                            let gap = raw.seq - expected;
+                            total_gaps += gap;
+                            tracing::warn!(
+                                "seq gap: cpu={} expected={} got={} (dropped {}, cumulative gaps={})",
+                                raw.cpu_id, expected, raw.seq, gap, total_gaps
+                            );
+                        }
+                        _ => {}
+                    }
+                    next_seq.insert(seq_key, raw.seq.wrapping_add(1));
+
+                    if let Some(event) = convert_raw_event(raw) {
+                        // Issue #20: Deduplicate noisy openat events
+                        if !dedup.should_emit(&event) {
+                            continue;
+                        }
+
+                        // Kill-on-detect is restricted to stateful violations
+                        // that BPF-LSM cannot handle at a single hook point:
+                        //   - TcpSend / TcpRecv: byte-count thresholds
+                        //     accumulated over multiple sends/receives.
+                        if policy.evaluate(&event) == PolicyAction::Deny {
+                            let is_stateful = matches!(
+                                &event.kind,
+                                SecurityEventKind::TcpSend { .. }
+                                    | SecurityEventKind::TcpRecv { .. }
+                            );
+                            if is_stateful {
+                                unsafe {
+                                    libc::kill(event.pid as libc::pid_t, libc::SIGKILL);
                                 }
+                                tracing::warn!(
+                                    "STATEFUL KILL: pid={} comm={} {:?}",
+                                    event.pid, event.comm, event.kind
+                                );
                             }
-                            // Always forward to channel so daemon can log the event
-                            if tx.try_send(event).is_err() {
-                                tracing::warn!("Telemetry channel full, dropping event");
-                            }
+                        }
+                        if tx.try_send(event).is_err() {
+                            tracing::warn!("Telemetry channel full, dropping event");
                         }
                     }
                 }
+                guard.clear_ready();
             }
         });
     }
@@ -475,6 +636,96 @@ pub async fn start_tracer(
     tracing::info!("eBPF tracer started — tracepoints, kprobes, and BPF-LSM hooks active");
 
     Ok((TracerHandle { _ebpf: ebpf, _lsm_links: lsm_links }, rx))
+}
+
+/// Populate the OFFSETS BPF map with kernel struct field offsets resolved
+/// from `/sys/kernel/btf/vmlinux`.
+///
+/// This replaces the previous hardcoded-offset approach (which silently
+/// broke on kernel upgrades — issue #13). On kernels without BTF the map
+/// is left empty and probes use their baked-in fallback constants.
+///
+/// Index layout must match the constants in `garden-ebpf-probes/src/main.rs`:
+///   0: task_struct.exit_code
+///   1: linux_binprm.file
+///   2: file.f_path.dentry
+///   3: dentry.d_name.name
+///   4: dentry.d_parent
+#[cfg(target_os = "linux")]
+fn populate_btf_offsets(ebpf: &mut aya::Ebpf) {
+    use super::btf_offsets::{read_vmlinux_btf, struct_member_offset};
+    use aya::maps::Array;
+
+    let btf = match read_vmlinux_btf() {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                "BTF unavailable ({}); probes will use hardcoded offset fallbacks. \
+                 If kernel struct layout has changed this may cause silent mis-reads.",
+                e
+            );
+            return;
+        }
+    };
+
+    let map = match ebpf.map_mut("OFFSETS") {
+        Some(m) => m,
+        None => {
+            tracing::warn!("OFFSETS map not found in BPF ELF — skipping BTF resolution");
+            return;
+        }
+    };
+    let mut arr: Array<_, u32> = match Array::try_from(map) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("OFFSETS map not an Array<u32>: {}", e);
+            return;
+        }
+    };
+
+    // (index, struct, member, effective-fallback)
+    // The effective-fallback values must match DEFAULT_*_OFFSET in probes/main.rs
+    // because the effective value (after the +8 adjustments below for nested
+    // struct path/qstr members) is what the probe will use if the map lookup
+    // returns the fallback.
+    let lookups: &[(u32, &str, &str, u32)] = &[
+        (0, "task_struct",  "exit_code",  1076),
+        (1, "linux_binprm", "file",       264),
+        (2, "file",         "f_path",     72),  // f_path.dentry = offsetof(file,f_path) + offsetof(path,dentry=8)
+        (3, "dentry",       "d_name",     40),  // d_name.name   = offsetof(dentry,d_name) + offsetof(qstr,name=8)
+        (4, "dentry",       "d_parent",   24),
+    ];
+
+    for (idx, st, memb, fallback) in lookups {
+        match struct_member_offset(&btf, st, memb) {
+            Ok(off) => {
+                // file.f_path.dentry is inside struct path { mnt; dentry; } — dentry is at +8.
+                // dentry.d_name.name is inside struct qstr { hash_len; name; } — name is at +8.
+                let effective = match (*st, *memb) {
+                    ("file",   "f_path") => off + 8,
+                    ("dentry", "d_name") => off + 8,
+                    _ => off,
+                };
+                if effective != *fallback {
+                    tracing::info!(
+                        "BTF offset drift: {}.{} = {} (fallback was {})",
+                        st, memb, effective, fallback
+                    );
+                } else {
+                    tracing::debug!("BTF offset {}.{} = {} (matches fallback)", st, memb, effective);
+                }
+                if let Err(e) = arr.set(*idx, effective, 0) {
+                    tracing::warn!("OFFSETS.set({}) failed: {}", idx, e);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "BTF lookup {}.{} failed: {} — probe will fall back to {}",
+                    st, memb, e, fallback
+                );
+            }
+        }
+    }
 }
 
 /// Populate BPF-LSM policy maps from the given security policy.
@@ -496,10 +747,12 @@ fn populate_policy_maps(
     // Collect keys first so we can insert into each map one at a time.
     // aya 0.13 requires exclusive access per map and cannot hold multiple
     // map handles simultaneously (borrow checker).
-    let mut file_deny:  Vec<[u8; 256]>                      = Vec::new();
-    let mut file_allow: Vec<[u8; 256]>                      = Vec::new();
-    let mut net_deny:   Vec<aya::maps::lpm_trie::Key<u32>>  = Vec::new();
-    let mut net_allow:  Vec<aya::maps::lpm_trie::Key<u32>>  = Vec::new();
+    let mut file_deny:   Vec<[u8; 256]>                          = Vec::new();
+    let mut file_allow:  Vec<[u8; 256]>                          = Vec::new();
+    let mut net_deny:    Vec<aya::maps::lpm_trie::Key<u32>>      = Vec::new();
+    let mut net_allow:   Vec<aya::maps::lpm_trie::Key<u32>>      = Vec::new();
+    let mut net6_deny:   Vec<aya::maps::lpm_trie::Key<[u8; 16]>> = Vec::new();
+    let mut net6_allow:  Vec<aya::maps::lpm_trie::Key<[u8; 16]>> = Vec::new();
 
     for rule in &policy.rules {
         match rule {
@@ -520,15 +773,23 @@ fn populate_policy_maps(
             PolicyRule::Network { dest, port: None, action } => {
                 // Port-specific rules can't be enforced per-port by CIDR LPM trie;
                 // those fall back to kill-on-detect.
-                match cidr_to_lpm_key(dest) {
-                    Ok(key) => match action {
+                //
+                // Try IPv4 first; on failure try IPv6. This keeps the existing
+                // v4 behaviour unchanged while adding v6 as a parallel path.
+                if let Ok(key) = cidr_to_lpm_key(dest) {
+                    match action {
                         PolicyAction::Deny  => net_deny.push(key),
                         PolicyAction::Allow => net_allow.push(key),
                         PolicyAction::Log   => {}
-                    },
-                    Err(e) => {
-                        tracing::warn!("Failed to parse CIDR '{}' for BPF-LSM map: {}", dest, e);
                     }
+                } else if let Ok(key) = cidr_to_lpm_key_v6(dest) {
+                    match action {
+                        PolicyAction::Deny  => net6_deny.push(key),
+                        PolicyAction::Allow => net6_allow.push(key),
+                        PolicyAction::Log   => {}
+                    }
+                } else {
+                    tracing::warn!("Failed to parse CIDR '{}' for BPF-LSM map (v4 and v6)", dest);
                 }
             }
             PolicyRule::Network { port: Some(_), .. } => {
@@ -578,6 +839,24 @@ fn populate_policy_maps(
             m.insert(&key, 1u8, 0)?;
         }
     }
+    {
+        let mut m: LpmTrie<_, [u8; 16], u8> =
+            LpmTrie::try_from(ebpf.map_mut("DENIED_NETS_V6").ok_or_else(|| {
+                anyhow::anyhow!("BPF map 'DENIED_NETS_V6' not found")
+            })?)?;
+        for key in net6_deny {
+            m.insert(&key, 1u8, 0)?;
+        }
+    }
+    {
+        let mut m: LpmTrie<_, [u8; 16], u8> =
+            LpmTrie::try_from(ebpf.map_mut("ALLOWED_NETS_V6").ok_or_else(|| {
+                anyhow::anyhow!("BPF map 'ALLOWED_NETS_V6' not found")
+            })?)?;
+        for key in net6_allow {
+            m.insert(&key, 1u8, 0)?;
+        }
+    }
 
     Ok(())
 }
@@ -623,6 +902,42 @@ fn cidr_to_lpm_key(cidr: &str) -> anyhow::Result<aya::maps::lpm_trie::Key<u32>> 
     Ok(aya::maps::lpm_trie::Key::new(prefix_len, masked.to_be()))
 }
 
+/// Convert an IPv6 CIDR string (e.g. "2001:db8::/32") to an aya LPM trie key.
+///
+/// The kernel's `bpf_lpm_trie_key` stores `prefix_len` followed by `data` in
+/// network byte order. IPv6 addresses are already in network byte order
+/// (16 raw bytes), so we pass them through unchanged after masking.
+#[cfg(target_os = "linux")]
+fn cidr_to_lpm_key_v6(cidr: &str) -> anyhow::Result<aya::maps::lpm_trie::Key<[u8; 16]>> {
+    let (net_str, prefix_len) = if let Some((net, bits)) = cidr.split_once('/') {
+        let bits: u32 = bits.parse().map_err(|_| anyhow::anyhow!("invalid prefix length in '{}'", cidr))?;
+        if bits > 128 {
+            return Err(anyhow::anyhow!("IPv6 prefix length >128 in '{}'", cidr));
+        }
+        (net, bits)
+    } else {
+        (cidr, 128u32)
+    };
+
+    let mut addr = super::policy::parse_ipv6(net_str)
+        .ok_or_else(|| anyhow::anyhow!("invalid IPv6 address in '{}'", cidr))?;
+
+    // Mask the address to the prefix length so "2001:db8::1/32" normalises to
+    // "2001:db8::/32". The LPM trie does longest-prefix match on the stored key,
+    // so unmasked host bits would leak into the match.
+    let full_bytes = (prefix_len / 8) as usize;
+    let rem_bits = (prefix_len % 8) as u8;
+    if full_bytes < 16 && rem_bits != 0 {
+        let mask = 0xFFu8 << (8 - rem_bits);
+        addr[full_bytes] &= mask;
+        for b in addr.iter_mut().skip(full_bytes + 1) { *b = 0; }
+    } else {
+        for b in addr.iter_mut().skip(full_bytes) { *b = 0; }
+    }
+
+    Ok(aya::maps::lpm_trie::Key::new(prefix_len, addr))
+}
+
 /// Parse a dotted-quad IPv4 address into a host-byte-order u32.
 #[cfg(target_os = "linux")]
 fn parse_ipv4_to_u32(s: &str) -> Option<u32> {
@@ -659,6 +974,7 @@ mod tests {
         let mut raw = RawSecurityEvent::zeroed();
         raw.kind = EventKind::Execve as u32;
         raw.pid = 42;
+        raw.uid = 1000;
         raw.timestamp_ns = 123456789;
         raw.comm[..4].copy_from_slice(b"bash");
         raw.path[..8].copy_from_slice(b"/bin/cat");
@@ -666,6 +982,7 @@ mod tests {
 
         let event = convert_raw_event(&raw).unwrap();
         assert_eq!(event.pid, 42);
+        assert_eq!(event.uid, 1000);
         assert_eq!(event.comm, "bash");
         if let SecurityEventKind::ProcessExec { binary, args, .. } = &event.kind {
             assert_eq!(binary, "/bin/cat");
@@ -718,6 +1035,26 @@ mod tests {
             assert_eq!(protocol, "tcp");
         } else {
             panic!("expected NetworkConnect");
+        }
+    }
+
+    #[test]
+    fn test_convert_connect_v6_event() {
+        let mut raw = RawSecurityEvent::zeroed();
+        raw.kind = EventKind::ConnectV6 as u32;
+        raw.pid = 201;
+        raw.comm[..4].copy_from_slice(b"curl");
+        // ::1 (loopback)
+        raw.dest_ip6[15] = 1;
+        raw.dest_port = 443;
+        raw.protocol = 6;
+
+        let event = convert_raw_event(&raw).unwrap();
+        if let SecurityEventKind::NetworkConnect { dest_ip, dest_port, .. } = &event.kind {
+            assert_eq!(dest_ip, "0:0:0:0:0:0:0:1");
+            assert_eq!(*dest_port, 443);
+        } else {
+            panic!("expected NetworkConnect for IPv6");
         }
     }
 
@@ -822,5 +1159,75 @@ mod tests {
         } else {
             panic!("expected ModuleLoad");
         }
+    }
+
+    #[test]
+    fn test_convert_ptrace_event() {
+        let mut raw = RawSecurityEvent::zeroed();
+        raw.kind = EventKind::Ptrace as u32;
+        raw.pid = 700;
+        raw.comm[..6].copy_from_slice(b"strace");
+        raw.flags = 16; // PTRACE_ATTACH
+        raw.aux = 42; // target pid
+
+        let event = convert_raw_event(&raw).unwrap();
+        if let SecurityEventKind::PtraceAttempt { request, target_pid } = &event.kind {
+            assert_eq!(*request, 16);
+            assert_eq!(*target_pid, 42);
+        } else {
+            panic!("expected PtraceAttempt");
+        }
+    }
+
+    #[test]
+    fn test_convert_unlink_event() {
+        let mut raw = RawSecurityEvent::zeroed();
+        raw.kind = EventKind::Unlink as u32;
+        raw.pid = 800;
+        raw.path[..15].copy_from_slice(b"/workspace/test");
+        raw.flags = 0;
+
+        let event = convert_raw_event(&raw).unwrap();
+        if let SecurityEventKind::FileDelete { path, flags } = &event.kind {
+            assert_eq!(path, "/workspace/test");
+            assert_eq!(*flags, 0);
+        } else {
+            panic!("expected FileDelete");
+        }
+    }
+
+    #[test]
+    fn test_convert_rename_event() {
+        let mut raw = RawSecurityEvent::zeroed();
+        raw.kind = EventKind::Rename as u32;
+        raw.pid = 900;
+        raw.path[..14].copy_from_slice(b"/workspace/old");
+        raw.args[..14].copy_from_slice(b"/workspace/new");
+        raw.flags = 0;
+
+        let event = convert_raw_event(&raw).unwrap();
+        if let SecurityEventKind::FileRename { old_path, new_path, flags } = &event.kind {
+            assert_eq!(old_path, "/workspace/old");
+            assert_eq!(new_path, "/workspace/new");
+            assert_eq!(*flags, 0);
+        } else {
+            panic!("expected FileRename");
+        }
+    }
+
+    #[test]
+    fn test_format_ipv6_loopback() {
+        let mut bytes = [0u8; 16];
+        bytes[15] = 1;
+        assert_eq!(format_ipv6(&bytes), "0:0:0:0:0:0:0:1");
+    }
+
+    #[test]
+    fn test_format_ipv6_full() {
+        let bytes: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        ];
+        assert_eq!(format_ipv6(&bytes), "2001:db8:0:0:0:0:0:1");
     }
 }

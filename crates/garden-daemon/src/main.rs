@@ -403,7 +403,10 @@ fn run_telemetry_receiver(engine: &'static Virtualizer) {
             })
             .unwrap_or_else(garden_ebpf::policy::SecurityPolicy::default_observe)
     };
-    let (broadcast_tx, _) = tokio::sync::broadcast::channel::<String>(256);
+    // Issue #9: Increased from 256 to 4096 — burst traffic (e.g., `ls -R`)
+    // can generate hundreds of events per second, causing lagged receivers
+    // to miss events at the old capacity.
+    let (broadcast_tx, _) = tokio::sync::broadcast::channel::<String>(4096);
 
     let logger = std::sync::Arc::new(
         event_log::EventLogger::new().expect("Failed to create session event log"),
