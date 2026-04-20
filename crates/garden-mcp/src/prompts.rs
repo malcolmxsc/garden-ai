@@ -13,7 +13,9 @@ use rmcp::model::{
     PromptMessage, PromptMessageRole,
 };
 
-use crate::resources::{find_latest_session_log, read_recent_events, read_violations};
+use crate::resources::{
+    find_latest_session_log, format_events_for_pid, read_recent_events, read_violations,
+};
 
 // ---------------------------------------------------------------------------
 // List prompts
@@ -167,35 +169,10 @@ fn prompt_investigate_process(pid: &str) -> GetPromptResult {
     let pid_u64: Option<u64> = pid.parse().ok();
 
     let events_text = match (find_latest_session_log(), pid_u64) {
-        (Some(path), Some(target_pid)) => {
-            use std::io::{BufRead, BufReader};
-            let file = match std::fs::File::open(&path) {
-                Ok(f) => f,
-                Err(e) => return error_result(&format!("Could not open log: {e}")),
-            };
-            let matching: Vec<String> = BufReader::new(file)
-                .lines()
-                .filter_map(|l| l.ok())
-                .filter(|line| {
-                    // Parse JSON to compare pid exactly — avoids "12" matching "123".
-                    serde_json::from_str::<serde_json::Value>(line)
-                        .ok()
-                        .and_then(|v| v["pid"].as_u64())
-                        .map(|p| p == target_pid)
-                        .unwrap_or(false)
-                })
-                .collect();
-
-            if matching.is_empty() {
-                format!("No events found for PID {pid} in the current session.")
-            } else {
-                format!(
-                    "Events for PID {pid} ({} total):\n\n{}",
-                    matching.len(),
-                    matching.join("\n")
-                )
-            }
-        }
+        (Some(path), Some(target_pid)) => match format_events_for_pid(&path, target_pid) {
+            Ok(text) => text,
+            Err(e) => return error_result(&format!("Could not open log: {e}")),
+        },
         (None, _) => {
             "No session log found. The Garden daemon may not have been started yet.".to_string()
         }

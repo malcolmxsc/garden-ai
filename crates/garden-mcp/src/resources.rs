@@ -12,7 +12,7 @@
 //! cannot be spoofed by a compromised guest VM.
 
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // URI constants
@@ -50,6 +50,35 @@ pub fn find_latest_session_log() -> Option<PathBuf> {
 
     candidates.sort_by(|a, b| b.0.cmp(&a.0));
     candidates.into_iter().next().map(|(_, path)| path)
+}
+
+/// Filter the NDJSON log at `path` to lines whose `"pid"` field matches `pid`,
+/// then render a human-readable summary. Returns an I/O error if the log
+/// cannot be opened; malformed individual lines are silently skipped.
+pub fn format_events_for_pid(path: &Path, pid: u64) -> std::io::Result<String> {
+    let file = std::fs::File::open(path)?;
+    let matching: Vec<String> = BufReader::new(file)
+        .lines()
+        .filter_map(|l| l.ok())
+        .filter(|line| {
+            // Parse JSON to compare pid exactly — avoids "12" matching "123".
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|v| v["pid"].as_u64())
+                .map(|p| p == pid)
+                .unwrap_or(false)
+        })
+        .collect();
+
+    Ok(if matching.is_empty() {
+        format!("No events found for PID {pid} in the current session.")
+    } else {
+        format!(
+            "Events for PID {pid} ({} total):\n\n{}",
+            matching.len(),
+            matching.join("\n")
+        )
+    })
 }
 
 /// Return the last `n` lines of a file.

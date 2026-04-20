@@ -238,8 +238,7 @@ impl GardenMcpServer {
         &self,
         Parameters(params): Parameters<InvestigateProcessParams>,
     ) -> String {
-        use crate::resources::find_latest_session_log;
-        use std::io::{BufRead, BufReader};
+        use crate::resources::{find_latest_session_log, format_events_for_pid};
 
         let pid: u64 = match params.pid.parse() {
             Ok(n) => n,
@@ -248,33 +247,10 @@ impl GardenMcpServer {
 
         match find_latest_session_log() {
             None => "No session log found. The Garden daemon may not have been started yet.".to_string(),
-            Some(path) => {
-                let file = match std::fs::File::open(&path) {
-                    Ok(f) => f,
-                    Err(e) => return format!("Could not open session log: {e}"),
-                };
-                let matching: Vec<String> = BufReader::new(file)
-                    .lines()
-                    .filter_map(|l| l.ok())
-                    .filter(|line| {
-                        serde_json::from_str::<serde_json::Value>(line)
-                            .ok()
-                            .and_then(|v| v["pid"].as_u64())
-                            .map(|p| p == pid)
-                            .unwrap_or(false)
-                    })
-                    .collect();
-
-                if matching.is_empty() {
-                    format!("No events found for PID {pid} in the current session.")
-                } else {
-                    format!(
-                        "Events for PID {pid} ({} total):\n\n{}",
-                        matching.len(),
-                        matching.join("\n")
-                    )
-                }
-            }
+            Some(path) => match format_events_for_pid(&path, pid) {
+                Ok(text) => text,
+                Err(e) => format!("Could not open session log: {e}"),
+            },
         }
     }
 }
