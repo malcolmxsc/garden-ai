@@ -158,59 +158,6 @@ fn fill_cpu_and_seq(event: &mut RawSecurityEvent) {
 // (no loops) to satisfy the BPF verifier.
 // ===========================================================================
 
-/// True if path starts with `/proc/` followed by a decimal digit.
-/// Matches `/proc/<pid>/...` while allowing `/proc/cpuinfo`, `/proc/sys/`, etc.
-#[inline(always)]
-fn path_starts_with_proc_pid(p: &[u8; 256]) -> bool {
-    p[0] == b'/' && p[1] == b'p' && p[2] == b'r' && p[3] == b'o'
-        && p[4] == b'c' && p[5] == b'/' && p[6] >= b'0' && p[6] <= b'9'
-}
-
-/// True if byte at `i` starts one of the known-dangerous `/proc/<pid>/` entries:
-/// `mem`, `maps`, `pagemap`, `smaps`, `fd/`
-#[inline(always)]
-fn is_proc_danger_at(p: &[u8; 256], i: usize) -> bool {
-    // "mem\0"
-    if p[i] == b'm' && p[i+1] == b'e' && p[i+2] == b'm'
-        && (p[i+3] == 0 || p[i+3] == b'/') { return true; }
-    // "maps\0"
-    if p[i] == b'm' && p[i+1] == b'a' && p[i+2] == b'p' && p[i+3] == b's'
-        && (p[i+4] == 0 || p[i+4] == b'/') { return true; }
-    // "pagemap\0"
-    if p[i] == b'p' && p[i+1] == b'a' && p[i+2] == b'g' && p[i+3] == b'e'
-        && p[i+4] == b'm' && p[i+5] == b'a' && p[i+6] == b'p'
-        && (p[i+7] == 0 || p[i+7] == b'/') { return true; }
-    // "smaps\0"
-    if p[i] == b's' && p[i+1] == b'm' && p[i+2] == b'a' && p[i+3] == b'p'
-        && p[i+4] == b's' && (p[i+5] == 0 || p[i+5] == b'/') { return true; }
-    // "fd/"
-    if p[i] == b'f' && p[i+1] == b'd' && p[i+2] == b'/' { return true; }
-    // "ns/" — namespace entries (/proc/<pid>/ns/ipc, /ns/mnt, etc.)
-    if p[i] == b'n' && p[i+1] == b's' && p[i+2] == b'/' { return true; }
-    false
-}
-
-/// Scan offsets 7..14 (covers PIDs with 1–7 digits) for a `/` followed by a
-/// dangerous proc file name.  Fully unrolled — verifier-friendly.
-#[inline(always)]
-fn path_has_proc_danger(p: &[u8; 256]) -> bool {
-    // pid length 1: slash at offset 7, file starts at 8
-    if p[7] == b'/' && is_proc_danger_at(p, 8)  { return true; }
-    // pid length 2: slash at offset 8
-    if p[8] == b'/' && is_proc_danger_at(p, 9)  { return true; }
-    // pid length 3
-    if p[9] == b'/' && is_proc_danger_at(p, 10) { return true; }
-    // pid length 4
-    if p[10] == b'/' && is_proc_danger_at(p, 11) { return true; }
-    // pid length 5
-    if p[11] == b'/' && is_proc_danger_at(p, 12) { return true; }
-    // pid length 6
-    if p[12] == b'/' && is_proc_danger_at(p, 13) { return true; }
-    // pid length 7
-    if p[13] == b'/' && is_proc_danger_at(p, 14) { return true; }
-    false
-}
-
 /// True if flags indicate write intent: O_WRONLY (1) or O_RDWR (2).
 #[inline(always)]
 fn has_write_intent(flags: u32) -> bool {

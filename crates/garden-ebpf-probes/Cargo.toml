@@ -6,7 +6,6 @@ description = "eBPF kernel-side probe programs for Garden AI security telemetry"
 
 [dependencies]
 aya-ebpf = "0.1"
-aya-log-ebpf = "0.1"
 garden-ebpf-common = { path = "../garden-ebpf-common" }
 
 [[bin]]
