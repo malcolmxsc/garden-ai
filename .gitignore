@@ -4,6 +4,8 @@ Cargo.lock
 
 # === Swift / Xcode ===
 garden-ui/build/
+garden-ui/.build/
+garden-ui/.swiftpm/
 garden-ui/DerivedData/
 garden-ui/**/*.xcuserdata
 garden-ui/**/*.xcworkspace
