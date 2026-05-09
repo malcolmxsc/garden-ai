@@ -78,7 +78,7 @@ final class TelemetryStream {
         reconnectTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(3))
             guard !Task.isCancelled else { return }
-            await self?.connect()
+            self?.connect()
         }
     }
 }

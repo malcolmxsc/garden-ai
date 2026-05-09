@@ -34,6 +34,7 @@
 #![no_main]
 
 use aya_ebpf::{
+    bindings::{file as KernelFile, linux_binprm},
     cty::c_long,
     helpers::{
         bpf_d_path, bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
@@ -92,7 +93,8 @@ const TCP_RATE_BUCKET: u64 = 1 << 20; // 1 MiB granularity.
 ///   2 = file.f_path.dentry
 ///   3 = dentry.d_name.name
 ///   4 = dentry.d_parent
-/// Indices 5–7 reserved for future use.
+///   5 = linux_binprm.filename
+/// Indices 6–7 reserved for future use.
 #[map]
 static OFFSETS: Array<u32> = Array::with_max_entries(8, 0);
 
@@ -101,6 +103,7 @@ const OFFSET_IDX_BPRM_FILE: u32 = 1;
 const OFFSET_IDX_FILE_DENTRY: u32 = 2;
 const OFFSET_IDX_DENTRY_NAME: u32 = 3;
 const OFFSET_IDX_DENTRY_D_PARENT: u32 = 4;
+const OFFSET_IDX_BPRM_FILENAME: u32 = 5;
 
 /// Look up a kernel struct field offset. Falls back to `default` if the
 /// userspace loader failed to populate the map (e.g., BTF missing).
@@ -224,11 +227,33 @@ fn path_starts_with_sys(p: &[u8; 256]) -> bool {
     p[0] == b'/' && p[1] == b's' && p[2] == b'y' && p[3] == b's' && p[4] == b'/'
 }
 
+/// True if the path contains a literal `..` path component: a `/..` sequence
+/// followed by `/` or end-of-string. Used to flag traversal-escape attempts.
+/// Bounded scan over the first 128 bytes — verifier-friendly.
+#[inline(always)]
+fn path_has_dotdot_segment(p: &[u8; 256]) -> bool {
+    let mut i: usize = 0;
+    while i < 125 {
+        if p[i] == 0 {
+            return false;
+        }
+        if p[i] == b'/' && p[i + 1] == b'.' && p[i + 2] == b'.' && (p[i + 3] == b'/' || p[i + 3] == 0) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// True if the last path component is a known privilege-escalation binary:
 /// su, sudo, newuidmap, newgidmap, pkexec, nsenter, unshare.
 /// Checks up to 64 bytes of the path for the last `/`.
 #[inline(always)]
 fn path_is_privesc_binary(p: &[u8; 256]) -> bool {
+    if p[0] == b's' && p[1] == b'u' && p[2] == 0 { return true; }
+    if p[0] == b's' && p[1] == b'u' && p[2] == b'd' && p[3] == b'o'
+        && p[4] == 0 { return true; }
+
     // Walk path forward to find last slash position (unrolled, max 64 bytes).
     let mut last_slash: usize = 0;
     // Fully unrolled scan of first 64 bytes; constant time for verifier.
@@ -389,22 +414,21 @@ fn try_trace_openat(ctx: &TracePointContext) -> Result<(), c_long> {
     let flags: u64 = unsafe { ctx.read_at(32)? };
     event.flags = flags as u32;
 
-    // Write-intent enforcement: kill processes writing outside safe paths.
-    // Expanded allowlist (fix #6): /etc/, /run/, /var/, /proc/, /sys/ are
-    // legitimate write targets for DHCP scripts, init, and system services.
+    // Hand off to lsm_file_open: stash the intent flags for this pid_tgid so
+    // the LSM hook can resolve the canonical path via bpf_d_path and enforce.
+    // We do not enforce here because the raw user path may be relative — only
+    // bpf_d_path (available in LSM hooks) gives the true target.
     if event.pid != 1 {
-        if has_write_intent(event.flags)
-            && !path_starts_with_workspace(&event.path)
-            && !path_starts_with_dev(&event.path)
-            && !path_starts_with_tmp(&event.path)
-            && !path_starts_with_proc_self(&event.path)
-            && !path_starts_with_etc(&event.path)
-            && !path_starts_with_run(&event.path)
-            && !path_starts_with_var(&event.path)
-            && !path_starts_with_proc(&event.path)
-            && !path_starts_with_sys(&event.path)
-        {
-            unsafe { bpf_send_signal(9) };
+        let mut intent: u8 = 0;
+        if path_starts_with_workspace(&event.path) && path_has_dotdot_segment(&event.path) {
+            intent |= INTENT_TRAVERSAL;
+        }
+        if has_write_intent(event.flags) {
+            intent |= INTENT_WRITE;
+        }
+        if intent != 0 {
+            let key = bpf_get_current_pid_tgid();
+            let _ = OPEN_INTENT.insert(&key, &intent, 0);
         }
     }
 
@@ -1083,6 +1107,9 @@ fn try_trace_udp_sendmsg(ctx: &ProbeContext) -> Result<(), c_long> {
 static PATH_SCRATCH: PerCpuArray<[u8; 256]> = PerCpuArray::with_max_entries(1, 0);
 
 #[map]
+static PATH_COMPONENT_SCRATCH: PerCpuArray<[u8; 256]> = PerCpuArray::with_max_entries(1, 0);
+
+#[map]
 static DENIED_PATHS: HashMap<[u8; 256], u8> = HashMap::with_max_entries(512, 0);
 
 #[map]
@@ -1102,7 +1129,24 @@ static DENIED_NETS_V6: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(256, 0)
 #[map]
 static ALLOWED_NETS_V6: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(256, 0);
 
+// Keyed by pid_tgid. Set by trace_openat to hand off "this open needs the
+// resolved path checked" to lsm_file_open. Value is a bitmask:
+//   bit 0 (INTENT_TRAVERSAL) — raw path was /workspace-rooted with a `..`
+//                              segment; verify resolved stays under /workspace.
+//   bit 1 (INTENT_WRITE)     — open has write flags; verify resolved lands in
+//                              a write-allowed directory (workspace, tmp, etc.).
+// lsm_file_open looks up once, calls bpf_d_path once, runs both checks.
+#[map]
+static OPEN_INTENT: HashMap<u64, u8> = HashMap::with_max_entries(4096, 0);
+
+const INTENT_TRAVERSAL: u8 = 1 << 0;
+const INTENT_WRITE: u8 = 1 << 1;
+
 const EPERM: i32 = 1;
+
+// file.f_path is an embedded struct path at offset 64 on aarch64 Linux 6.12.13
+// (dentry at offset 72 = f_path + 8). Passed as *mut path to bpf_d_path.
+const DEFAULT_FILE_F_PATH_OFFSET: u64 = 64;
 
 // Struct offsets for aarch64 Linux 6.12.13 — verified via /sys/kernel/btf/vmlinux.
 // Issue #13: resolved from BTF at load time. These defaults are for Linux
@@ -1110,7 +1154,11 @@ const EPERM: i32 = 1;
 const DEFAULT_FILE_DENTRY_OFFSET: u64 = 72;       // file.f_path.dentry (64 + 8)
 const DEFAULT_DENTRY_NAME_OFFSET: u64 = 40;       // dentry.d_name.name (32 + 8)
 const DEFAULT_DENTRY_D_PARENT_OFFSET: u64 = 24;   // dentry.d_parent
-const DEFAULT_BPRM_FILE_OFFSET: u64 = 264;        // linux_binprm.file
+const DEFAULT_BPRM_FILE_OFFSET: u64 = 64;         // linux_binprm.file
+const DEFAULT_BPRM_FILENAME_OFFSET: u64 = 96;     // linux_binprm.filename
+const MAX_DENTRY_DEPTH: u8 = 24;
+const MAX_PATH_COMPONENT_COPY: usize = 32;
+const MAX_PATH_KEY_COPY: usize = 32;
 
 // ---------------------------------------------------------------------------
 // LSM probe: file_open — synchronous enforcement for dangerous paths
@@ -1141,6 +1189,98 @@ fn read_dentry_parent(dentry_addr: u64) -> u64 {
         Ok(parent) if parent != 0 && parent != dentry_addr => parent,
         _ => 0,
     }
+}
+
+#[inline(always)]
+fn read_dentry_name_full(dentry_addr: u64, buf: &mut [u8; 256]) -> bool {
+    match unsafe {
+        bpf_probe_read_kernel((dentry_addr + offset_or(OFFSET_IDX_DENTRY_NAME, DEFAULT_DENTRY_NAME_OFFSET)) as *const u64)
+    } {
+        Ok(name_ptr) if name_ptr != 0 => {
+            let _ = unsafe { bpf_probe_read_kernel_str_bytes(name_ptr as *const u8, buf) };
+            buf[0] != 0
+        }
+        _ => false,
+    }
+}
+
+#[inline(always)]
+fn build_path_key_from_dentry(dentry_addr: u64, path_buf_ptr: *mut [u8; 256]) -> Result<(), c_long> {
+    let component_buf_ptr = PATH_COMPONENT_SCRATCH.get_ptr_mut(0).ok_or(1i64)?;
+    unsafe { core::ptr::write_bytes(path_buf_ptr as *mut u8, 0, 256) };
+
+    let path = path_buf_ptr as *mut u8;
+    let component = component_buf_ptr as *mut u8;
+
+    let mut current = dentry_addr;
+    let mut write_pos: usize = 255;
+    let mut saw_component = false;
+    let mut depth: u8 = 0;
+
+    while depth < MAX_DENTRY_DEPTH && current != 0 {
+        unsafe { core::ptr::write_bytes(component_buf_ptr as *mut u8, 0, 256) };
+        if read_dentry_name_full(current, unsafe { &mut *(component_buf_ptr as *mut [u8; 256]) }) {
+            let first = unsafe { core::ptr::read(component) };
+            let second = unsafe { core::ptr::read(component.add(1)) };
+            if !(first == b'/' && second == 0) {
+                let mut len: usize = 0;
+                while len < MAX_PATH_COMPONENT_COPY {
+                    if unsafe { core::ptr::read(component.add(len)) } == 0 {
+                        break;
+                    }
+                    len += 1;
+                }
+
+                if len > 0 {
+                    if len + 1 > write_pos {
+                        return Err(1i64);
+                    }
+
+                    write_pos -= len;
+                    let mut i: usize = 0;
+                    while i < MAX_PATH_COMPONENT_COPY {
+                        if i >= len {
+                            break;
+                        }
+                        unsafe {
+                            core::ptr::write(path.add(write_pos + i), core::ptr::read(component.add(i)));
+                        }
+                        i += 1;
+                    }
+                    write_pos -= 1;
+                    unsafe { core::ptr::write(path.add(write_pos), b'/') };
+                    saw_component = true;
+                }
+            }
+        }
+
+        let parent = read_dentry_parent(current);
+        if parent == 0 {
+            break;
+        }
+        current = parent;
+        depth += 1;
+    }
+
+    if !saw_component {
+        unsafe { core::ptr::write(path, b'/') };
+        return Ok(());
+    }
+
+    let start = write_pos;
+    let mut i: usize = 0;
+    while i < MAX_PATH_KEY_COPY {
+        let value;
+        if start + i < 256 {
+            value = unsafe { core::ptr::read(path.add(start + i)) };
+        } else {
+            value = 0;
+        }
+        unsafe { core::ptr::write(path.add(i), value) };
+        i += 1;
+    }
+
+    Ok(())
 }
 
 #[inline(always)]
@@ -1210,22 +1350,65 @@ fn name_is_pid(n: &[u8; 16]) -> bool {
 }
 
 #[inline(always)]
-fn name_is_proc(n: &[u8; 16]) -> bool {
-    n[0] == b'p' && n[1] == b'r' && n[2] == b'o' && n[3] == b'c' && n[4] == 0
-}
-
-#[inline(always)]
 fn name_is_fd_or_ns(n: &[u8; 16]) -> bool {
     (n[0] == b'f' && n[1] == b'd' && n[2] == 0) ||
     (n[0] == b'n' && n[1] == b's' && n[2] == 0)
 }
 
 fn try_lsm_file_open(ctx: &LsmContext) -> Result<i32, c_long> {
-    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u32;
     if pid == 1 { return Ok(0); }
 
     let file_addr: u64 = unsafe { ctx.arg(0) };
     if file_addr == 0 { return Ok(0); }
+
+    // Consume intent flags set by trace_openat and enforce them now that we
+    // have `struct file` and can resolve the canonical path via bpf_d_path.
+    // The tracepoint sees raw user paths (possibly relative, possibly with
+    // `..`); this hook is the only place the kernel gives us the true target.
+    let intent: u8 = match unsafe { OPEN_INTENT.get(&pid_tgid) } {
+        Some(v) => *v,
+        None => 0,
+    };
+    if intent != 0 {
+        let _ = OPEN_INTENT.remove(&pid_tgid);
+        let f_path_addr = file_addr + DEFAULT_FILE_F_PATH_OFFSET;
+        if let Some(buf_ptr) = unsafe { PATH_SCRATCH.get_ptr_mut(0) } {
+            unsafe { core::ptr::write_bytes(buf_ptr as *mut u8, 0, 256) };
+            let ret = unsafe {
+                bpf_d_path(f_path_addr as *mut _, buf_ptr as *mut u8, 256)
+            };
+            if ret > 0 {
+                let resolved = unsafe { &*(buf_ptr as *const [u8; 256]) };
+
+                // Traversal: raw path was /workspace-rooted with `..` — the
+                // canonical path must still stay under /workspace.
+                if (intent & INTENT_TRAVERSAL) != 0 && !path_starts_with_workspace(resolved) {
+                    unsafe { bpf_send_signal(9) };
+                    return Ok(-EPERM);
+                }
+
+                // Write-intent: the resolved target must land in a directory
+                // where writes are policy-allowed. Keeps the expanded fix #6
+                // allowlist (/etc, /run, /var, /proc, /sys for DHCP + init).
+                if (intent & INTENT_WRITE) != 0
+                    && !path_starts_with_workspace(resolved)
+                    && !path_starts_with_dev(resolved)
+                    && !path_starts_with_tmp(resolved)
+                    && !path_starts_with_proc_self(resolved)
+                    && !path_starts_with_etc(resolved)
+                    && !path_starts_with_run(resolved)
+                    && !path_starts_with_var(resolved)
+                    && !path_starts_with_proc(resolved)
+                    && !path_starts_with_sys(resolved)
+                {
+                    unsafe { bpf_send_signal(9) };
+                    return Ok(-EPERM);
+                }
+            }
+        }
+    }
 
     let d0 = match unsafe {
         bpf_probe_read_kernel((file_addr + offset_or(OFFSET_IDX_FILE_DENTRY, DEFAULT_FILE_DENTRY_OFFSET)) as *const u64)
@@ -1245,14 +1428,41 @@ fn try_lsm_file_open(ctx: &LsmContext) -> Result<i32, c_long> {
     let mut n2 = [0u8; 16];
     if d2 != 0 { read_dentry_name(d2, &mut n2); }
 
+    // For /proc/kallsyms and /proc/kcore the dentry walk cannot see a
+    // parent named "proc" because d_parent of a filesystem root dentry
+    // loops on itself (mount boundaries need vfsmount to cross). The
+    // filenames "kallsyms" and "kcore" are distinctive enough that a
+    // leaf-only match is acceptable in a sandbox — blocking a user file
+    // named literally "kallsyms" is a tolerable false positive.
+    //
+    // /dev leaf names like "mem" are too common for leaf-only matching,
+    // so we keep the parent check there (accept "dev" at n1 or n2 in
+    // case the walk crosses the devtmpfs root).
     let blocked = (name_is_pid(&n1) && is_proc_danger_name(&n0))
         || (name_is_pid(&n2) && name_is_fd_or_ns(&n1))
-        || (name_is_proc(&n1) && is_proc_sensitive_leaf(&n0))
-        || (name_is_dev(&n1) && is_dev_sensitive_leaf(&n0));
+        || is_proc_sensitive_leaf(&n0)
+        || ((name_is_dev(&n1) || name_is_dev(&n2)) && is_dev_sensitive_leaf(&n0));
 
     if blocked {
         unsafe { bpf_send_signal(9) };
         return Ok(-EPERM);
+    }
+
+    if let Some(path_buf_ptr) = PATH_SCRATCH.get_ptr_mut(0) {
+        unsafe { core::ptr::write_bytes(path_buf_ptr as *mut u8, 0, 256) };
+        let f_path_addr = file_addr + DEFAULT_FILE_F_PATH_OFFSET;
+        let ret = unsafe {
+            bpf_d_path(f_path_addr as *mut _, path_buf_ptr as *mut u8, 256)
+        };
+        if ret > 0 {
+            let path_key = unsafe { &*(path_buf_ptr as *const [u8; 256]) };
+            if unsafe { ALLOWED_PATHS.get(path_key) }.is_some() {
+                return Ok(0);
+            }
+            if unsafe { DENIED_PATHS.get(path_key) }.is_some() {
+                return Ok(-EPERM);
+            }
+        }
     }
 
     Ok(0)
@@ -1351,73 +1561,75 @@ pub fn lsm_bprm_check(ctx: LsmContext) -> i32 {
 }
 
 fn try_lsm_bprm_check(ctx: &LsmContext) -> Result<i32, c_long> {
-    let path_buf_ptr = unsafe { PATH_SCRATCH.get_ptr_mut(0).ok_or(1i64)? };
-    unsafe { core::ptr::write_bytes(path_buf_ptr as *mut u8, 0, 256) };
-
     // arg(0) is struct linux_binprm *bprm
-    let bprm_ptr: u64 = unsafe { ctx.arg(0) };
-    if bprm_ptr == 0 {
+    let bprm: *const linux_binprm = unsafe { ctx.arg(0) };
+    if bprm.is_null() {
         return Ok(0);
     }
 
-    // Walk bprm->file->f_path.dentry to get the actual binary path.
-    // bprm->file offset resolved dynamically from BTF (fallback 264 on aarch64 Linux 6.12).
-    let file_ptr: u64 = match unsafe {
-        bpf_probe_read_kernel((bprm_ptr + offset_or(OFFSET_IDX_BPRM_FILE, DEFAULT_BPRM_FILE_OFFSET)) as *const u64)
-    } {
-        Ok(f) if f != 0 => f,
-        _ => return Ok(0),
-    };
-
-    // Read the dentry from file->f_path.dentry
-    let dentry_ptr: u64 = match unsafe {
-        bpf_probe_read_kernel((file_ptr + offset_or(OFFSET_IDX_FILE_DENTRY, DEFAULT_FILE_DENTRY_OFFSET)) as *const u64)
-    } {
-        Ok(d) if d != 0 => d,
-        _ => return Ok(0),
-    };
-
-    // Read the filename from dentry->d_name.name into scratch buffer
-    let name_ptr: u64 = match unsafe {
-        bpf_probe_read_kernel((dentry_ptr + offset_or(OFFSET_IDX_DENTRY_NAME, DEFAULT_DENTRY_NAME_OFFSET)) as *const u64)
-    } {
-        Ok(p) if p != 0 => p,
-        _ => return Ok(0),
-    };
-
-    let path_slice = unsafe { &mut *(path_buf_ptr as *mut [u8; 256]) };
-    let _ = unsafe { bpf_probe_read_kernel_str_bytes(name_ptr as *const u8, path_slice) };
-
-    // For DENIED_PATHS lookup, we need the full path. Since we only have the
-    // basename from the dentry, we build a simple /basename key. This works for
-    // policies that deny by basename (e.g., /su, /sudo). Full-path policies
-    // with directory prefixes won't match here — they're handled by the
-    // kill-on-detect fallback in the perf event loop + privesc binary check.
-    //
-    // Build key: prepend "/" to make it look like a path for map lookup
-    let mut lookup_key = [0u8; 256];
-    lookup_key[0] = b'/';
-    // Copy up to 254 bytes of the basename after the leading "/"
-    let mut i: usize = 0;
-    while i < 254 {
-        let c = path_slice[i];
-        if c == 0 { break; }
-        lookup_key[i + 1] = c;
-        i += 1;
+    if let Some(filename_buf_ptr) = PATH_COMPONENT_SCRATCH.get_ptr_mut(0) {
+        unsafe { core::ptr::write_bytes(filename_buf_ptr as *mut u8, 0, 256) };
+        let filename_ptr: u64 = match unsafe {
+            bpf_probe_read_kernel(
+                (bprm as *const u8)
+                    .add(offset_or(OFFSET_IDX_BPRM_FILENAME, DEFAULT_BPRM_FILENAME_OFFSET) as usize)
+                    as *const u64,
+            )
+        } {
+            Ok(ptr) => ptr,
+            _ => 0,
+        };
+        if filename_ptr != 0 {
+            let filename_key = unsafe { &mut *(filename_buf_ptr as *mut [u8; 256]) };
+            let _ = unsafe { bpf_probe_read_kernel_str_bytes(filename_ptr as *const u8, filename_key) };
+            if path_is_privesc_binary(filename_key) {
+                let event = get_scratch_event().ok_or(1i64)?;
+                event.kind = EventKind::Execve as u32;
+                fill_common(event)?;
+                event.path.copy_from_slice(filename_key);
+                let _ = EVENTS.output(event, 0);
+                return Ok(-EPERM);
+            }
+        }
     }
+
+    // Walk bprm->file->f_path to get the actual binary path.
+    //
+    // Keep this as direct constant-offset pointer access. Reading the field via
+    // bpf_probe_read_kernel turns the result into a scalar address, and the
+    // verifier then rejects bpf_d_path because it requires a trusted path ptr.
+    let file_ptr = unsafe {
+        core::ptr::read(
+            (bprm as *const u8).add(DEFAULT_BPRM_FILE_OFFSET as usize) as *const *const KernelFile
+        )
+    };
+    if file_ptr.is_null() {
+        return Ok(0);
+    }
+
+    let path_buf_ptr = PATH_SCRATCH.get_ptr_mut(0).ok_or(1i64)?;
+    unsafe { core::ptr::write_bytes(path_buf_ptr as *mut u8, 0, 256) };
+    let f_path_addr = unsafe {
+        (file_ptr as *const u8).add(DEFAULT_FILE_F_PATH_OFFSET as usize)
+    };
+    let ret = unsafe {
+        bpf_d_path(f_path_addr as *mut _, path_buf_ptr as *mut u8, 256)
+    };
+    if ret <= 0 {
+        return Ok(0);
+    }
+    let path_key = unsafe { &*(path_buf_ptr as *const [u8; 256]) };
 
     // Check privesc binary list inline — this catches the common cases
     // regardless of map contents.
-    if path_is_privesc_binary(&lookup_key) {
+    if path_is_privesc_binary(path_key) {
         let event = get_scratch_event().ok_or(1i64)?;
         event.kind = EventKind::Execve as u32;
         fill_common(event)?;
-        event.path.copy_from_slice(&lookup_key);
+        event.path.copy_from_slice(path_key);
         let _ = EVENTS.output(event, 0);
         return Ok(-EPERM);
     }
-
-    let path_key = unsafe { &*(path_buf_ptr as *const [u8; 256]) };
 
     if unsafe { ALLOWED_PATHS.get(path_key) }.is_some() {
         return Ok(0);

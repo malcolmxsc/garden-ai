@@ -14,7 +14,7 @@ use std::fs;
 use std::io;
 
 /// BTF header magic (little-endian reading).
-const BTF_MAGIC: u16 = 0xeB9F;
+const BTF_MAGIC: u16 = 0xEB9F;
 
 /// BPF_KIND_STRUCT — we only look up structs.
 const BTF_KIND_STRUCT: u32 = 4;
@@ -213,7 +213,7 @@ mod tests {
 
     #[test]
     fn truncated_rejected() {
-        let bad = vec![0x9F, 0xeB, 1, 0];
+        let bad = vec![0x9F, 0xEB, 1, 0];
         assert!(matches!(
             struct_member_offset(&bad, "task_struct", "exit_code"),
             Err(BtfError::Truncated)

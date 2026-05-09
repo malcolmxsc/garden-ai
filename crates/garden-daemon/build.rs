@@ -20,7 +20,7 @@ fn main() {
     // The `cc` crate assumes we are using a C compiler and passes flags like `-O0` 
     // which swiftc doesn't understand. By invoking it manually, we control the exact flags.
     let status = Command::new("swiftc")
-        .args(&[
+        .args([
             "-emit-library", // We want to output a library
             "-static",       // Specifically a static library
             "-emit-objc-header",
@@ -52,7 +52,7 @@ fn main() {
     // Swift's runtime libraries live in /usr/lib/swift on macOS, but the binary
     // needs an LC_RPATH entry to locate them (macOS SIP strips DYLD_LIBRARY_PATH).
     let swift_runtime_paths = Command::new("swift")
-        .args(&["-print-target-info"])
+        .args(["-print-target-info"])
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())

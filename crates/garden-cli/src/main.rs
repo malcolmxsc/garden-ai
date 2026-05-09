@@ -70,6 +70,16 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// Debug-only: execute a command through the agent privileged-exec endpoint.
+    #[command(name = "debug-run-privileged", hide = true)]
+    DebugRunPrivileged {
+        /// The command to execute
+        command: String,
+
+        /// Arguments to the command
+        args: Vec<String>,
+    },
+
     /// Show the status of running sandboxes
     Status,
 
@@ -161,53 +171,10 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Run { command, args } => {
-            // ----------------------------------------------------
-            // VirtioFS Secure Sandbox Validation
-            // ----------------------------------------------------
-            // The macOS host only shares ~/GardenBox with the guest VM.
-            // We must enforce that the user runs the CLI from inside this directory.
-            let sandbox_root = dirs::home_dir()
-                .expect("Could not find home directory")
-                .join("GardenBox");
-                
-            let cwd = std::env::current_dir().unwrap_or_default();
-            
-            if !cwd.starts_with(&sandbox_root) {
-                eprintln!("❌ Security Violation: garden commands can only run inside the secure sandbox.");
-                eprintln!("   Your current directory is: {}", cwd.display());
-                eprintln!("   Please cd into: {}", sandbox_root.display());
-                std::process::exit(1);
-            }
-            
-            // Calculate the relative path from the sandbox root.
-            // e.g. ~/GardenBox/my_project/src -> my_project/src
-            let relative_cwd = cwd.strip_prefix(&sandbox_root)
-                .unwrap_or(std::path::Path::new(""))
-                .to_string_lossy()
-                .to_string();
-
-            tracing::info!(command = %command, args = ?args, cwd = %relative_cwd, "Connecting to Micro-VM Agent...");
-            
-            // Connect to the daemon's local TCP proxy which forwards to the
-            // guest agent via vSock. No guest IP discovery needed!
-            let mut client = garden_common::ipc::agent_service_client::AgentServiceClient::connect("http://127.0.0.1:10000").await?;
-            
-            let request = tonic::Request::new(garden_common::ipc::CommandRequest {
-                command,
-                args,
-                cwd: relative_cwd,
-            });
-
-            tracing::info!("Executing Remote Procedure Call...");
-            let response = client.execute_command(request).await?.into_inner();
-            
-            println!("🌿 Command executed. Exit Code: {}", response.exit_code);
-            if !response.stdout.is_empty() {
-                println!("--- STDOUT ---\n{}", String::from_utf8_lossy(&response.stdout));
-            }
-            if !response.stderr.is_empty() {
-                println!("--- STDERR ---\n{}", String::from_utf8_lossy(&response.stderr));
-            }
+            run_agent_command(command, args, false).await?;
+        }
+        Commands::DebugRunPrivileged { command, args } => {
+            run_agent_command(command, args, true).await?;
         }
         Commands::Status => {
             tracing::info!("Querying sandbox status...");
@@ -283,6 +250,70 @@ async fn main() -> anyhow::Result<()> {
             garden_mcp::server::start_server(garden_mcp::server::McpServerConfig::default())
                 .await?;
         }
+    }
+
+    Ok(())
+}
+
+async fn run_agent_command(command: String, args: Vec<String>, privileged: bool) -> anyhow::Result<()> {
+    // ----------------------------------------------------
+    // VirtioFS Secure Sandbox Validation
+    // ----------------------------------------------------
+    // The macOS host only shares ~/GardenBox with the guest VM.
+    // We must enforce that the user runs the CLI from inside this directory.
+    let sandbox_root = dirs::home_dir()
+        .expect("Could not find home directory")
+        .join("GardenBox");
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+
+    if !cwd.starts_with(&sandbox_root) {
+        eprintln!("❌ Security Violation: garden commands can only run inside the secure sandbox.");
+        eprintln!("   Your current directory is: {}", cwd.display());
+        eprintln!("   Please cd into: {}", sandbox_root.display());
+        std::process::exit(1);
+    }
+
+    // Calculate the relative path from the sandbox root.
+    // e.g. ~/GardenBox/my_project/src -> my_project/src
+    let relative_cwd = cwd
+        .strip_prefix(&sandbox_root)
+        .unwrap_or(std::path::Path::new(""))
+        .to_string_lossy()
+        .to_string();
+
+    tracing::info!(
+        command = %command,
+        args = ?args,
+        cwd = %relative_cwd,
+        privileged = privileged,
+        "Connecting to Micro-VM Agent..."
+    );
+
+    // Connect to the daemon's local TCP proxy which forwards to the
+    // guest agent via vSock. No guest IP discovery needed.
+    let mut client =
+        garden_common::ipc::agent_service_client::AgentServiceClient::connect("http://127.0.0.1:10000").await?;
+
+    let request = tonic::Request::new(garden_common::ipc::CommandRequest {
+        command,
+        args,
+        cwd: relative_cwd,
+    });
+
+    tracing::info!("Executing Remote Procedure Call...");
+    let response = if privileged {
+        client.execute_privileged_command(request).await?.into_inner()
+    } else {
+        client.execute_command(request).await?.into_inner()
+    };
+
+    println!("🌿 Command executed. Exit Code: {}", response.exit_code);
+    if !response.stdout.is_empty() {
+        println!("--- STDOUT ---\n{}", String::from_utf8_lossy(&response.stdout));
+    }
+    if !response.stderr.is_empty() {
+        println!("--- STDERR ---\n{}", String::from_utf8_lossy(&response.stderr));
     }
 
     Ok(())

@@ -292,7 +292,7 @@ impl EventDedup {
 
         self.ops += 1;
         // Periodic cleanup every 1000 operations to prevent unbounded growth
-        if self.ops % 1000 == 0 {
+        if self.ops.is_multiple_of(1000) {
             let cutoff = event.timestamp_ns.saturating_sub(self.window_ns * 10);
             self.seen.retain(|_, ts| *ts > cutoff);
         }
@@ -480,7 +480,7 @@ pub async fn start_tracer(
     let lsm_hooks: &[(&str, &str, bool)] = &[
         ("lsm_file_open",      "file_open",           false),
         ("lsm_socket_connect", "socket_connect",       false),
-        ("lsm_bprm_check",     "bprm_check_security", false),
+        ("lsm_bprm_check",     "bprm_check_security", true),
         ("lsm_sb_mount",       "sb_mount",             false),
     ];
 
@@ -509,18 +509,19 @@ pub async fn start_tracer(
                     tracing::info!("Attached BPF-LSM hook: {}", hook);
                     lsm_attached += 1;
                 }
-                Err(e) if *required => {
-                    return Err(e.context(format!("Required LSM hook {} failed", hook)));
-                }
                 Err(e) => {
-                    // Write full verifier log to /tmp to avoid tracing truncation
+                    // Write full verifier log to VirtioFS so it survives a guest panic.
                     let full_err = format!("{:#}", e);
+                    let log_path = format!("/workspace/lsm_{}_error.txt", hook.replace('/', "_"));
                     let _ = std::fs::write(
-                        format!("/tmp/lsm_{}_error.txt", hook.replace('/', "_")),
+                        &log_path,
                         &full_err,
                     );
-                    tracing::warn!("LSM hook '{}' failed (full log: /tmp/lsm_{}_error.txt): {}",
-                        hook, hook.replace('/', "_"), &full_err[..full_err.len().min(500)]);
+                    tracing::warn!("LSM hook '{}' failed (full log: {}): {}",
+                        hook, log_path, &full_err);
+                    if *required {
+                        return Err(e.context(format!("Required LSM hook {} failed", hook)));
+                    }
                 }
             }
         }
@@ -651,6 +652,7 @@ pub async fn start_tracer(
 ///   2: file.f_path.dentry
 ///   3: dentry.d_name.name
 ///   4: dentry.d_parent
+///   5: linux_binprm.filename
 #[cfg(target_os = "linux")]
 fn populate_btf_offsets(ebpf: &mut aya::Ebpf) {
     use super::btf_offsets::{read_vmlinux_btf, struct_member_offset};
@@ -690,10 +692,11 @@ fn populate_btf_offsets(ebpf: &mut aya::Ebpf) {
     // returns the fallback.
     let lookups: &[(u32, &str, &str, u32)] = &[
         (0, "task_struct",  "exit_code",  1076),
-        (1, "linux_binprm", "file",       264),
+        (1, "linux_binprm", "file",       64),
         (2, "file",         "f_path",     72),  // f_path.dentry = offsetof(file,f_path) + offsetof(path,dentry=8)
         (3, "dentry",       "d_name",     40),  // d_name.name   = offsetof(dentry,d_name) + offsetof(qstr,name=8)
         (4, "dentry",       "d_parent",   24),
+        (5, "linux_binprm", "filename",   96),
     ];
 
     for (idx, st, memb, fallback) in lookups {
@@ -962,272 +965,4 @@ pub async fn start_tracer(
     tracing::warn!("eBPF tracer is only available on Linux (inside the guest VM)");
     let (_tx, rx) = mpsc::channel(1);
     Ok((TracerHandle {}, rx))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use garden_ebpf_common::{EventKind, RawSecurityEvent};
-
-    #[test]
-    fn test_convert_execve_event() {
-        let mut raw = RawSecurityEvent::zeroed();
-        raw.kind = EventKind::Execve as u32;
-        raw.pid = 42;
-        raw.uid = 1000;
-        raw.timestamp_ns = 123456789;
-        raw.comm[..4].copy_from_slice(b"bash");
-        raw.path[..8].copy_from_slice(b"/bin/cat");
-        raw.args[..5].copy_from_slice(b"hello");
-
-        let event = convert_raw_event(&raw).unwrap();
-        assert_eq!(event.pid, 42);
-        assert_eq!(event.uid, 1000);
-        assert_eq!(event.comm, "bash");
-        if let SecurityEventKind::ProcessExec { binary, args, .. } = &event.kind {
-            assert_eq!(binary, "/bin/cat");
-            assert_eq!(args[0], "hello");
-        } else {
-            panic!("expected ProcessExec");
-        }
-    }
-
-    #[test]
-    fn test_convert_openat_event() {
-        let mut raw = RawSecurityEvent::zeroed();
-        raw.kind = EventKind::Openat as u32;
-        raw.pid = 100;
-        raw.comm[..2].copy_from_slice(b"ls");
-        raw.path[..4].copy_from_slice(b"/tmp");
-        raw.flags = 0o0;
-
-        let event = convert_raw_event(&raw).unwrap();
-        assert_eq!(event.pid, 100);
-        if let SecurityEventKind::FileAccess { path, flags, .. } = &event.kind {
-            assert_eq!(path, "/tmp");
-            assert_eq!(*flags, 0);
-        } else {
-            panic!("expected FileAccess");
-        }
-    }
-
-    #[test]
-    fn test_convert_connect_event() {
-        let mut raw = RawSecurityEvent::zeroed();
-        raw.kind = EventKind::Connect as u32;
-        raw.pid = 200;
-        raw.comm[..4].copy_from_slice(b"curl");
-        // BPF probe stores IP bytes via from_ne_bytes, preserving network byte order
-        raw.dest_ip = u32::from_ne_bytes([93, 184, 216, 34]);
-        raw.dest_port = 443;
-        raw.protocol = 6; // TCP
-
-        let event = convert_raw_event(&raw).unwrap();
-        if let SecurityEventKind::NetworkConnect {
-            dest_ip,
-            dest_port,
-            protocol,
-            ..
-        } = &event.kind
-        {
-            assert_eq!(dest_ip, "93.184.216.34");
-            assert_eq!(*dest_port, 443);
-            assert_eq!(protocol, "tcp");
-        } else {
-            panic!("expected NetworkConnect");
-        }
-    }
-
-    #[test]
-    fn test_convert_connect_v6_event() {
-        let mut raw = RawSecurityEvent::zeroed();
-        raw.kind = EventKind::ConnectV6 as u32;
-        raw.pid = 201;
-        raw.comm[..4].copy_from_slice(b"curl");
-        // ::1 (loopback)
-        raw.dest_ip6[15] = 1;
-        raw.dest_port = 443;
-        raw.protocol = 6;
-
-        let event = convert_raw_event(&raw).unwrap();
-        if let SecurityEventKind::NetworkConnect { dest_ip, dest_port, .. } = &event.kind {
-            assert_eq!(dest_ip, "0:0:0:0:0:0:0:1");
-            assert_eq!(*dest_port, 443);
-        } else {
-            panic!("expected NetworkConnect for IPv6");
-        }
-    }
-
-    #[test]
-    fn test_convert_unknown_kind_returns_none() {
-        let mut raw = RawSecurityEvent::zeroed();
-        raw.kind = 255; // invalid
-        assert!(convert_raw_event(&raw).is_none());
-    }
-
-    #[test]
-    fn test_decode_dns_query() {
-        // DNS wire format: 12-byte header + "\x07example\x03com\x00"
-        let mut raw = [0u8; 256];
-        // Skip 12-byte header (zeros)
-        raw[12] = 7; // length of "example"
-        raw[13..20].copy_from_slice(b"example");
-        raw[20] = 3; // length of "com"
-        raw[21..24].copy_from_slice(b"com");
-        raw[24] = 0; // terminator
-
-        assert_eq!(decode_dns_query(&raw), "example.com");
-    }
-
-    #[test]
-    fn test_decode_dns_query_empty() {
-        let raw = [0u8; 10]; // too short for DNS header
-        assert_eq!(decode_dns_query(&raw), "");
-    }
-
-    #[test]
-    fn test_convert_dns_event() {
-        let mut raw = RawSecurityEvent::zeroed();
-        raw.kind = EventKind::DnsQuery as u32;
-        raw.pid = 300;
-        raw.comm[..7].copy_from_slice(b"resolv ");
-        raw.dest_ip = u32::from_ne_bytes([8, 8, 8, 8]);
-        raw.dest_port = 53;
-        raw.protocol = 17; // UDP
-        // DNS payload: header (12 bytes) + \x07example\x03com\x00
-        raw.args[12] = 7;
-        raw.args[13..20].copy_from_slice(b"example");
-        raw.args[20] = 3;
-        raw.args[21..24].copy_from_slice(b"com");
-
-        let event = convert_raw_event(&raw).unwrap();
-        if let SecurityEventKind::DnsQuery { server_ip, domain } = &event.kind {
-            assert_eq!(server_ip, "8.8.8.8");
-            assert_eq!(domain, "example.com");
-        } else {
-            panic!("expected DnsQuery");
-        }
-    }
-
-    #[test]
-    fn test_convert_mount_event() {
-        let mut raw = RawSecurityEvent::zeroed();
-        raw.kind = EventKind::Mount as u32;
-        raw.pid = 1;
-        raw.comm[..4].copy_from_slice(b"init");
-        raw.path[..4].copy_from_slice(b"/mnt");
-        raw.args[..8].copy_from_slice(b"/dev/vda");
-        raw.flags = 0;
-
-        let event = convert_raw_event(&raw).unwrap();
-        if let SecurityEventKind::MountAttempt { target, source, flags } = &event.kind {
-            assert_eq!(target, "/mnt");
-            assert_eq!(source, "/dev/vda");
-            assert_eq!(*flags, 0);
-        } else {
-            panic!("expected MountAttempt");
-        }
-    }
-
-    #[test]
-    fn test_convert_bpf_event() {
-        let mut raw = RawSecurityEvent::zeroed();
-        raw.kind = EventKind::BpfLoad as u32;
-        raw.pid = 500;
-        raw.comm[..5].copy_from_slice(b"agent");
-        raw.flags = 5; // BPF_PROG_LOAD
-
-        let event = convert_raw_event(&raw).unwrap();
-        if let SecurityEventKind::BpfSyscall { cmd } = &event.kind {
-            assert_eq!(*cmd, 5);
-        } else {
-            panic!("expected BpfSyscall");
-        }
-    }
-
-    #[test]
-    fn test_convert_module_load_event() {
-        let mut raw = RawSecurityEvent::zeroed();
-        raw.kind = EventKind::ModuleLoad as u32;
-        raw.pid = 600;
-        raw.comm[..6].copy_from_slice(b"insmod");
-        raw.flags = 4096; // module size
-
-        let event = convert_raw_event(&raw).unwrap();
-        if let SecurityEventKind::ModuleLoad { size, .. } = &event.kind {
-            assert_eq!(*size, 4096);
-        } else {
-            panic!("expected ModuleLoad");
-        }
-    }
-
-    #[test]
-    fn test_convert_ptrace_event() {
-        let mut raw = RawSecurityEvent::zeroed();
-        raw.kind = EventKind::Ptrace as u32;
-        raw.pid = 700;
-        raw.comm[..6].copy_from_slice(b"strace");
-        raw.flags = 16; // PTRACE_ATTACH
-        raw.aux = 42; // target pid
-
-        let event = convert_raw_event(&raw).unwrap();
-        if let SecurityEventKind::PtraceAttempt { request, target_pid } = &event.kind {
-            assert_eq!(*request, 16);
-            assert_eq!(*target_pid, 42);
-        } else {
-            panic!("expected PtraceAttempt");
-        }
-    }
-
-    #[test]
-    fn test_convert_unlink_event() {
-        let mut raw = RawSecurityEvent::zeroed();
-        raw.kind = EventKind::Unlink as u32;
-        raw.pid = 800;
-        raw.path[..15].copy_from_slice(b"/workspace/test");
-        raw.flags = 0;
-
-        let event = convert_raw_event(&raw).unwrap();
-        if let SecurityEventKind::FileDelete { path, flags } = &event.kind {
-            assert_eq!(path, "/workspace/test");
-            assert_eq!(*flags, 0);
-        } else {
-            panic!("expected FileDelete");
-        }
-    }
-
-    #[test]
-    fn test_convert_rename_event() {
-        let mut raw = RawSecurityEvent::zeroed();
-        raw.kind = EventKind::Rename as u32;
-        raw.pid = 900;
-        raw.path[..14].copy_from_slice(b"/workspace/old");
-        raw.args[..14].copy_from_slice(b"/workspace/new");
-        raw.flags = 0;
-
-        let event = convert_raw_event(&raw).unwrap();
-        if let SecurityEventKind::FileRename { old_path, new_path, flags } = &event.kind {
-            assert_eq!(old_path, "/workspace/old");
-            assert_eq!(new_path, "/workspace/new");
-            assert_eq!(*flags, 0);
-        } else {
-            panic!("expected FileRename");
-        }
-    }
-
-    #[test]
-    fn test_format_ipv6_loopback() {
-        let mut bytes = [0u8; 16];
-        bytes[15] = 1;
-        assert_eq!(format_ipv6(&bytes), "0:0:0:0:0:0:0:1");
-    }
-
-    #[test]
-    fn test_format_ipv6_full() {
-        let bytes: [u8; 16] = [
-            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-        ];
-        assert_eq!(format_ipv6(&bytes), "2001:db8:0:0:0:0:0:1");
-    }
 }

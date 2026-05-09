@@ -55,9 +55,7 @@ pub(crate) fn normalize_path(path: &str) -> String {
         match part {
             "" | "." => continue,
             ".." => {
-                if absolute {
-                    stack.pop();
-                } else if stack.last().map(|s| *s != "..").unwrap_or(false) {
+                if absolute || stack.last().is_some_and(|s| *s != "..") {
                     stack.pop();
                 } else {
                     stack.push("..");
@@ -224,14 +222,49 @@ fn detect_violation(event: &SecurityEvent) -> Option<Violation> {
             })
         }
 
+        // Path traversal: raw path contains `..` segments that resolve
+        // outside /workspace. The eBPF probe emits the pre-lookup string
+        // from the openat syscall, so traversal attempts sneak past any
+        // prefix check on the raw path. Canonicalize here and flag when
+        // the resolved target escapes the workspace. In-kernel d_path
+        // would be stricter (catches symlink traversal too) but is a
+        // separate probe rework.
+        SecurityEventKind::FileAccess { path, .. }
+            if event.pid != 1 && {
+                let has_dotdot = path.split('/').any(|seg| seg == "..");
+                if !has_dotdot {
+                    false
+                } else {
+                    let norm = normalize_path(path);
+                    !(norm == "/workspace" || norm.starts_with("/workspace/"))
+                }
+            } =>
+        {
+            Some(Violation {
+                severity: "high",
+                rule: "path_traversal_attempt",
+                message: format!(
+                    "process '{}' (pid {}) used path traversal at '{}' (resolves to '{}')",
+                    event.comm, event.pid, path, normalize_path(path)
+                ),
+            })
+        }
+
         // Gap 2: write-intent open outside /workspace.
+        // Only fires on absolute paths — relative paths cannot be resolved
+        // from the string alone (the actual target depends on the process's
+        // cwd, which the tracepoint doesn't capture), and the in-kernel
+        // LSM hook now enforces the true canonical target via bpf_d_path.
+        // So for relative paths we trust the kernel: if it made it past the
+        // LSM hook, the resolved target was inside an allowlisted directory.
         // Normalize before prefix-check so `/workspace/../etc/shadow` is
         // not accidentally allowlisted by the literal `/workspace` prefix.
         SecurityEventKind::FileAccess { path, flags, .. }
-            if event.pid != 1 && is_write_intent(*flags) && {
+            if event.pid != 1 && is_write_intent(*flags) && path.starts_with('/') && {
                 let norm = normalize_path(path);
-                !(norm == "/workspace" || norm.starts_with("/workspace/"))
-                    && !is_allowed_device_write(&norm)
+                !(norm == "/workspace"
+                    || norm.starts_with("/workspace/")
+                    || is_allowed_device_write(&norm))
             } =>
         {
             Some(Violation {
@@ -876,6 +909,25 @@ mod tests {
     }
 
     #[test]
+    fn test_relative_path_write_not_flagged() {
+        // Relative paths cannot be resolved from the string alone — the true
+        // target depends on cwd, which the tracepoint doesn't capture. The
+        // in-kernel LSM hook now enforces canonical-path policy, so if a
+        // write event with a relative path made it out of the kernel, the
+        // resolved target was inside an allowlist. Don't false-flag here.
+        let ev = make_event(
+            119,
+            "sh",
+            SecurityEventKind::FileAccess {
+                path: "write_test.txt".into(),
+                flags: 1, // O_WRONLY
+                allowed: true,
+            },
+        );
+        assert!(detect_violation(&ev).is_none());
+    }
+
+    #[test]
     fn test_tmp_write_allowed() {
         let ev = make_event(
             50,
@@ -903,6 +955,8 @@ mod tests {
 
     #[test]
     fn test_path_traversal_not_allowlisted_as_workspace() {
+        // Write-mode traversal escapes workspace — the traversal rule
+        // fires first (more specific signal than a plain write_outside).
         let ev = make_event(
             50,
             "sh",
@@ -913,7 +967,39 @@ mod tests {
             },
         );
         let v = detect_violation(&ev).expect("traversal should be flagged");
-        assert_eq!(v.rule, "write_outside_workspace");
+        assert_eq!(v.rule, "path_traversal_attempt");
+    }
+
+    #[test]
+    fn test_read_traversal_fires_when_escaping_workspace() {
+        let ev = make_event(
+            50,
+            "sh",
+            SecurityEventKind::FileAccess {
+                path: "/workspace/../init".into(),
+                flags: 0, // O_RDONLY
+                allowed: true,
+            },
+        );
+        let v = detect_violation(&ev).expect("read traversal escaping workspace should fire");
+        assert_eq!(v.rule, "path_traversal_attempt");
+        assert_eq!(v.severity, "high");
+    }
+
+    #[test]
+    fn test_dotdot_staying_within_workspace_is_not_flagged() {
+        // `/workspace/a/../b` normalizes to `/workspace/b` — legitimate
+        // relative lookup, not an escape attempt.
+        let ev = make_event(
+            50,
+            "sh",
+            SecurityEventKind::FileAccess {
+                path: "/workspace/a/../b".into(),
+                flags: 0,
+                allowed: true,
+            },
+        );
+        assert!(detect_violation(&ev).is_none());
     }
 
     #[test]

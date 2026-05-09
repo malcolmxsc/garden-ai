@@ -166,10 +166,13 @@ final class AppState: ObservableObject {
             daemonReachable = true
 
             if status.running {
+                // Always snap to daemon truth so the counter survives daemon
+                // restarts, VM reboots, and clock drift. Local timer ticks
+                // between polls for smooth animation.
+                uptimeSeconds = Int(status.uptime_seconds)
                 if vmState == .stopped || vmState == .error {
                     // Terminal did `garden boot` while UI wasn't watching — reattach
                     vmState = .running
-                    uptimeSeconds = Int(status.uptime_seconds)
                     startUptimeTimer()
                     startTelemetryStream()
                     withAnimation(.easeIn) { wakeFlash = true }

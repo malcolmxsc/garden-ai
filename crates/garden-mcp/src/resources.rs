@@ -59,7 +59,7 @@ pub fn format_events_for_pid(path: &Path, pid: u64) -> std::io::Result<String> {
     let file = std::fs::File::open(path)?;
     let matching: Vec<String> = BufReader::new(file)
         .lines()
-        .filter_map(|l| l.ok())
+        .map_while(Result::ok)
         .filter(|line| {
             // Parse JSON to compare pid exactly — avoids "12" matching "123".
             serde_json::from_str::<serde_json::Value>(line)
@@ -89,7 +89,7 @@ fn tail_lines(path: &PathBuf, n: usize) -> Vec<String> {
     };
     let lines: Vec<String> = BufReader::new(file)
         .lines()
-        .filter_map(|l| l.ok())
+        .map_while(Result::ok)
         .collect();
     let start = lines.len().saturating_sub(n);
     lines[start..].to_vec()
@@ -269,7 +269,7 @@ pub fn read_violations() -> String {
             // The log serialises violations as `"violation":{...}` (never `null`).
             let violation_lines: Vec<String> = BufReader::new(file)
                 .lines()
-                .filter_map(|l| l.ok())
+                .map_while(Result::ok)
                 .filter(|l| l.contains(r#""violation":{"#))
                 .collect();
 

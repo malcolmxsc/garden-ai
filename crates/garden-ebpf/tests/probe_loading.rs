@@ -173,6 +173,6 @@ mod macos_tests {
             rx.try_recv().is_err(),
             "stub tracer should not produce events"
         );
-        drop(handle);
+        let _ = handle;
     }
 }

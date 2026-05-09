@@ -424,8 +424,8 @@ fn run_telemetry_receiver(engine: &'static Virtualizer) {
             let vsock_fd = match engine.connect_vsock(6001) {
                 Ok(fd) => fd,
                 Err(e) => {
-                    eprintln!("📊 Telemetry connect failed: {}, retrying in 2s...", e);
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    eprintln!("📊 Telemetry connect failed: {}, retrying in 100ms...", e);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
             };
@@ -441,9 +441,9 @@ fn run_telemetry_receiver(engine: &'static Virtualizer) {
             let stream = match VsockStream::new(vsock_fd) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("📊 VsockStream error: {}, retrying...", e);
+                    eprintln!("📊 VsockStream error: {}, retrying in 100ms...", e);
                     unsafe { libc::close(vsock_fd); }
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
             };
@@ -451,8 +451,8 @@ fn run_telemetry_receiver(engine: &'static Virtualizer) {
             // Read NDJSON lines, evaluate policy, log to session file, and broadcast
             process_telemetry_stream(stream, &policy, &broadcast_tx, logger.clone()).await;
 
-            println!("📊 Telemetry connection lost, reconnecting in 2s...");
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            println!("📊 Telemetry connection lost, reconnecting in 500ms...");
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     });
 }

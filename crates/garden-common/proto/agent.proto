@@ -6,6 +6,10 @@ package garden.agent.v1;
 service AgentService {
     // Executes a shell command inside the Alpine Linux Micro-VM
     rpc ExecuteCommand(CommandRequest) returns (CommandResponse);
+
+    // Debug-only privileged command execution. Production agents return
+    // PERMISSION_DENIED unless built with the debug privileged-exec feature.
+    rpc ExecutePrivilegedCommand(CommandRequest) returns (CommandResponse);
     
     // Checks the health of the Guest Agent
     rpc GetStatus(StatusRequest) returns (StatusResponse);

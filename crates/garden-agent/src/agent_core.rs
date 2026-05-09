@@ -13,6 +13,38 @@ use tonic::{transport::Server, Request, Response, Status};
 
 use tokio_stream::StreamExt;
 
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
+
+// PIDs currently owned by tokio::process::Child handles. The orphan reaper
+// must NOT call waitpid() on these — doing so steals the zombie before
+// tokio's SIGCHLD handler can observe the exit, leaving tokio's wait()
+// blocked forever. Observed when an eBPF LSM hook SIGKILLs a command's
+// child during execute_command: the 1-second reaper tick would race and
+// win, hanging the gRPC handler permanently.
+fn managed_pids() -> &'static Mutex<HashSet<i32>> {
+    static S: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+struct ManagedPidGuard(Option<i32>);
+impl ManagedPidGuard {
+    fn new(pid: Option<u32>) -> Self {
+        let pid = pid.map(|p| p as i32);
+        if let Some(p) = pid {
+            managed_pids().lock().unwrap().insert(p);
+        }
+        Self(pid)
+    }
+}
+impl Drop for ManagedPidGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.0 {
+            managed_pids().lock().unwrap().remove(&p);
+        }
+    }
+}
+
 // =====================================================================
 // PID 1 Signal Safety
 // =====================================================================
@@ -105,6 +137,131 @@ impl GardenAgentImpl {
             seccomp_filter,
         }
     }
+
+    async fn run_command_request(
+        &self,
+        req: CommandRequest,
+        privileged_debug: bool,
+    ) -> Result<Response<CommandResponse>, Status> {
+        // Ensure cwd is relative to the sandbox and prevents traversal
+        let relative_cwd = req.cwd.trim_start_matches('/');
+        if relative_cwd.contains("..") {
+            tracing::error!("Path traversal attempt blocked: cwd={}", req.cwd);
+            return Err(Status::invalid_argument("Path traversal ('..') is not allowed inside the sandbox"));
+        }
+
+        let target_cwd = std::path::Path::new("/workspace").join(relative_cwd);
+        let cwd_str = target_cwd.to_string_lossy();
+        let mode = if privileged_debug { "privileged-debug" } else { "sandboxed" };
+
+        tracing::info!(
+            "Executing {} command: {} {:?} (cwd={})",
+            mode,
+            req.command,
+            req.args,
+            cwd_str
+        );
+
+        // Use tokio::process::Command for non-blocking child process management.
+        // This integrates with tokio's reactor and handles waitpid internally.
+        let mut command = tokio::process::Command::new(&req.command);
+        command
+            .args(&req.args)
+            .current_dir(&target_cwd)
+            .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        // Normal user commands are constrained by uid/gid drop and seccomp. The
+        // privileged debug endpoint deliberately skips this block so diagnostics
+        // can inspect BPF state in debug builds.
+        #[cfg(target_os = "linux")]
+        if !privileged_debug {
+            let filter = self.seccomp_filter.clone();
+            unsafe {
+                command.pre_exec(move || {
+                    // Drop to uid/gid 1000 (unprivileged user) before exec.
+                    // setgid must come before setuid — once we drop uid we can't setgid.
+                    nix::unistd::setgid(nix::unistd::Gid::from_raw(1000))
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
+                    nix::unistd::setuid(nix::unistd::Uid::from_raw(1000))
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
+                    seccompiler::apply_filter(&filter)
+                        .map_err(|e| std::io::Error::other(e.to_string()))
+                });
+            }
+        }
+
+        // Spawn explicitly so we can register the pid with the managed-pid set
+        // (so the orphan reaper leaves it alone) and drive reads/wait under a
+        // timeout guard.
+        let mut child = command.spawn().map_err(|e| {
+            tracing::error!("Failed to spawn '{}': {:?}", req.command, e);
+            Status::internal(format!("Failed to execute process: {}", e))
+        })?;
+        let _guard = ManagedPidGuard::new(child.id());
+
+        let mut stdout_pipe = child.stdout.take();
+        let mut stderr_pipe = child.stderr.take();
+
+        let collect = async {
+            use tokio::io::AsyncReadExt;
+            let mut stdout_buf = Vec::new();
+            let mut stderr_buf = Vec::new();
+            let read_out = async {
+                if let Some(p) = stdout_pipe.as_mut() {
+                    p.read_to_end(&mut stdout_buf).await?;
+                }
+                Ok::<_, std::io::Error>(())
+            };
+            let read_err = async {
+                if let Some(p) = stderr_pipe.as_mut() {
+                    p.read_to_end(&mut stderr_buf).await?;
+                }
+                Ok::<_, std::io::Error>(())
+            };
+            let (_, _, status) = tokio::try_join!(read_out, read_err, child.wait())?;
+            Ok::<_, std::io::Error>((status, stdout_buf, stderr_buf))
+        };
+
+        // Ceiling on command duration. Prevents a zombie pipe (e.g. a
+        // grandchild inheriting the pipe after its parent is killed) from
+        // wedging the handler permanently.
+        const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+        let (status, stdout, stderr) = match tokio::time::timeout(COMMAND_TIMEOUT, collect).await {
+            Ok(Ok(triple)) => triple,
+            Ok(Err(e)) => {
+                tracing::error!("I/O error running '{}': {:?}", req.command, e);
+                return Err(Status::internal(format!("Process I/O error: {}", e)));
+            }
+            Err(_) => {
+                if let Some(pid) = _guard.0 {
+                    unsafe { libc::kill(pid, libc::SIGKILL); }
+                }
+                tracing::error!("Command '{}' exceeded {}s timeout", req.command, COMMAND_TIMEOUT.as_secs());
+                return Err(Status::deadline_exceeded(format!(
+                    "command exceeded {}s timeout", COMMAND_TIMEOUT.as_secs()
+                )));
+            }
+        };
+
+        let response = CommandResponse {
+            exit_code: status.code().unwrap_or_else(|| {
+                use std::os::unix::process::ExitStatusExt;
+                status.signal().map(|s| 128 + s).unwrap_or(-1)
+            }),
+            stdout,
+            stderr,
+        };
+
+        tracing::info!(
+            "{} command '{}' exited with code {}",
+            mode,
+            req.command,
+            response.exit_code
+        );
+        Ok(Response::new(response))
+    }
 }
 
 impl Default for GardenAgentImpl {
@@ -182,65 +339,31 @@ impl AgentService for GardenAgentImpl {
         &self,
         request: Request<CommandRequest>,
     ) -> Result<Response<CommandResponse>, Status> {
-        let req = request.into_inner();
-        
-        // Ensure cwd is relative to the sandbox and prevents traversal
-        let relative_cwd = req.cwd.trim_start_matches('/');
-        if relative_cwd.contains("..") {
-            tracing::error!("Path traversal attempt blocked: cwd={}", req.cwd);
-            return Err(Status::invalid_argument("Path traversal ('..') is not allowed inside the sandbox"));
-        }
-        
-        let target_cwd = std::path::Path::new("/workspace").join(relative_cwd);
-        let cwd_str = target_cwd.to_string_lossy();
-        
-        tracing::info!("Executing command: {} {:?} (cwd={})", req.command, req.args, cwd_str);
+        self.run_command_request(request.into_inner(), false).await
+    }
 
-        // Use tokio::process::Command for non-blocking child process management.
-        // This integrates with tokio's reactor and handles waitpid internally.
-        let mut command = tokio::process::Command::new(&req.command);
-        command
-            .args(&req.args)
-            .current_dir(&target_cwd)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-
-        // Apply the seccomp baseline filter and drop root privileges in the child
-        // process. pre_exec runs after fork() but before exec(), so changes here
-        // only affect the child — the agent itself keeps uid 0 for eBPF and mount ops.
-        #[cfg(target_os = "linux")]
+    async fn execute_privileged_command(
+        &self,
+        request: Request<CommandRequest>,
+    ) -> Result<Response<CommandResponse>, Status> {
+        #[cfg(feature = "debug-privileged-exec")]
         {
-            let filter = self.seccomp_filter.clone();
-            unsafe {
-                command.pre_exec(move || {
-                    // Drop to uid/gid 1000 (unprivileged user) before exec.
-                    // setgid must come before setuid — once we drop uid we can't setgid.
-                    nix::unistd::setgid(nix::unistd::Gid::from_raw(1000))
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
-                    nix::unistd::setuid(nix::unistd::Uid::from_raw(1000))
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
-                    seccompiler::apply_filter(&filter)
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-                });
-            }
+            let req = request.into_inner();
+            tracing::warn!(
+                "DEBUG privileged exec requested: {} {:?}",
+                req.command,
+                req.args
+            );
+            self.run_command_request(req, true).await
         }
 
-        let output = command
-            .output()
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to execute '{}': {:?}", req.command, e);
-                Status::internal(format!("Failed to execute process: {}", e))
-            })?;
-
-        let response = CommandResponse {
-            exit_code: output.status.code().unwrap_or(-1),
-            stdout: output.stdout,
-            stderr: output.stderr,
-        };
-
-        tracing::info!("Command '{}' exited with code {}", req.command, response.exit_code);
-        Ok(Response::new(response))
+        #[cfg(not(feature = "debug-privileged-exec"))]
+        {
+            let _ = request;
+            Err(Status::permission_denied(
+                "privileged exec is disabled; rebuild garden-agent with --features debug-privileged-exec",
+            ))
+        }
     }
 
     async fn get_status(
@@ -372,18 +495,37 @@ async fn async_main() -> anyhow::Result<()> {
     tokio::spawn(async {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            // Reap all available zombies (non-blocking)
+            // Peek (WNOWAIT) at any waitable child, skip if tokio owns it,
+            // otherwise consume it with a targeted waitpid(pid). Peeking
+            // first prevents racing tokio::process::Child::wait() — see
+            // the managed_pids() comment at the top of this file.
             loop {
-                let pid = unsafe {
-                    libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG)
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                let rc = unsafe {
+                    libc::waitid(
+                        libc::P_ALL,
+                        0,
+                        &mut info,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
                 };
-                if pid <= 0 { break; } // 0 = no zombies, -1 = error/ECHILD
-                tracing::debug!("Reaped orphan zombie pid={}", pid);
+                if rc != 0 { break; } // -1 (no children) or error
+                let pid = unsafe { info.si_pid() };
+                if pid == 0 { break; } // no waitable child
+                if managed_pids().lock().unwrap().contains(&pid) {
+                    // Leave it for tokio's SIGCHLD handler.
+                    break;
+                }
+                let reaped = unsafe {
+                    libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG)
+                };
+                if reaped <= 0 { break; }
+                tracing::debug!("Reaped orphan zombie pid={}", reaped);
             }
         }
     });
 
-    // 3.5. Mount debugfs and bpffs for eBPF tracepoint attachment
+    // 3.5. Mount debugfs, bpffs, and securityfs for eBPF tracepoint attachment
     // =========================================================
     let _ = std::fs::create_dir_all("/sys/kernel/debug");
     let _ = std::process::Command::new("/bin/busybox")
@@ -393,7 +535,11 @@ async fn async_main() -> anyhow::Result<()> {
     let _ = std::process::Command::new("/bin/busybox")
         .args(["mount", "-t", "bpf", "bpf", "/sys/fs/bpf"])
         .status();
-    tracing::info!("Mounted debugfs and bpffs for eBPF");
+    let _ = std::fs::create_dir_all("/sys/kernel/security");
+    let _ = std::process::Command::new("/bin/busybox")
+        .args(["mount", "-t", "securityfs", "securityfs", "/sys/kernel/security"])
+        .status();
+    tracing::info!("Mounted debugfs, bpffs, and securityfs");
 
     // 3.6. Start eBPF security tracer
     // =========================================================
@@ -417,6 +563,21 @@ async fn async_main() -> anyhow::Result<()> {
         }
     };
 
+    // Open the telemetry vSock listener BEFORE starting the tracer so the host
+    // daemon can establish its connection (queued in the kernel accept backlog)
+    // while probes are still attaching. Eliminates the cold-start drain where
+    // events fire into the mpsc before the listener fd exists.
+    let telemetry_listener_fd = match create_vsock_listener(6001) {
+        Ok(fd) => {
+            tracing::info!("Telemetry vSock listener ready on port 6001 (pre-tracer)");
+            Some(fd)
+        }
+        Err(e) => {
+            tracing::error!("Failed to create telemetry vSock listener on port 6001: {}", e);
+            None
+        }
+    };
+
     match garden_ebpf::tracer::start_tracer(policy).await {
         Ok((handle, mut rx)) => {
             tracing::info!("eBPF tracer started successfully");
@@ -437,14 +598,10 @@ async fn async_main() -> anyhow::Result<()> {
             tokio::spawn(async move {
                 use tokio::io::AsyncWriteExt;
 
-                let listener_fd = match create_vsock_listener(6001) {
-                    Ok(fd) => fd,
-                    Err(e) => {
-                        tracing::error!("Failed to create telemetry vSock listener on port 6001: {}", e);
-                        return;
-                    }
+                let listener_fd = match telemetry_listener_fd {
+                    Some(fd) => fd,
+                    None => return,
                 };
-                tracing::info!("Telemetry vSock listener ready on port 6001");
 
                 // Make the listener non-blocking for async accept
                 unsafe {
@@ -460,8 +617,25 @@ async fn async_main() -> anyhow::Result<()> {
                 };
 
                 loop {
-                    // Wait for a readable event (incoming connection)
+                    // Eager-accept loop. The listener fd is opened BEFORE start_tracer,
+                    // so the host daemon may have connected (and been queued in the
+                    // kernel accept backlog) BEFORE this AsyncFd was registered with
+                    // tokio's epoll. Edge-triggered epoll only fires on transitions —
+                    // an already-pending connection won't generate a readiness event,
+                    // so we must try accept() once immediately, and only then fall
+                    // back to waiting on readable().
                     let conn_fd = loop {
+                        let fd = unsafe {
+                            libc::accept(listener_fd, std::ptr::null_mut(), std::ptr::null_mut())
+                        };
+                        if fd >= 0 {
+                            break fd;
+                        }
+                        let err = std::io::Error::last_os_error();
+                        if err.kind() != std::io::ErrorKind::WouldBlock {
+                            tracing::warn!("Accept error: {}", err);
+                        }
+
                         match listener_async.readable().await {
                             Ok(mut guard) => {
                                 let fd = unsafe {
@@ -523,8 +697,11 @@ async fn async_main() -> anyhow::Result<()> {
             });
         }
         Err(e) => {
-            tracing::error!("Failed to start eBPF tracer (non-fatal): {}", e);
-            tracing::warn!("Continuing without security telemetry");
+            tracing::error!("Failed to start eBPF tracer: {}", e);
+            if let Some(fd) = telemetry_listener_fd {
+                unsafe { libc::close(fd); }
+            }
+            std::process::exit(1);
         }
     }
 

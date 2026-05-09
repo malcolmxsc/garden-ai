@@ -106,7 +106,7 @@ impl PolicyRule {
                     dest_ip, dest_port, ..
                 },
             ) => {
-                if cidr_match(dest, dest_ip) && port.map_or(true, |p| p == *dest_port) {
+                if cidr_match(dest, dest_ip) && port.is_none_or(|p| p == *dest_port) {
                     Some(*action)
                 } else {
                     None
@@ -281,9 +281,7 @@ pub(crate) fn parse_ipv6(s: &str) -> Option<[u8; 16]> {
         let zeros_needed = 8 - left_count - right_count;
         let mut expanded = Vec::with_capacity(8);
         expanded.extend_from_slice(&groups[..left_count]);
-        for _ in 0..zeros_needed {
-            expanded.push(0);
-        }
+        expanded.extend(std::iter::repeat_n(0u16, zeros_needed));
         expanded.extend_from_slice(&groups[left_count..]);
         groups = expanded;
     }

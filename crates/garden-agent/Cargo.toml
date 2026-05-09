@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+debug-privileged-exec = []
+
 [dependencies]
 tokio = { version = "1.37", features = ["full"] }
 tracing = "0.1"

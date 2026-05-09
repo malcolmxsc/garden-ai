@@ -91,10 +91,8 @@ pub async fn dispatch_get_prompt(
                 .and_then(|v| {
                     if let Some(s) = v.as_str() {
                         Some(s.to_string())
-                    } else if let Some(n) = v.as_u64() {
-                        Some(n.to_string())
                     } else {
-                        None
+                        v.as_u64().map(|n| n.to_string())
                     }
                 })
                 .or(pid);

@@ -53,6 +53,12 @@ pub struct GardenMcpServer {
     tool_router: ToolRouter<Self>,
 }
 
+impl Default for GardenMcpServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GardenMcpServer {
     pub fn new() -> Self {
         Self {
@@ -62,7 +68,7 @@ impl GardenMcpServer {
     }
 
     /// Return a connected gRPC client, connecting now if not yet connected.
-    async fn client(&self) -> std::result::Result<tokio::sync::MutexGuard<'_, Option<AgentServiceClient<Channel>>>, String> {
+    async fn client<'a>(&'a self) -> std::result::Result<tokio::sync::MutexGuard<'a, Option<AgentServiceClient<Channel>>>, String> {
         let mut guard = self.grpc_client.lock().await;
         if guard.is_none() {
             match AgentServiceClient::connect("http://127.0.0.1:10000").await {
