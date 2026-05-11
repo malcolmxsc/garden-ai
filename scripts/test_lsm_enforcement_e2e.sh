@@ -106,11 +106,14 @@ if ! (cd "$GARDEN_BOX" && "${GARDEN_CLI[@]}" boot >"$BOOT_OUT" 2>&1); then
 fi
 rm -f "$BOOT_OUT"
 
-# Poll for tracer success or explicit failure rather than a fixed sleep, so
-# we get the fastest feedback for both outcomes. Cap at 30s.
+# Poll for full agent readiness — vSock listener up AND tracer attached —
+# or explicit failure. The previous version polled only on the
+# "Attached 4/4 BPF-LSM hooks" log line, which fires ~2ms BEFORE the
+# agent opens its vSock listener. Polling on the listener line tightens
+# the race. Cap at 30s.
 TRACER_STATUS=""
 for _ in $(seq 1 30); do
-  if grep -q "Attached 4/4 BPF-LSM hooks" "$DAEMON_LOG"; then
+  if grep -q "AgentService listening on vSock port 6000" "$DAEMON_LOG"; then
     TRACER_STATUS="ready"
     break
   fi
@@ -118,40 +121,57 @@ for _ in $(seq 1 30); do
     TRACER_STATUS="failed"
     break
   fi
+  if grep -q "Kernel panic" "$DAEMON_LOG"; then
+    TRACER_STATUS="failed"
+    break
+  fi
   sleep 1
 done
 
 if [[ "$TRACER_STATUS" == "failed" ]]; then
-  echo "FAIL: tracer reported startup failure"
-  grep -E "BPF-LSM|Attached|Failed to start" "$DAEMON_LOG"
+  echo "FAIL: tracer reported startup failure or guest kernel panic"
+  grep -E "BPF-LSM|Attached|Failed to start|Kernel panic" "$DAEMON_LOG"
   exit 9
 elif [[ "$TRACER_STATUS" != "ready" ]]; then
-  echo "FAIL: tracer did not reach 4/4 BPF-LSM hooks within 30s"
-  grep -E "BPF-LSM|Attached" "$DAEMON_LOG"
+  echo "FAIL: agent vSock listener did not come up within 30s"
+  grep -E "BPF-LSM|Attached|AgentService" "$DAEMON_LOG"
   exit 10
 fi
+
+grep -q "Attached 4/4 BPF-LSM hooks" "$DAEMON_LOG" \
+  || { echo "FAIL: agent ready but not 4/4 LSM hooks"; grep -E "BPF-LSM|Attached" "$DAEMON_LOG"; exit 10; }
 
 for hook in file_open socket_connect bprm_check_security sb_mount; do
   grep -q "Attached BPF-LSM hook: $hook" "$DAEMON_LOG" \
     || { echo "FAIL: $hook not attached"; exit 11; }
 done
 
-OUT="$(cd "$GARDEN_BOX" && "${GARDEN_CLI[@]}" run cat /sys/kernel/security/lsm 2>&1)"
+# Small settling pause: the agent's "AgentService listening on vSock port 6000"
+# log line is emitted before the listener has fully started accepting in
+# tokio's scheduler. Without this, the first garden run can still race the
+# accept loop and get ECONNREFUSED through the daemon's TCP→vSock proxy.
+sleep 2
+
+# Note on `|| true`: `OUT="$(cmd)"` under `set -e` exits the script
+# silently if the command inside `$( )` returns non-zero. Append || true
+# so we always reach the grep-and-FAIL line below, where the assertion
+# can surface a real error message.
+OUT="$(cd "$GARDEN_BOX" && "${GARDEN_CLI[@]}" run cat /sys/kernel/security/lsm 2>&1)" || true
 echo "$OUT" | grep -qE '(^|,)bpf(,|$|[[:space:]])' \
   || { echo "FAIL: bpf not in active LSM list. Output: $OUT"; exit 16; }
 
 OUT="$(cd "$GARDEN_BOX" && "${GARDEN_CLI[@]}" run sh -- -c \
-  'ln -sf /bin/busybox ./su && ./su; echo "rc=$?"' 2>&1)"
+  'ln -sf /bin/busybox ./su && ./su; echo "rc=$?"' 2>&1)" || true
 echo "$OUT" | grep -qE 'rc=([1-9][0-9]*)' \
   || { echo "FAIL: ./su was not denied. Output: $OUT"; exit 12; }
 
 OUT="$(cd "$GARDEN_BOX" && "${GARDEN_CLI[@]}" run sh -- -c \
-  'cat /proc/self/maps; echo "rc=$?"' 2>&1)"
+  'cat /proc/self/maps; echo "rc=$?"' 2>&1)" || true
 echo "$OUT" | grep -qE 'rc=([1-9][0-9]*)' \
   || { echo "FAIL: /proc/self/maps was not denied. Output: $OUT"; exit 13; }
 
 OUT="$(cd "$GARDEN_BOX" && "${GARDEN_CLI[@]}" run sh -- -c \
-  'cat /proc/version; echo "rc=$?"' 2>&1)"
+  'cat /proc/version; echo "rc=$?"' 2>&1)" || true
 echo "$OUT" | grep -q 'rc=0' \
   || { echo "FAIL: /proc/version blocked or errored. Output: $OUT"; exit 14; }
 echo "$OUT" | grep -q 'Linux version' \
