@@ -14,9 +14,9 @@
 |---|---|---|---|---|
 | 1 | `DENIED_PATHS` / `ALLOWED_PATHS` keys never match in `lsm_bprm_check` | **Critical** | Bug — feature appears to work but doesn't | Resolved |
 | 2 | `lsm_file_open` never consults `DENIED_PATHS` | **Critical** | Feature gap | Resolved |
-| 3 | Glob patterns silently dropped from BPF maps | **High** | Misleading API | Open |
-| 4 | Three silent fail-open paths during startup (BTF, attach, syscall) | **High** | Operational opacity | Partial — bprm_check only (see Finding 9) |
-| 5 | Per-hook `Err(_) => 0` fail-open inside every LSM wrapper | **Medium** | Defensible but worth knowing | Open |
+| 3 | Glob patterns silently dropped from BPF maps | **High** | Misleading API | Partial — log-only (warn-level surfaced; LpmTrie prefix-match still pending) |
+| 4 | Three silent fail-open paths during startup (BTF, attach, syscall) | **High** | Operational opacity | Resolved |
+| 5 | Per-hook `Err(_) => 0` fail-open inside every LSM wrapper | **Medium** | Defensible but worth knowing | Resolved |
 | 6 | Zero test coverage for any `-EPERM` deny path | **High** | Quality | Resolved (e2e test) |
 | 7 | `BPF_LINK_CREATE` syscall implementation | **OK** | Verified correct | n/a |
 | 8 | Deny verdict ABI (`Ok(-EPERM)`, `bpf_send_signal(9)`) | **OK** | Verified correct | n/a |
@@ -251,6 +251,10 @@ Errors come from `bpf_probe_read_kernel` failures, scratch-map (`PerCpuArray`) l
 
 Not necessarily a fix — fail-open is reasonable here — but the failure should at minimum be **counted**. Add a `PerCpuArray<u64>` counter for `lsm_*_error_count` and surface it via the same telemetry stream as events. An operator can then see "enforcement is reporting 1000 errors/sec" instead of inferring it from absent denials.
 
+### Resolution
+
+Resolved by adding `LSM_ERROR_COUNTS` and changing all four BPF-LSM wrapper error arms to fail closed with `-EPERM`: [crates/garden-ebpf-probes/src/main.rs:1132](crates/garden-ebpf-probes/src/main.rs#L1132), [crates/garden-ebpf-probes/src/main.rs:1185](crates/garden-ebpf-probes/src/main.rs#L1185), [crates/garden-ebpf-probes/src/main.rs:1205](crates/garden-ebpf-probes/src/main.rs#L1205), [crates/garden-ebpf-probes/src/main.rs:1514](crates/garden-ebpf-probes/src/main.rs#L1514), [crates/garden-ebpf-probes/src/main.rs:1594](crates/garden-ebpf-probes/src/main.rs#L1594), [crates/garden-ebpf-probes/src/main.rs:1694](crates/garden-ebpf-probes/src/main.rs#L1694).
+
 ---
 
 ## Finding 6 — Zero test coverage for deny paths (High)
@@ -403,7 +407,12 @@ The project ships a meaningful kernel-enforcement story today **only for the har
 
 - Finding 1: resolved. `lsm_bprm_check` uses verifier-preserving `bpf_d_path`, scrubs helper-written tail bytes, and checks `ALLOWED_PATHS` / `DENIED_PATHS`: [crates/garden-ebpf-probes/src/main.rs:1633](crates/garden-ebpf-probes/src/main.rs#L1633).
 - Finding 2: resolved. `lsm_file_open` uses the same post-`bpf_d_path` tail scrub before `DENIED_PATHS` lookup: [crates/garden-ebpf-probes/src/main.rs:1469](crates/garden-ebpf-probes/src/main.rs#L1469).
-- Finding 4b: resolved. `bprm_check_security` is required in the LSM hook table: [crates/garden-ebpf/src/tracer.rs:480](crates/garden-ebpf/src/tracer.rs#L480). All four hooks are now `required:true`.
+- Finding 3: partial. Glob `FileAccess` patterns can't be enforced at the kernel level by the current `HashMap<[u8; 256], u8>` data structure (exact match only). The log emit at [tracer.rs:777](crates/garden-ebpf/src/tracer.rs#L777) is now `tracing::warn!` so operators see the degradation to userspace kill-on-detect. Real fix (prefix-match LpmTrie keyed on path bytes) is separate work.
+- Finding 4: resolved. All sub-findings closed:
+  - 4a (BTF missing → silent LSM skip): guarded at [tracer.rs:487](crates/garden-ebpf/src/tracer.rs#L487) — refuses to start if BTF is unavailable while any required LSM hook is in the table.
+  - 4b (required:false on hooks): all 4 LSM hooks marked `required:true` at [tracer.rs:480](crates/garden-ebpf/src/tracer.rs#L480).
+  - 4c (BPF_LINK_CREATE syscall fail): `required:true` + Finding 9's PID 1 exit means any individual hook attach failure aborts startup.
+- Finding 5: resolved. LSM wrapper internal errors increment `LSM_ERROR_COUNTS` and return `-EPERM` instead of allowing silently: [crates/garden-ebpf-probes/src/main.rs:1185](crates/garden-ebpf-probes/src/main.rs#L1185).
 - Finding 9: resolved. Agent-level `start_tracer` failure now exits PID 1 instead of continuing without enforcement: [crates/garden-agent/src/agent_core.rs:695](crates/garden-agent/src/agent_core.rs#L695).
 - Known constraint: `lsm_bprm_check` still has a hardcoded basename privesc deny list independent of policy, enforced at [crates/garden-ebpf-probes/src/main.rs:252](crates/garden-ebpf-probes/src/main.rs#L252).
 - Verification: host-driven e2e smoke test at [scripts/test_lsm_enforcement_e2e.sh](scripts/test_lsm_enforcement_e2e.sh); run with `GARDEN_RUN_E2E=1 bash scripts/test_lsm_enforcement_e2e.sh`. Phase 2 now verifies policy delivery, BPF map population, and runtime policy denies for both `bprm_check_security` and `file_open`.

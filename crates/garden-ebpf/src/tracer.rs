@@ -484,6 +484,17 @@ pub async fn start_tracer(
         ("lsm_sb_mount",       "sb_mount",             true),
     ];
 
+    // Finding 4a fix: refuse to start if BTF is unavailable while any LSM hook
+    // is marked required. Previously, BTF load failure silently skipped the
+    // entire LSM attach loop and start_tracer returned Ok with 0 hooks
+    // attached — a hidden fail-open path that the required:true on individual
+    // hooks couldn't catch (the loop wouldn't run).
+    if btf_result.is_err() && lsm_hooks.iter().any(|(_, _, required)| *required) {
+        return Err(anyhow::anyhow!(
+            "BTF unavailable but required LSM hooks present — refusing to start without enforcement"
+        ));
+    }
+
     let mut lsm_attached = 0u32;
     let mut lsm_links: Vec<std::os::fd::OwnedFd> = Vec::new();
     if let Ok(ref btf) = btf_result {
@@ -763,7 +774,14 @@ fn populate_policy_maps(
                 // Skip glob patterns — BPF maps do exact match only.
                 // Glob rules are evaluated by kill-on-detect in the perf loop.
                 if super::policy::has_glob_pattern(pattern) {
-                    tracing::debug!("Glob FileAccess rule skipped for BPF map (kill-on-detect fallback): {}", pattern);
+                    // Finding 3 fix (partial): warn-level so operators see when
+                    // their glob rule degrades to async kill-on-detect instead
+                    // of pre-hoc kernel deny. The real fix (prefix-match LpmTrie)
+                    // is separate work.
+                    tracing::warn!(
+                        "Glob FileAccess rule '{}' cannot be enforced at kernel level — falling back to userspace kill-on-detect (post-hoc)",
+                        pattern
+                    );
                     continue;
                 }
                 let key = path_to_map_key(pattern);

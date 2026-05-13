@@ -1129,6 +1129,14 @@ static DENIED_NETS_V6: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(256, 0)
 #[map]
 static ALLOWED_NETS_V6: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(256, 0);
 
+#[map]
+static LSM_ERROR_COUNTS: PerCpuArray<u64> = PerCpuArray::with_max_entries(4, 0);
+
+const LSM_ERR_FILE_OPEN: u32 = 0;
+const LSM_ERR_SOCKET_CONNECT: u32 = 1;
+const LSM_ERR_BPRM_CHECK: u32 = 2;
+const LSM_ERR_SB_MOUNT: u32 = 3;
+
 fn zero_bpf_d_path_tail(path_buf_ptr: *mut [u8; 256], ret: c_long) {
     if ret <= 0 || ret >= 256 {
         return;
@@ -1174,6 +1182,17 @@ const MAX_DENTRY_DEPTH: u8 = 24;
 const MAX_PATH_COMPONENT_COPY: usize = 32;
 const MAX_PATH_KEY_COPY: usize = 32;
 
+#[inline(always)]
+fn lsm_internal_error_verdict(counter_idx: u32) -> i32 {
+    if let Some(counter_ptr) = LSM_ERROR_COUNTS.get_ptr_mut(counter_idx) {
+        unsafe {
+            *counter_ptr = (*counter_ptr).wrapping_add(1);
+        }
+    }
+
+    -EPERM
+}
+
 // ---------------------------------------------------------------------------
 // LSM probe: file_open — synchronous enforcement for dangerous paths
 // ---------------------------------------------------------------------------
@@ -1182,7 +1201,7 @@ const MAX_PATH_KEY_COPY: usize = 32;
 pub fn lsm_file_open(ctx: LsmContext) -> i32 {
     match try_lsm_file_open(&ctx) {
         Ok(verdict) => verdict,
-        Err(_) => 0,
+        Err(_) => lsm_internal_error_verdict(LSM_ERR_FILE_OPEN),
     }
 }
 
@@ -1491,7 +1510,7 @@ fn try_lsm_file_open(ctx: &LsmContext) -> Result<i32, c_long> {
 pub fn lsm_socket_connect(ctx: LsmContext) -> i32 {
     match try_lsm_socket_connect(&ctx) {
         Ok(verdict) => verdict,
-        Err(_) => 0,
+        Err(_) => lsm_internal_error_verdict(LSM_ERR_SOCKET_CONNECT),
     }
 }
 
@@ -1571,7 +1590,7 @@ fn try_lsm_socket_connect(ctx: &LsmContext) -> Result<i32, c_long> {
 pub fn lsm_bprm_check(ctx: LsmContext) -> i32 {
     match try_lsm_bprm_check(&ctx) {
         Ok(verdict) => verdict,
-        Err(_) => 0,
+        Err(_) => lsm_internal_error_verdict(LSM_ERR_BPRM_CHECK),
     }
 }
 
@@ -1671,7 +1690,7 @@ fn try_lsm_bprm_check(ctx: &LsmContext) -> Result<i32, c_long> {
 pub fn lsm_sb_mount(ctx: LsmContext) -> i32 {
     match try_lsm_sb_mount(&ctx) {
         Ok(verdict) => verdict,
-        Err(_) => 0,
+        Err(_) => lsm_internal_error_verdict(LSM_ERR_SB_MOUNT),
     }
 }
 
