@@ -1129,6 +1129,20 @@ static DENIED_NETS_V6: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(256, 0)
 #[map]
 static ALLOWED_NETS_V6: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(256, 0);
 
+fn zero_bpf_d_path_tail(path_buf_ptr: *mut [u8; 256], ret: c_long) {
+    if ret <= 0 || ret >= 256 {
+        return;
+    }
+
+    let mut off = ret as usize;
+    while off < 256 {
+        unsafe {
+            core::ptr::write_volatile((path_buf_ptr as *mut u8).add(off), 0);
+        }
+        off += 1;
+    }
+}
+
 // Keyed by pid_tgid. Set by trace_openat to hand off "this open needs the
 // resolved path checked" to lsm_file_open. Value is a bitmask:
 //   bit 0 (INTENT_TRAVERSAL) — raw path was /workspace-rooted with a `..`
@@ -1455,6 +1469,7 @@ fn try_lsm_file_open(ctx: &LsmContext) -> Result<i32, c_long> {
             bpf_d_path(f_path_addr as *mut _, path_buf_ptr as *mut u8, 256)
         };
         if ret > 0 {
+            zero_bpf_d_path_tail(path_buf_ptr, ret);
             let path_key = unsafe { &*(path_buf_ptr as *const [u8; 256]) };
             if unsafe { ALLOWED_PATHS.get(path_key) }.is_some() {
                 return Ok(0);
@@ -1618,6 +1633,7 @@ fn try_lsm_bprm_check(ctx: &LsmContext) -> Result<i32, c_long> {
     if ret <= 0 {
         return Ok(0);
     }
+    zero_bpf_d_path_tail(path_buf_ptr, ret);
     let path_key = unsafe { &*(path_buf_ptr as *const [u8; 256]) };
 
     // Check privesc binary list inline — this catches the common cases

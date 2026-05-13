@@ -187,17 +187,10 @@ echo "$OUT" | grep -q 'Linux version' \
 #   - Agent parses it ("Loaded policy 'name' (N rules)")
 #   - populate_policy_maps inserts the FileAccess rule into the
 #     kernel DENIED_PATHS BPF hashmap
-#
-# What Phase 2 does NOT yet verify is that the policy-driven runtime
-# DENY actually fires at LSM hook time. See enforcement_audit.md
-# Finding 10 — DENIED_PATHS lookup at runtime misses despite the map
-# being populated correctly. Until that's diagnosed, asserting the
-# runtime deny here would give false negatives. The delivery and
-# population path IS verified, which catches regressions in
-#   garden boot --policy → daemon → VirtioFS → agent → BPF map
-# even without runtime-deny coverage.
+#   - bprm_check_security denies a policy-listed executable
+#   - file_open denies a policy-listed non-hardcoded path
 echo ""
-echo "--- Phase 2: policy delivery + map population ---"
+echo "--- Phase 2: policy delivery + map population + runtime deny ---"
 
 # Write the policy to a temp file and pass it via `garden boot --policy`.
 # The daemon's boot_vm handler writes req.policy_json to
@@ -210,7 +203,8 @@ cat > "$POLICY_FILE" <<EOF
 {
   "name": "e2e-phase2-policy",
   "rules": [
-    {"type": "file_access", "pattern": "/usr/sbin/bpftool", "action": "deny"}
+    {"type": "file_access", "pattern": "/usr/local/bin/probe_loading", "action": "deny"},
+    {"type": "file_access", "pattern": "/proc/version", "action": "deny"}
   ]
 }
 EOF
@@ -248,31 +242,45 @@ done
 if [[ "$PHASE2_STATUS" != "ready" ]]; then
   echo "FAIL: Phase 2 agent did not come up"
   tail -n +$((LOG_MARK + 1)) "$DAEMON_LOG" | tail -60
-  rm -f "$PHASE2_POLICY"
+  rm -f "$POLICY_FILE"
   exit 18
 fi
 sleep 2
 
 # ASSERT_7 — Agent loaded the policy file with the expected rule count.
-tail -n +$((LOG_MARK + 1)) "$DAEMON_LOG" | grep -q "Loaded policy 'e2e-phase2-policy' (1 rules)" \
+tail -n +$((LOG_MARK + 1)) "$DAEMON_LOG" | grep -q "Loaded policy 'e2e-phase2-policy' (2 rules)" \
   || { echo "FAIL: agent did not load Phase 2 policy correctly. Relevant log lines:"; \
        tail -n +$((LOG_MARK + 1)) "$DAEMON_LOG" | grep -iE "policy" | head; \
        rm -f "$POLICY_FILE"; exit 19; }
 
 # ASSERT_8 — DENIED_PATHS BPF map contains the expected entry. The
 # privileged-exec channel runs bpftool with the agent's caps. The
-# inserted key is "/usr/sbin/bpftool" zero-padded to 256 bytes; bpftool
-# dumps it hex-encoded.
+# inserted keys are zero-padded to 256 bytes; bpftool dumps them hex-encoded.
 OUT="$(cd "$GARDEN_BOX" && "${GARDEN_CLI[@]}" debug-run-privileged \
   bpftool -- map dump name DENIED_PATHS 2>&1)" || true
-# Expect: "2f 75 73 72 2f 73 62 69 6e 2f 62 70 66 74 6f 6f 6c 00"
-# That's "/usr/sbin/bpftool" + NUL in hex.
-echo "$OUT" | tr -s ' \n' '  ' | grep -qE '2f 75 73 72 2f 73 62 69  *6e 2f 62 70 66 74 6f 6f  *6c 00' \
-  || { echo "FAIL: DENIED_PATHS BPF map does not contain /usr/sbin/bpftool. Output: $OUT"; \
+# Expect "/usr/local/bin/probe_loading" + NUL in hex.
+echo "$OUT" | tr -s ' \n' '  ' | grep -qE '2f 75 73 72 2f 6c 6f 63  *61 6c 2f 62 69 6e 2f 70  *72 6f 62 65 5f 6c 6f 61  *64 69 6e 67 00' \
+  || { echo "FAIL: DENIED_PATHS BPF map does not contain /usr/local/bin/probe_loading. Output: $OUT"; \
        rm -f "$POLICY_FILE"; exit 20; }
+# Expect "/proc/version" + NUL in hex.
+echo "$OUT" | tr -s ' \n' '  ' | grep -qE '2f 70 72 6f 63 2f 76 65  *72 73 69 6f 6e 00' \
+  || { echo "FAIL: DENIED_PATHS BPF map does not contain /proc/version. Output: $OUT"; \
+       rm -f "$POLICY_FILE"; exit 20; }
+
+# ASSERT_9 — policy-driven bprm_check deny fires at exec time.
+OUT="$(cd "$GARDEN_BOX" && "${GARDEN_CLI[@]}" run sh -- -c \
+  '/usr/local/bin/probe_loading --help; echo "rc=$?"' 2>&1)" || true
+echo "$OUT" | grep -qE 'rc=([1-9][0-9]*)' \
+  || { echo "FAIL: policy /usr/local/bin/probe_loading exec deny did not fire. Output: $OUT"; \
+       rm -f "$POLICY_FILE"; exit 21; }
+
+# ASSERT_10 — policy-driven file_open deny fires at open time.
+OUT="$(cd "$GARDEN_BOX" && "${GARDEN_CLI[@]}" run sh -- -c \
+  'cat /proc/version; echo "rc=$?"' 2>&1)" || true
+echo "$OUT" | grep -qE 'rc=([1-9][0-9]*)' \
+  || { echo "FAIL: policy /proc/version open deny did not fire. Output: $OUT"; \
+       rm -f "$POLICY_FILE"; exit 22; }
 
 rm -f "$POLICY_FILE"
 
-echo "PASS: hardcoded denies + over-block check + policy delivery + BPF map population all verified."
-echo "NOTE: runtime DENIED_PATHS lookup miss is tracked as Finding 10 in enforcement_audit.md;"
-echo "      Phase 2 verifies everything up to but not including the kernel-side lookup."
+echo "PASS: hardcoded denies + over-block check + policy delivery + BPF map population + runtime policy denies all verified."

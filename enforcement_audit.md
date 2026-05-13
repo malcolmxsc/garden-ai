@@ -29,7 +29,7 @@
 
 The map populated from policy rules and the map looked up from the LSM hook use **incompatible key formats**, so policy-driven exec blocks never trigger.
 
-### Evidence
+### Evidence Before Fix
 
 **Userspace populates the map with full paths.** [tracer.rs:759-771](crates/garden-ebpf/src/tracer.rs#L759-L771) calls `path_to_map_key(pattern)`, which zero-pads the policy pattern verbatim:
 
@@ -401,14 +401,14 @@ The project ships a meaningful kernel-enforcement story today **only for the har
 
 ## Resolution
 
-- Finding 1: **partially resolved**. The code path is in place — `lsm_bprm_check` uses verifier-preserving `bpf_d_path` and `DENIED_PATHS.get(path_key)` at [crates/garden-ebpf-probes/src/main.rs:1638](crates/garden-ebpf-probes/src/main.rs#L1638) — but runtime lookup misses. See Finding 10.
-- Finding 2: **partially resolved**. Same situation — `lsm_file_open` consults `DENIED_PATHS` at [crates/garden-ebpf-probes/src/main.rs:1462](crates/garden-ebpf-probes/src/main.rs#L1462) but the lookup misses for the same reason as Finding 1. See Finding 10.
+- Finding 1: resolved. `lsm_bprm_check` uses verifier-preserving `bpf_d_path`, scrubs helper-written tail bytes, and checks `ALLOWED_PATHS` / `DENIED_PATHS`: [crates/garden-ebpf-probes/src/main.rs:1633](crates/garden-ebpf-probes/src/main.rs#L1633).
+- Finding 2: resolved. `lsm_file_open` uses the same post-`bpf_d_path` tail scrub before `DENIED_PATHS` lookup: [crates/garden-ebpf-probes/src/main.rs:1469](crates/garden-ebpf-probes/src/main.rs#L1469).
 - Finding 4b: resolved. `bprm_check_security` is required in the LSM hook table: [crates/garden-ebpf/src/tracer.rs:480](crates/garden-ebpf/src/tracer.rs#L480). All four hooks are now `required:true`.
 - Finding 9: resolved. Agent-level `start_tracer` failure now exits PID 1 instead of continuing without enforcement: [crates/garden-agent/src/agent_core.rs:695](crates/garden-agent/src/agent_core.rs#L695).
 - Known constraint: `lsm_bprm_check` still has a hardcoded basename privesc deny list independent of policy, enforced at [crates/garden-ebpf-probes/src/main.rs:252](crates/garden-ebpf-probes/src/main.rs#L252).
-- Verification: host-driven e2e smoke test at [scripts/test_lsm_enforcement_e2e.sh](scripts/test_lsm_enforcement_e2e.sh); run with `GARDEN_RUN_E2E=1 bash scripts/test_lsm_enforcement_e2e.sh`. Phase 2 verifies policy delivery and BPF map population; runtime deny is not yet covered (Finding 10).
+- Verification: host-driven e2e smoke test at [scripts/test_lsm_enforcement_e2e.sh](scripts/test_lsm_enforcement_e2e.sh); run with `GARDEN_RUN_E2E=1 bash scripts/test_lsm_enforcement_e2e.sh`. Phase 2 now verifies policy delivery, BPF map population, and runtime policy denies for both `bprm_check_security` and `file_open`.
 
-## Finding 10 — Runtime `DENIED_PATHS` lookup misses despite correct map population (Critical, open)
+## Finding 10 — Runtime `DENIED_PATHS` lookup misses despite correct map population (Critical, resolved)
 
 ### Evidence
 
@@ -428,27 +428,22 @@ Verified end-to-end with a fresh VM booted with a policy denying `/usr/sbin/bpft
 - Symlink on `/usr/sbin/bpftool` (it's a regular file with no indirection).
 - `path_is_privesc_binary` accidentally returning false in a way that bypasses (the privesc check returns false for "bpftool", as expected).
 - `bpf_d_path` returning the wrong string (the diagnostic event shows `binary: "/usr/sbin/bpftool"` exactly).
-- Bytes past the NUL terminator in the scratch buffer. Three attempts: (a) keep the existing `core::ptr::write_bytes`, (b) replace with an explicit u64-stride volatile loop, (c) replace the PerCpuArray scratch with a stack-allocated `[u8; 256]` zero-initialized by Rust. None made the lookup hit.
+- Pre-helper zeroing was insufficient. Three attempts zeroed the buffer before `bpf_d_path`: (a) keep the existing `core::ptr::write_bytes`, (b) replace with an explicit u64-stride volatile loop, (c) replace the PerCpuArray scratch with a stack-allocated `[u8; 256]` zero-initialized by Rust. None made the lookup hit because `bpf_d_path` dirtied tail bytes after the zeroing step.
 - LSM hook not firing. Diagnostic event emission on the default-allow path confirmed bprm_check IS running, IS reaching the DENIED_PATHS lookup, and IS falling through.
 
-### What this means
+### Root cause
 
-The audit's claim "Finding 1: resolved" was premature. The code path exists, compiles, attaches, and runs — but `DENIED_PATHS.get(path_key)` returns `None` at runtime despite the map having a byte-identical key. The most likely remaining causes:
+`bpf_d_path` writes the visible NUL-terminated path at the front of the supplied buffer, but it can also leave another copy of the path near the end of the same buffer. Pre-zeroing the 256-byte key buffer is insufficient because the helper dirties tail bytes after the zeroing step. The visible string matched `/usr/sbin/bpftool`, but the full 256-byte key differed from the userspace-inserted zero-padded key.
 
-- An aya 0.13 bug or quirk in `HashMap<[u8; 256], u8>::get()` for large fixed-size keys
-- A BPF verifier-induced semantic difference between userspace `bpf_map_update_elem` and BPF `bpf_map_lookup_elem` for this map type
-- Some property of the key buffer's verifier-tracked type that differs from the inserted key
+### Fix
 
-### Next steps
+- Added `zero_bpf_d_path_tail()` to clear bytes after the helper-returned string length: [crates/garden-ebpf-probes/src/main.rs:1129](crates/garden-ebpf-probes/src/main.rs#L1129).
+- Applied the scrub before `DENIED_PATHS` / `ALLOWED_PATHS` lookup in `lsm_file_open`: [crates/garden-ebpf-probes/src/main.rs:1469](crates/garden-ebpf-probes/src/main.rs#L1469).
+- Applied the scrub before `DENIED_PATHS` / `ALLOWED_PATHS` lookup in `lsm_bprm_check`: [crates/garden-ebpf-probes/src/main.rs:1633](crates/garden-ebpf-probes/src/main.rs#L1633).
 
-Continued investigation is out of scope for this work block. Recommended approach:
+### Verification
 
-1. Replicate in a minimal aya 0.13 example with `HashMap<[u8; 256], u8>`: insert from userspace, look up from a BPF program with a stack-allocated key matching the inserted bytes. If the minimal repro also misses, file an aya issue.
-2. If the minimal repro hits, the bug is something specific to this codebase's setup — e.g. some interaction with PerCpuArray scratch, BTF offsets, or another LSM hook's state.
-3. As a workaround: use a smaller key derived from the path (e.g. FNV-1a u64 hash of the path string, computed identically in userspace and in BPF). Bypasses whatever's wrong with the 256-byte hashmap path. Trade-off: hash collisions can produce false denials; pick a hash strong enough that collisions are negligible at policy sizes.
+`GARDEN_RUN_E2E=1 bash scripts/test_lsm_enforcement_e2e.sh` now passes and includes runtime policy denies:
 
-### Impact
-
-The basename privesc list at [crates/garden-ebpf-probes/src/main.rs:252](crates/garden-ebpf-probes/src/main.rs#L252) still works (covers `su`, `sudo`, `pkexec`, `nsenter`, `unshare`, etc.). Hardcoded sensitive paths (`/proc/<pid>/maps`, `/proc/kallsyms`, `/dev/mem`, etc.) still get denied via the dentry-walk check in `lsm_file_open`. So the project's hardcoded enforcement floor is intact.
-
-Arbitrary user policy `FileAccess` rules are no-ops at the kernel level until this is fixed. The daemon-side userspace policy evaluator may catch some violations post-hoc, but that's kill-on-detect, not pre-hoc deny. The "kernel-level enforcement for arbitrary file paths" claim should be considered unwired until Finding 10 closes.
+- `bprm_check_security`: policy denies exec of `/usr/local/bin/probe_loading`.
+- `file_open`: policy denies open of `/proc/version`.
