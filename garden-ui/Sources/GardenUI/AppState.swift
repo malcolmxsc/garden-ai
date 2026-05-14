@@ -47,6 +47,7 @@ final class AppState: ObservableObject {
 
     // Whether we successfully reached the daemon
     private(set) var daemonReachable: Bool = false
+    private var didHandleLaunchAutoBoot: Bool = false
 
     var filteredEvents: [SecurityEvent] {
         showViolationsOnly ? events.filter(\.isViolation) : events
@@ -69,7 +70,7 @@ final class AppState: ObservableObject {
         startStatusPolling()
     }
 
-    func boot() async {
+    func boot(allowMockFallback: Bool = true) async {
         guard vmState == .stopped || vmState == .error else { return }
         vmState = .booting
         errorMessage = nil
@@ -87,11 +88,16 @@ final class AppState: ObservableObject {
                     errorMessage = result.message
                 }
             } catch {
-                // Daemon was reachable at init but is now gone — fall back to mock
-                vmState = .running
-                wakeFlash = true
-                startUptimeTimer()
-                startMockEventStream()
+                if allowMockFallback {
+                    // Daemon was reachable at init but is now gone — fall back to mock
+                    vmState = .running
+                    wakeFlash = true
+                    startUptimeTimer()
+                    startMockEventStream()
+                } else {
+                    vmState = .error
+                    errorMessage = error.localizedDescription
+                }
             }
         } else {
             // No daemon: demo mode with mock events
@@ -137,14 +143,20 @@ final class AppState: ObservableObject {
         do {
             let status = try await DaemonClient.status()
             daemonReachable = true
+            let shouldAutoBoot = !status.running && !didHandleLaunchAutoBoot
+            didHandleLaunchAutoBoot = true
+
             if status.running {
                 vmState = .running
                 uptimeSeconds = Int(status.uptime_seconds)
                 startUptimeTimer()
                 startTelemetryStream()
+            } else if shouldAutoBoot {
+                await boot(allowMockFallback: false)
             }
         } catch {
             daemonReachable = false
+            didHandleLaunchAutoBoot = true
             // Daemon not running — stay in stopped state, demo mode available
         }
     }
