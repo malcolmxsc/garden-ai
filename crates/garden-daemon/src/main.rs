@@ -210,10 +210,11 @@ fn main() {
     // tap the raw telemetry NDJSON stream.
     println!("📊 Starting telemetry receiver (background thread)...");
 
+    let telemetry_state = vm_state.clone();
     std::thread::spawn(move || {
         // Wait longer than gRPC proxy — eBPF probes load after gRPC server starts
         std::thread::sleep(std::time::Duration::from_secs(5));
-        run_telemetry_receiver(engine);
+        run_telemetry_receiver(engine, telemetry_state);
     });
 
     // 7. Start DaemonService gRPC server on port 9000 (background thread)
@@ -357,7 +358,7 @@ fn run_tcp_vsock_proxy(engine: &'static Virtualizer, vsock_port: u32) {
 // Reads NDJSON SecurityEvent stream from the guest agent's eBPF tracer.
 // Also starts a TCP proxy on 127.0.0.1:10001 for external tools to tap
 // the raw telemetry stream.
-fn run_telemetry_receiver(engine: &'static Virtualizer) {
+fn run_telemetry_receiver(engine: &'static Virtualizer, state: Arc<VmState>) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -394,6 +395,15 @@ fn run_telemetry_receiver(engine: &'static Virtualizer) {
         tokio::spawn(run_telemetry_tcp_proxy(broadcast_tx.clone()));
 
         loop {
+            // If no VM is running, wait quietly. The fast (100ms) retry below
+            // is only useful during the brief window between BootVm returning
+            // and the guest agent binding vSock:6001. Without this gate, the
+            // receiver spams the log at 10 lines/sec until a VM is booted.
+            if !state.running.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                continue;
+            }
+
             println!("📊 Connecting to guest telemetry vSock port 6001...");
 
             let vsock_fd = match engine.connect_vsock(6001) {
