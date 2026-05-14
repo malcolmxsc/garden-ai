@@ -95,16 +95,11 @@ impl DaemonService for DaemonServiceImpl {
         *self.state.boot_time.lock().unwrap() = Some(Instant::now());
         *self.state.kernel_path.lock().unwrap() = kernel;
 
-        // Start proxies after a brief delay for the guest to initialize
-        let engine = self.engine;
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(3));
-            run_tcp_vsock_proxy(engine, 6000);
-        });
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(5));
-            run_telemetry_receiver(engine);
-        });
+        // Note: proxies are spawned once in main() and outlive this VM. The
+        // TCP→vSock proxy is bound to :10000 at startup; vSock connections
+        // are made on-demand when clients connect, so a re-boot reuses the
+        // same proxy threads (they call engine.connect_vsock() against
+        // whichever VM is current).
 
         Ok(tonic::Response::new(BootVmResponse {
             success: true,
@@ -180,35 +175,15 @@ fn main() {
         }
     }
 
-    // 3. Configure the VM
-    println!("⚙️ Configuring Virtual Machine (2 CPUs, 512MB RAM)...");
-
-    let kernel_path = "/Users/malcolmgriffin/.gemini/antigravity/scratch/garden-ai/guest/kernel/kernel";
-    let initrd_path = "/Users/malcolmgriffin/.gemini/antigravity/scratch/garden-ai/guest/kernel/garden-initrd.cpio.gz";
-
-    match engine.configure(kernel_path, initrd_path, 2, 512) {
-        Ok(_) => println!("✅ VM successfully configured by Apple Hypervisor!"),
-        Err(e) => {
-            eprintln!("❌ VM configuration failed: {}", e);
-            std::process::exit(1);
-        }
-    }
-
-    // 4. Boot the VM
-    println!("🚀 Booting the Alpine Linux VM...");
-    match engine.start() {
-        Ok(_) => println!("✅ VM Boot sequence initiated!"),
-        Err(e) => {
-            eprintln!("❌ VM failed to boot: {}", e);
-            std::process::exit(1);
-        }
-    }
-
-    // Shared VM state for the DaemonService
+    // Note: no auto-boot here. The VM is started by an explicit BootVm gRPC
+    // call (or POST /api/boot HTTP) from a client. This lets callers pass a
+    // policy on the first boot — the previous auto-boot would race the gRPC
+    // server and silently discard any --policy passed to the first
+    // `garden boot --policy` because state.running was already true.
     let vm_state = Arc::new(VmState {
-        running: AtomicBool::new(true),
-        boot_time: Mutex::new(Some(Instant::now())),
-        kernel_path: Mutex::new(kernel_path.to_string()),
+        running: AtomicBool::new(false),
+        boot_time: Mutex::new(None),
+        kernel_path: Mutex::new(String::new()),
     });
 
     // 5. Wait for agent to be ready, then start TCP proxy
