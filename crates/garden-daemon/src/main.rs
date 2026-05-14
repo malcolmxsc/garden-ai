@@ -724,15 +724,9 @@ async fn run_http_api(engine: &'static Virtualizer, state: Arc<VmState>) {
             st.running.store(true, Ordering::SeqCst);
             *st.boot_time.lock().unwrap() = Some(Instant::now());
             *st.kernel_path.lock().unwrap() = kernel;
-            // Start proxies
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(3));
-                run_tcp_vsock_proxy(engine, 6000);
-            });
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                run_telemetry_receiver(engine);
-            });
+            // Proxies are spawned once in main() and outlive this VM; no
+            // need to re-spawn per boot. Same fix as the gRPC boot_vm
+            // handler (a035c7c).
             axum::Json(ApiActionResponse { success: true, message: "VM booted".into() })
         }
     };
