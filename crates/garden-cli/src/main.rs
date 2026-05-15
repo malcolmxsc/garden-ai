@@ -8,7 +8,25 @@
 //!   garden status
 //!   garden stop
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+/// Network egress posture at boot time.
+///
+/// `Allow` (default) leaves all outbound connections allowed unless an
+/// explicit `--policy` rule denies them. `Deny` injects catch-all
+/// deny-everything rules for IPv4 (0.0.0.0/0) and IPv6 (::/0) into the
+/// policy that gets shipped to the guest, so the guest agent's BPF-LSM
+/// hook rejects every `socket_connect()` from a non-PID-1 process unless
+/// the user has also passed `--policy <file>` with explicit allow rules
+/// that punch holes through the catch-all (per-CIDR allow lookups win
+/// over the catch-all deny via LPM longest-prefix-match).
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum NetworkMode {
+    /// Outbound network allowed by default (current observe-only behaviour).
+    Allow,
+    /// All outbound network denied; pair with --policy for an allowlist.
+    Deny,
+}
 
 #[derive(Parser)]
 #[command(
@@ -59,6 +77,11 @@ enum Commands {
         /// Path to a JSON security policy file
         #[arg(long)]
         policy: Option<String>,
+
+        /// Network egress posture: `allow` (default, current behaviour) or
+        /// `deny` (block all outbound; combine with --policy to whitelist).
+        #[arg(long, value_enum, default_value_t = NetworkMode::Allow)]
+        network: NetworkMode,
     },
 
     /// Execute a command inside the running sandbox
@@ -124,6 +147,7 @@ async fn main() -> anyhow::Result<()> {
             cpus,
             share,
             policy,
+            network,
         } => {
             tracing::info!(
                 kernel = %kernel,
@@ -131,10 +155,11 @@ async fn main() -> anyhow::Result<()> {
                 memory_mb = memory,
                 cpus = cpus,
                 shared_dirs = ?share,
+                network = ?network,
                 "Booting sandbox VM..."
             );
 
-            let policy_json = match policy {
+            let mut policy_json = match policy {
                 Some(path) => {
                     let json = std::fs::read_to_string(&path)
                         .unwrap_or_else(|e| {
@@ -149,6 +174,40 @@ async fn main() -> anyhow::Result<()> {
                 }
                 None => String::new(),
             };
+
+            // --network=deny: append catch-all deny rules for IPv4 + IPv6 to
+            // whatever policy was loaded (or synthesize a deny-only policy if
+            // none was given). User-supplied per-CIDR allow rules win at
+            // lookup time via the LPM trie's longest-prefix-match, so this
+            // composes correctly with `--policy allowlist.json`.
+            if matches!(network, NetworkMode::Deny) {
+                eprintln!("🚫 Network egress: DENY ALL (combine with --policy to allowlist exceptions)");
+                let deny_rules = serde_json::json!([
+                    {"type": "network", "dest": "0.0.0.0/0", "action": "deny"},
+                    {"type": "network", "dest": "::/0",      "action": "deny"}
+                ]);
+                if policy_json.is_empty() {
+                    let synthesised = serde_json::json!({
+                        "name": "network-deny",
+                        "rules": deny_rules
+                    });
+                    policy_json = serde_json::to_string(&synthesised)
+                        .expect("synthesised policy serialises");
+                } else {
+                    let mut existing: serde_json::Value =
+                        serde_json::from_str(&policy_json)
+                            .expect("policy file already validated as JSON");
+                    if let Some(rules) = existing["rules"].as_array_mut() {
+                        for rule in deny_rules.as_array().expect("deny_rules is an array") {
+                            rules.push(rule.clone());
+                        }
+                    } else {
+                        eprintln!("⚠️  --policy file has no `rules` array — --network=deny rules not appended");
+                    }
+                    policy_json = serde_json::to_string(&existing)
+                        .expect("policy with appended rules serialises");
+                }
+            }
 
             let mut client = garden_common::daemon::daemon_service_client::DaemonServiceClient::connect("http://127.0.0.1:9000")
                 .await
