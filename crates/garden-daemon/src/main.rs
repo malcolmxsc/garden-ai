@@ -155,6 +155,24 @@ impl DaemonService for DaemonServiceImpl {
 fn main() {
     println!("🌱 Starting Garden Engine Daemon...");
 
+    // Verbose telemetry-to-stdout. Off by default — the daemon's stdout would
+    // otherwise spam every BPF event from the guest (`📊 [telemetry] ...`),
+    // which under sustained MCP traffic fills the terminal's pipe buffer
+    // until println! panics on EAGAIN, taking the telemetry-reader thread
+    // down with it and wedging the VM. When verbose IS enabled, route the
+    // prints through tracing_appender::non_blocking — a bounded-queue
+    // background-thread writer that drops overflow instead of panicking,
+    // so even with full chatter the daemon stays alive. Set
+    // `GARDEN_DAEMON_VERBOSE=1` to enable.
+    let verbose_telemetry: bool = std::env::var("GARDEN_DAEMON_VERBOSE").is_ok();
+    let (telemetry_writer, _telemetry_writer_guard) = if verbose_telemetry {
+        let (w, g) = tracing_appender::non_blocking(std::io::stdout());
+        println!("📊 Verbose telemetry enabled (non-blocking writer, drops on overflow)");
+        (Some(w), Some(g))
+    } else {
+        (None, None)
+    };
+
     // 1. Initialize the FFI Bridge
     println!("Checking Apple Silicon Virtualization support...");
 
@@ -211,10 +229,11 @@ fn main() {
     println!("📊 Starting telemetry receiver (background thread)...");
 
     let telemetry_state = vm_state.clone();
+    let telemetry_writer_for_thread = telemetry_writer.clone();
     std::thread::spawn(move || {
         // Wait longer than gRPC proxy — eBPF probes load after gRPC server starts
         std::thread::sleep(std::time::Duration::from_secs(5));
-        run_telemetry_receiver(engine, telemetry_state);
+        run_telemetry_receiver(engine, telemetry_state, verbose_telemetry, telemetry_writer_for_thread);
     });
 
     // 7. Start DaemonService gRPC server on port 9000 (background thread)
@@ -358,7 +377,12 @@ fn run_tcp_vsock_proxy(engine: &'static Virtualizer, vsock_port: u32) {
 // Reads NDJSON SecurityEvent stream from the guest agent's eBPF tracer.
 // Also starts a TCP proxy on 127.0.0.1:10001 for external tools to tap
 // the raw telemetry stream.
-fn run_telemetry_receiver(engine: &'static Virtualizer, state: Arc<VmState>) {
+fn run_telemetry_receiver(
+    engine: &'static Virtualizer,
+    state: Arc<VmState>,
+    verbose: bool,
+    telemetry_writer: Option<tracing_appender::non_blocking::NonBlocking>,
+) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -434,7 +458,15 @@ fn run_telemetry_receiver(engine: &'static Virtualizer, state: Arc<VmState>) {
             };
 
             // Read NDJSON lines, evaluate policy, log to session file, and broadcast
-            process_telemetry_stream(stream, &policy, &broadcast_tx, logger.clone()).await;
+            process_telemetry_stream(
+                stream,
+                &policy,
+                &broadcast_tx,
+                logger.clone(),
+                verbose,
+                telemetry_writer.clone(),
+            )
+            .await;
 
             println!("📊 Telemetry connection lost, reconnecting in 500ms...");
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -447,7 +479,10 @@ async fn process_telemetry_stream(
     policy: &garden_ebpf::policy::SecurityPolicy,
     broadcast_tx: &tokio::sync::broadcast::Sender<String>,
     logger: std::sync::Arc<event_log::EventLogger>,
+    verbose: bool,
+    telemetry_writer: Option<tracing_appender::non_blocking::NonBlocking>,
 ) {
+    use std::io::Write;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     let reader = BufReader::new(stream);
@@ -562,11 +597,16 @@ async fn process_telemetry_stream(
                         }
                     }
                     garden_ebpf::policy::PolicyAction::Log => {
-                        if violation.is_none() {
-                            println!(
-                                "📊 [telemetry] pid={} comm={} {:?}",
-                                event.pid, event.comm, event.kind
-                            );
+                        if violation.is_none() && verbose {
+                            if let Some(w) = telemetry_writer.as_ref() {
+                                // Non-blocking writer — drops on overflow, never
+                                // panics. Result intentionally discarded.
+                                let _ = writeln!(
+                                    w.clone(),
+                                    "📊 [telemetry] pid={} comm={} {:?}",
+                                    event.pid, event.comm, event.kind
+                                );
+                            }
                         }
                     }
                     #[allow(unreachable_patterns)]
