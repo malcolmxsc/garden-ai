@@ -36,7 +36,13 @@ final class TelemetryStream {
                 switch state {
                 case .ready:
                     self.receive(on: conn)
-                case .failed, .cancelled:
+                case .waiting, .failed, .cancelled:
+                    // .waiting fires when the OS couldn't establish the
+                    // connection (e.g. daemon binds :9001 a hair before
+                    // :10001 at startup, so the first connect attempt
+                    // gets ECONNREFUSED). NWConnection's built-in retry
+                    // sits in .waiting indefinitely — we cancel and
+                    // schedule our own 3s reconnect instead.
                     self.scheduleReconnect()
                 default:
                     break
@@ -75,6 +81,11 @@ final class TelemetryStream {
         connection?.cancel()
         connection = nil
         buffer = Data()
+        // Cancelling the existing reconnect task ensures multiple state
+        // transitions during one teardown (e.g. .waiting → cancel → .cancelled)
+        // collapse into a single pending reconnect rather than scheduling
+        // a duplicate 3s task that races the first one.
+        reconnectTask?.cancel()
         reconnectTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(3))
             guard !Task.isCancelled else { return }
