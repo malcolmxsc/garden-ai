@@ -25,8 +25,18 @@ struct ActionRailView: View {
     private var primaryButton: some View {
         switch appState.vmState {
         case .stopped, .error:
-            GlassButton(label: "Boot", icon: "play.fill", tint: Color(hue: 0.36, saturation: 0.7, brightness: 0.75)) {
-                Task { await appState.boot() }
+            // Booting requires a reachable daemon. If it's offline, fall
+            // through to a disabled state that nudges the user to run
+            // `garden start` instead of silently entering mock mode.
+            if appState.daemonReachable {
+                GlassButton(label: "Boot", icon: "play.fill", tint: Color(hue: 0.36, saturation: 0.7, brightness: 0.75)) {
+                    Task { await appState.boot() }
+                }
+            } else {
+                GlassButton(label: "Boot", icon: "play.fill", tint: .secondary) { }
+                    .disabled(true)
+                    .opacity(0.5)
+                    .help("Daemon offline — run `garden start` in the terminal first.")
             }
         case .running:
             GlassButton(label: "Stop", icon: "stop.fill", tint: .red) {
