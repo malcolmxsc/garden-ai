@@ -467,10 +467,21 @@ fn try_trace_connect(ctx: &TracePointContext) -> Result<(), c_long> {
         let mut sockaddr_buf = [0u8; 8];
         let _ = unsafe { bpf_probe_read_user_buf(addr_ptr as *const u8, &mut sockaddr_buf) };
 
+        let port = u16::from_be_bytes([sockaddr_buf[2], sockaddr_buf[3]]);
+        // Drop sentinel-port events. Port 0 and 0xFFFF show up when libc
+        // resolvers (musl, glibc) call connect() on a UDP socket purely to
+        // determine the source address for routing — the socket is never
+        // used to send data. These events look like real network connects
+        // in the telemetry stream but represent no actual network activity.
+        // Real applications essentially never connect() to port 0 or 65535.
+        if port == 0 || port == 0xFFFF {
+            return Ok(());
+        }
+
         let event = get_scratch_event().ok_or(1i64)?;
         event.kind = EventKind::Connect as u32;
         fill_common(event)?;
-        event.dest_port = u16::from_be_bytes([sockaddr_buf[2], sockaddr_buf[3]]);
+        event.dest_port = port;
         event.dest_ip = u32::from_ne_bytes([
             sockaddr_buf[4], sockaddr_buf[5], sockaddr_buf[6], sockaddr_buf[7],
         ]);
@@ -482,10 +493,16 @@ fn try_trace_connect(ctx: &TracePointContext) -> Result<(), c_long> {
         let mut sa6_buf = [0u8; 28];
         let _ = unsafe { bpf_probe_read_user_buf(addr_ptr as *const u8, &mut sa6_buf) };
 
+        let port = u16::from_be_bytes([sa6_buf[2], sa6_buf[3]]);
+        // Same sentinel filter as the IPv4 path.
+        if port == 0 || port == 0xFFFF {
+            return Ok(());
+        }
+
         let event = get_scratch_event().ok_or(1i64)?;
         event.kind = EventKind::ConnectV6 as u32;
         fill_common(event)?;
-        event.dest_port = u16::from_be_bytes([sa6_buf[2], sa6_buf[3]]);
+        event.dest_port = port;
         // IPv6 address is at bytes 8..24 in sockaddr_in6
         event.dest_ip6.copy_from_slice(&sa6_buf[8..24]);
         event.protocol = 6;
