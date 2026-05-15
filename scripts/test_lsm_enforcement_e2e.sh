@@ -139,10 +139,10 @@ elif [[ "$TRACER_STATUS" != "ready" ]]; then
   exit 10
 fi
 
-grep -q "Attached 4/4 BPF-LSM hooks" "$DAEMON_LOG" \
-  || { echo "FAIL: agent ready but not 4/4 LSM hooks"; grep -E "BPF-LSM|Attached" "$DAEMON_LOG"; exit 10; }
+grep -q "Attached 5/5 BPF-LSM hooks" "$DAEMON_LOG" \
+  || { echo "FAIL: agent ready but not 5/5 LSM hooks"; grep -E "BPF-LSM|Attached" "$DAEMON_LOG"; exit 10; }
 
-for hook in file_open socket_connect bprm_check_security sb_mount; do
+for hook in file_open socket_connect socket_sendmsg bprm_check_security sb_mount; do
   grep -q "Attached BPF-LSM hook: $hook" "$DAEMON_LOG" \
     || { echo "FAIL: $hook not attached"; exit 11; }
 done

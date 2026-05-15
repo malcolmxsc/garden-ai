@@ -1153,12 +1153,13 @@ static DENIED_NETS_V6: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(256, 0)
 static ALLOWED_NETS_V6: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(256, 0);
 
 #[map]
-static LSM_ERROR_COUNTS: PerCpuArray<u64> = PerCpuArray::with_max_entries(4, 0);
+static LSM_ERROR_COUNTS: PerCpuArray<u64> = PerCpuArray::with_max_entries(5, 0);
 
 const LSM_ERR_FILE_OPEN: u32 = 0;
 const LSM_ERR_SOCKET_CONNECT: u32 = 1;
 const LSM_ERR_BPRM_CHECK: u32 = 2;
 const LSM_ERR_SB_MOUNT: u32 = 3;
+const LSM_ERR_SOCKET_SENDMSG: u32 = 4;
 
 fn zero_bpf_d_path_tail(path_buf_ptr: *mut [u8; 256], ret: c_long) {
     if ret <= 0 || ret >= 256 {
@@ -1599,6 +1600,118 @@ fn try_lsm_socket_connect(ctx: &LsmContext) -> Result<i32, c_long> {
             event.protocol = 6;
             let _ = EVENTS.output(event, 0);
             unsafe { bpf_send_signal(9) };
+            return Ok(-EPERM);
+        }
+    }
+
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// LSM probe: socket_sendmsg — block forbidden UDP egress (DNS, etc.)
+// ---------------------------------------------------------------------------
+//
+// `lsm_socket_connect` only fires on connect()/SOCK_STREAM and on
+// connection-oriented UDP. Connectionless UDP traffic — most notably DNS
+// queries via the libc resolver — uses sendto()/sendmsg() with a per-call
+// destination and never goes through connect(). Without a hook here,
+// `--network=deny` would still let UDP traffic out, and DNS-based exfil
+// (encoding bytes into subdomain queries to an attacker-controlled
+// nameserver) would be unconstrained.
+//
+// `security_socket_sendmsg(struct socket *, struct msghdr *, int size)` is
+// the LSM hook for outgoing socket messages. For TCP sockets, `msg_name`
+// is typically NULL (the destination is already on the socket), so this
+// hook is essentially a no-op for the connected-stream case — connect-time
+// enforcement still does the work. For UDP datagram sends, `msg_name`
+// points to the kernel-side sockaddr that was just copied in from
+// userspace via copy_msghdr_from_user, so we can read it with
+// bpf_probe_read_kernel.
+
+#[lsm(hook = "socket_sendmsg")]
+pub fn lsm_socket_sendmsg(ctx: LsmContext) -> i32 {
+    match try_lsm_socket_sendmsg(&ctx) {
+        Ok(verdict) => verdict,
+        Err(_) => lsm_internal_error_verdict(LSM_ERR_SOCKET_SENDMSG),
+    }
+}
+
+fn try_lsm_socket_sendmsg(ctx: &LsmContext) -> Result<i32, c_long> {
+    // PID 1 exemption: the agent's own networking (DHCP, vSock setup,
+    // anything it issues itself) must not be subject to user policy.
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    if pid == 1 {
+        return Ok(0);
+    }
+
+    // arg(1) is `struct msghdr *`. msg_name is the first field
+    // (offset 0, pointer-sized).
+    let msghdr_ptr: u64 = unsafe { ctx.arg(1) };
+    if msghdr_ptr == 0 {
+        return Ok(0);
+    }
+
+    let name_ptr: u64 = match unsafe {
+        bpf_probe_read_kernel(msghdr_ptr as *const u64)
+    } {
+        Ok(p) => p,
+        Err(_) => return Ok(0),
+    };
+
+    // Connected socket: no per-message destination. Connect-time enforcement
+    // already handled this.
+    if name_ptr == 0 {
+        return Ok(0);
+    }
+
+    let sa_buf: [u8; 8] = match unsafe {
+        bpf_probe_read_kernel(name_ptr as *const [u8; 8])
+    } {
+        Ok(b) => b,
+        Err(_) => return Ok(0),
+    };
+
+    let sa_family = u16::from_ne_bytes([sa_buf[0], sa_buf[1]]);
+
+    if sa_family == AF_INET {
+        let dest_port = u16::from_be_bytes([sa_buf[2], sa_buf[3]]);
+        let dest_ip_ne = u32::from_ne_bytes([sa_buf[4], sa_buf[5], sa_buf[6], sa_buf[7]]);
+
+        if unsafe { ALLOWED_NETS.get(&LpmKey::new(32, dest_ip_ne)) }.is_some() {
+            return Ok(0);
+        }
+
+        if unsafe { DENIED_NETS.get(&LpmKey::new(32, dest_ip_ne)) }.is_some() {
+            let event = get_scratch_event().ok_or(1i64)?;
+            event.kind = EventKind::Connect as u32;
+            fill_common(event)?;
+            event.dest_ip = dest_ip_ne;
+            event.dest_port = dest_port;
+            event.protocol = 17; // UDP — distinguishes from TCP connect denies
+            let _ = EVENTS.output(event, 0);
+            return Ok(-EPERM);
+        }
+    } else if sa_family == AF_INET6 {
+        let sa6: [u8; 28] = match unsafe { bpf_probe_read_kernel(name_ptr as *const [u8; 28]) } {
+            Ok(b) => b,
+            Err(_) => return Ok(0),
+        };
+        let dest_port = u16::from_be_bytes([sa6[2], sa6[3]]);
+        let mut dest_addr = [0u8; 16];
+        dest_addr.copy_from_slice(&sa6[8..24]);
+
+        if ALLOWED_NETS_V6.get(&LpmKey::new(128, dest_addr)).is_some() {
+            return Ok(0);
+        }
+
+        if DENIED_NETS_V6.get(&LpmKey::new(128, dest_addr)).is_some() {
+            let event = get_scratch_event().ok_or(1i64)?;
+            event.kind = EventKind::ConnectV6 as u32;
+            fill_common(event)?;
+            event.dest_ip6.copy_from_slice(&dest_addr);
+            event.dest_port = dest_port;
+            event.protocol = 17;
+            let _ = EVENTS.output(event, 0);
             return Ok(-EPERM);
         }
     }

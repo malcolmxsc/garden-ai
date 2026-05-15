@@ -480,6 +480,7 @@ pub async fn start_tracer(
     let lsm_hooks: &[(&str, &str, bool)] = &[
         ("lsm_file_open",      "file_open",           true),
         ("lsm_socket_connect", "socket_connect",       true),
+        ("lsm_socket_sendmsg", "socket_sendmsg",       true),
         ("lsm_bprm_check",     "bprm_check_security", true),
         ("lsm_sb_mount",       "sb_mount",             true),
     ];
