@@ -3,12 +3,19 @@
 //! Usage:
 //!   garden init
 //!   garden update-kernel
-//!   garden boot [--kernel <path>] [--rootfs <path>]
+//!   garden start [--policy <file>] [--network=allow|deny]    one-step daemon+VM
+//!   garden boot  [--policy <file>] [--network=allow|deny]    requires daemon up
 //!   garden run <command> [args...]
 //!   garden status
 //!   garden stop
 
 use clap::{Parser, Subcommand, ValueEnum};
+
+/// Ad-hoc-signing entitlements for the daemon binary. Embedded at compile
+/// time so `garden start` can codesign without needing the project tree on
+/// disk. Source of truth: crates/garden-daemon/entitlements.plist.
+const DAEMON_ENTITLEMENTS_PLIST: &str =
+    include_str!("../../garden-daemon/entitlements.plist");
 
 /// Network egress posture at boot time.
 ///
@@ -84,6 +91,47 @@ enum Commands {
         network: NetworkMode,
     },
 
+    /// One-step: launch the daemon (if not already running), then boot a VM.
+    ///
+    /// Replaces the manual flow of "run ./target/debug/garden-daemon in one
+    /// terminal, then `garden boot` in another." Accepts the same flags as
+    /// `boot` and passes them through. If the daemon is already up, just
+    /// boots the VM with whatever you pass.
+    Start {
+        /// Path to the Linux kernel image (leave empty to use daemon default)
+        #[arg(long, default_value = "")]
+        kernel: String,
+
+        /// Path to the initramfs image (leave empty to use daemon default)
+        #[arg(long, default_value = "")]
+        rootfs: String,
+
+        /// Memory allocation in MB
+        #[arg(long, default_value = "512")]
+        memory: u64,
+
+        /// Number of CPU cores
+        #[arg(long, default_value = "2")]
+        cpus: u32,
+
+        /// Host directories to share (format: host_path:mount_tag)
+        #[arg(long)]
+        share: Vec<String>,
+
+        /// Path to a JSON security policy file
+        #[arg(long)]
+        policy: Option<String>,
+
+        /// Network egress posture: `allow` (default) or `deny`.
+        #[arg(long, value_enum, default_value_t = NetworkMode::Allow)]
+        network: NetworkMode,
+
+        /// Start the daemon but don't boot a VM. Useful for running an MCP
+        /// session and explicitly booting later.
+        #[arg(long)]
+        no_boot: bool,
+    },
+
     /// Execute a command inside the running sandbox
     Run {
         /// The command to execute
@@ -149,84 +197,23 @@ async fn main() -> anyhow::Result<()> {
             policy,
             network,
         } => {
-            tracing::info!(
-                kernel = %kernel,
-                rootfs = %rootfs,
-                memory_mb = memory,
-                cpus = cpus,
-                shared_dirs = ?share,
-                network = ?network,
-                "Booting sandbox VM..."
-            );
-
-            let mut policy_json = match policy {
-                Some(path) => {
-                    let json = std::fs::read_to_string(&path)
-                        .unwrap_or_else(|e| {
-                            eprintln!("Cannot read policy file {}: {}", path, e);
-                            std::process::exit(1);
-                        });
-                    if serde_json::from_str::<serde_json::Value>(&json).is_err() {
-                        eprintln!("Invalid JSON in policy file: {}", path);
-                        std::process::exit(1);
-                    }
-                    json
-                }
-                None => String::new(),
-            };
-
-            // --network=deny: append catch-all deny rules for IPv4 + IPv6 to
-            // whatever policy was loaded (or synthesize a deny-only policy if
-            // none was given). User-supplied per-CIDR allow rules win at
-            // lookup time via the LPM trie's longest-prefix-match, so this
-            // composes correctly with `--policy allowlist.json`.
-            if matches!(network, NetworkMode::Deny) {
-                eprintln!("🚫 Network egress: DENY ALL (combine with --policy to allowlist exceptions)");
-                let deny_rules = serde_json::json!([
-                    {"type": "network", "dest": "0.0.0.0/0", "action": "deny"},
-                    {"type": "network", "dest": "::/0",      "action": "deny"}
-                ]);
-                if policy_json.is_empty() {
-                    let synthesised = serde_json::json!({
-                        "name": "network-deny",
-                        "rules": deny_rules
-                    });
-                    policy_json = serde_json::to_string(&synthesised)
-                        .expect("synthesised policy serialises");
-                } else {
-                    let mut existing: serde_json::Value =
-                        serde_json::from_str(&policy_json)
-                            .expect("policy file already validated as JSON");
-                    if let Some(rules) = existing["rules"].as_array_mut() {
-                        for rule in deny_rules.as_array().expect("deny_rules is an array") {
-                            rules.push(rule.clone());
-                        }
-                    } else {
-                        eprintln!("⚠️  --policy file has no `rules` array — --network=deny rules not appended");
-                    }
-                    policy_json = serde_json::to_string(&existing)
-                        .expect("policy with appended rules serialises");
-                }
-            }
-
-            let mut client = garden_common::daemon::daemon_service_client::DaemonServiceClient::connect("http://127.0.0.1:9000")
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to connect to daemon on :9000: {}", e))?;
-
-            let request = tonic::Request::new(garden_common::daemon::BootVmRequest {
-                kernel_path: kernel,
-                initrd_path: rootfs,
-                cpus,
-                memory_mb: memory,
-                policy_json,
-            });
-
-            let response = client.boot_vm(request).await?.into_inner();
-            if response.success {
-                println!("🌿 {}", response.message);
+            do_boot(kernel, rootfs, memory, cpus, share, policy, network).await?;
+        }
+        Commands::Start {
+            kernel,
+            rootfs,
+            memory,
+            cpus,
+            share,
+            policy,
+            network,
+            no_boot,
+        } => {
+            ensure_daemon_running().await?;
+            if !no_boot {
+                do_boot(kernel, rootfs, memory, cpus, share, policy, network).await?;
             } else {
-                eprintln!("❌ {}", response.message);
-                std::process::exit(1);
+                println!("🌱 Daemon ready on :9000 (no VM booted — pass `garden boot ...` or omit --no-boot)");
             }
         }
         Commands::Run { command, args } => {
@@ -312,6 +299,189 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Shared boot path used by both `garden boot` and `garden start`. Reads
+/// the policy file if given, applies the --network deny catch-all if
+/// requested, calls the daemon's BootVm gRPC. Exits the process on
+/// fatal errors.
+async fn do_boot(
+    kernel: String,
+    rootfs: String,
+    memory: u64,
+    cpus: u32,
+    share: Vec<String>,
+    policy: Option<String>,
+    network: NetworkMode,
+) -> anyhow::Result<()> {
+    tracing::info!(
+        kernel = %kernel,
+        rootfs = %rootfs,
+        memory_mb = memory,
+        cpus = cpus,
+        shared_dirs = ?share,
+        network = ?network,
+        "Booting sandbox VM..."
+    );
+
+    let mut policy_json = match policy {
+        Some(path) => {
+            let json = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                eprintln!("Cannot read policy file {}: {}", path, e);
+                std::process::exit(1);
+            });
+            if serde_json::from_str::<serde_json::Value>(&json).is_err() {
+                eprintln!("Invalid JSON in policy file: {}", path);
+                std::process::exit(1);
+            }
+            json
+        }
+        None => String::new(),
+    };
+
+    // --network=deny: append catch-all deny rules for IPv4 + IPv6 to
+    // whatever policy was loaded (or synthesize a deny-only policy if
+    // none was given). User-supplied per-CIDR allow rules win at lookup
+    // time via the LPM trie's longest-prefix-match.
+    if matches!(network, NetworkMode::Deny) {
+        eprintln!("🚫 Network egress: DENY ALL (combine with --policy to allowlist exceptions)");
+        let deny_rules = serde_json::json!([
+            {"type": "network", "dest": "0.0.0.0/0", "action": "deny"},
+            {"type": "network", "dest": "::/0",      "action": "deny"}
+        ]);
+        if policy_json.is_empty() {
+            let synthesised = serde_json::json!({
+                "name": "network-deny",
+                "rules": deny_rules
+            });
+            policy_json = serde_json::to_string(&synthesised)
+                .expect("synthesised policy serialises");
+        } else {
+            let mut existing: serde_json::Value = serde_json::from_str(&policy_json)
+                .expect("policy file already validated as JSON");
+            if let Some(rules) = existing["rules"].as_array_mut() {
+                for rule in deny_rules.as_array().expect("deny_rules is an array") {
+                    rules.push(rule.clone());
+                }
+            } else {
+                eprintln!("⚠️  --policy file has no `rules` array — --network=deny rules not appended");
+            }
+            policy_json = serde_json::to_string(&existing)
+                .expect("policy with appended rules serialises");
+        }
+    }
+
+    let mut client = garden_common::daemon::daemon_service_client::DaemonServiceClient::connect("http://127.0.0.1:9000")
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to connect to daemon on :9000: {}", e))?;
+
+    let request = tonic::Request::new(garden_common::daemon::BootVmRequest {
+        kernel_path: kernel,
+        initrd_path: rootfs,
+        cpus,
+        memory_mb: memory,
+        policy_json,
+    });
+
+    let response = client.boot_vm(request).await?.into_inner();
+    if response.success {
+        println!("🌿 {}", response.message);
+    } else {
+        eprintln!("❌ {}", response.message);
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Make sure a garden-daemon is running on 127.0.0.1:9000.
+///
+/// Sequence:
+///   1. If we can already connect to :9000, return immediately.
+///   2. Find the daemon binary in the same directory as this CLI binary
+///      (the cargo/install convention).
+///   3. Codesign it ad-hoc with the embedded entitlements — Apple's
+///      Virtualization.framework rejects unsigned binaries.
+///   4. Spawn it as a detached background process with stdout/stderr
+///      redirected to /tmp/garden-daemon.log (so the parent shell stays
+///      clean; the user can `tail -f /tmp/garden-daemon.log` to watch).
+///   5. Poll :9000 for up to ~5 seconds. Bail if it never binds.
+async fn ensure_daemon_running() -> anyhow::Result<()> {
+    use std::io::Write;
+
+    // Already up?
+    if tokio::net::TcpStream::connect("127.0.0.1:9000").await.is_ok() {
+        return Ok(());
+    }
+
+    // Find the daemon binary alongside the CLI binary.
+    let cli_exe = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("can't locate cli executable: {}", e))?;
+    let daemon_bin = cli_exe
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("cli executable has no parent directory"))?
+        .join("garden-daemon");
+    if !daemon_bin.exists() {
+        anyhow::bail!(
+            "daemon binary not found at {}. Build it first: cargo build -p garden-daemon",
+            daemon_bin.display()
+        );
+    }
+
+    // Write entitlements to a temp file and ad-hoc sign. Overwriting an
+    // existing /tmp/garden-entitlements.plist is intentional — we always
+    // want the version embedded in this CLI build to be authoritative.
+    let entitlements_path = std::env::temp_dir().join("garden-entitlements.plist");
+    {
+        let mut f = std::fs::File::create(&entitlements_path)
+            .map_err(|e| anyhow::anyhow!("can't write entitlements: {}", e))?;
+        f.write_all(DAEMON_ENTITLEMENTS_PLIST.as_bytes())?;
+    }
+    let sign = std::process::Command::new("codesign")
+        .arg("-s")
+        .arg("-")
+        .arg("--entitlements")
+        .arg(&entitlements_path)
+        .arg("--force")
+        .arg(&daemon_bin)
+        .output()?;
+    if !sign.status.success() {
+        anyhow::bail!(
+            "codesign failed:\n{}",
+            String::from_utf8_lossy(&sign.stderr)
+        );
+    }
+
+    // Detached background launch. Log file at a known path so users (and
+    // future debugging sessions) can find it.
+    let log_path = "/tmp/garden-daemon.log";
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .map_err(|e| anyhow::anyhow!("can't open daemon log {}: {}", log_path, e))?;
+    let log_err = log.try_clone()?;
+
+    std::process::Command::new(&daemon_bin)
+        .stdin(std::process::Stdio::null())
+        .stdout(log)
+        .stderr(log_err)
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn daemon: {}", e))?;
+
+    // Wait for the gRPC port to bind. The daemon needs to init Apple's
+    // Hypervisor framework, sign-check itself, start a tokio runtime, and
+    // bind two TCP sockets — usually under 1 second, but allow 5.
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if tokio::net::TcpStream::connect("127.0.0.1:9000").await.is_ok() {
+            eprintln!("🌱 Daemon started (log: {})", log_path);
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "daemon failed to bind :9000 within 5s. Check {} for errors.",
+        log_path
+    )
 }
 
 async fn run_agent_command(command: String, args: Vec<String>, privileged: bool) -> anyhow::Result<()> {
