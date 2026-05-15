@@ -202,7 +202,18 @@ final class AppState: ObservableObject {
                 withAnimation(.easeOut(duration: 0.4)) { events = [] }
             }
         } catch {
+            // Daemon went away (typical cause: `garden down` from the terminal
+            // followed by `garden start`). Tear down the telemetry stream so
+            // the next successful poll's `telemetry == nil` branch kicks in
+            // and reconnects against the *new* daemon process. Without this,
+            // the dead NWConnection from the previous daemon's lifetime stays
+            // resident, never recovers, and events silently stop appearing
+            // even though vmState is still .running.
             daemonReachable = false
+            if telemetry != nil {
+                telemetry?.stop()
+                telemetry = nil
+            }
         }
     }
 
