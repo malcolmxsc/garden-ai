@@ -197,9 +197,12 @@ final class AppState: ObservableObject {
                     startUptimeTimer()
                     startTelemetryStream()
                     withAnimation(.easeIn) { wakeFlash = true }
-                } else if vmState == .running && telemetry == nil {
-                    // VM still running but stream dropped — reconnect
-                    startTelemetryStream()
+                } else if vmState == .running {
+                    // VM still running but we may have torn things down
+                    // during a transient daemon hiccup. Reconnect telemetry
+                    // and resume the uptime timer if either was paused.
+                    if telemetry == nil { startTelemetryStream() }
+                    if uptimeTimer == nil { startUptimeTimer() }
                 }
             } else if vmState == .running || vmState == .booting {
                 // Terminal did `garden stop` — reflect in UI
@@ -223,6 +226,15 @@ final class AppState: ObservableObject {
                 telemetry?.stop()
                 telemetry = nil
             }
+
+            // Freeze the uptime/cpu animation on the FIRST failure. The
+            // offline banner is already visible at this point (gated on
+            // daemonReachable), so a still-ticking clock makes the UI
+            // inconsistent with what the banner is saying. The displayed
+            // uptimeSeconds value is preserved verbatim — if the daemon
+            // comes back inside the threshold window, the success branch
+            // will resume the timer and snap to daemon truth.
+            uptimeTimer?.invalidate(); uptimeTimer = nil
 
             // After a couple of consecutive failures, assume the daemon is
             // genuinely offline (not just a transient blip) and roll the UI
