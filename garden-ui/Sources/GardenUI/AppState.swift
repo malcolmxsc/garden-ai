@@ -45,8 +45,16 @@ final class AppState: ObservableObject {
     // Flare — triggers the "wake" flash on transition to running
     @Published var wakeFlash: Bool = false
 
-    // Whether we successfully reached the daemon
-    private(set) var daemonReachable: Bool = false
+    // Whether we successfully reached the daemon. @Published so the
+    // ContentView "Daemon offline" banner re-renders on change.
+    @Published private(set) var daemonReachable: Bool = false
+
+    // Consecutive failed daemon polls. Once this hits the threshold below
+    // we treat the daemon as truly offline and roll vmState back to
+    // .stopped so the UI doesn't keep displaying stale uptime/cpu.
+    private var consecutiveFailedPolls: Int = 0
+    private let failedPollsBeforeOffline = 2  // ~10s at the 5s poll cadence
+
     private var didHandleLaunchAutoBoot: Bool = false
 
     var filteredEvents: [SecurityEvent] {
@@ -176,6 +184,7 @@ final class AppState: ObservableObject {
         do {
             let status = try await DaemonClient.status()
             daemonReachable = true
+            consecutiveFailedPolls = 0
 
             if status.running {
                 // Always snap to daemon truth so the counter survives daemon
@@ -213,6 +222,22 @@ final class AppState: ObservableObject {
             if telemetry != nil {
                 telemetry?.stop()
                 telemetry = nil
+            }
+
+            // After a couple of consecutive failures, assume the daemon is
+            // genuinely offline (not just a transient blip) and roll the UI
+            // back to .stopped so we don't keep showing stale uptime/cpu.
+            // The next successful poll's reattach branch will pick the new
+            // daemon up automatically — no manual relaunch needed.
+            consecutiveFailedPolls += 1
+            if consecutiveFailedPolls >= failedPollsBeforeOffline,
+               vmState == .running || vmState == .booting {
+                stopAll()
+                vmState = .stopped
+                uptimeSeconds = 0
+                memoryMB = 0
+                cpuHistory = Array(repeating: 0.0, count: 30)
+                withAnimation(.easeOut(duration: 0.4)) { events = [] }
             }
         }
     }

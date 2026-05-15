@@ -18,6 +18,14 @@ struct ContentView: View {
             .padding(.vertical, 14)
             .background(.regularMaterial)
 
+            // Offline banner — appears when the daemon has been unreachable
+            // for ~10s. Goes away automatically when `garden start` brings
+            // the daemon back and the next poll succeeds.
+            if !appState.daemonReachable {
+                daemonOfflineBanner
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+
             thinDivider
 
             // Tab picker
@@ -101,6 +109,28 @@ struct ContentView: View {
 
     private var thinDivider: some View {
         Divider().opacity(0.25)
+    }
+
+    // MARK: - Daemon Offline Banner
+
+    private var daemonOfflineBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .font(.system(size: 11, weight: .semibold))
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Daemon offline")
+                    .font(.system(size: 11, weight: .semibold))
+                Text("Run `garden start` in the terminal to resume.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.12))
     }
 }
 
