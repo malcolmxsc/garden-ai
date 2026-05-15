@@ -138,7 +138,9 @@ enum Commands {
         /// The command to execute
         command: String,
 
-        /// Arguments to the command
+        /// Arguments to the command. Hyphen-prefixed args (e.g. `-la`) are
+        /// passed through verbatim instead of being parsed as flags.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
 
@@ -148,7 +150,8 @@ enum Commands {
         /// The command to execute
         command: String,
 
-        /// Arguments to the command
+        /// Arguments to the command. Hyphen-prefixed args pass through.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
 
