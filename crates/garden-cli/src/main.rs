@@ -7,7 +7,8 @@
 //!   garden boot  [--policy <file>] [--network=allow|deny]    requires daemon up
 //!   garden run <command> [args...]
 //!   garden status
-//!   garden stop
+//!   garden stop    stop VM only (daemon stays running)
+//!   garden down    stop VM and kill the daemon (full teardown)
 
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -161,6 +162,14 @@ enum Commands {
         id: Option<String>,
     },
 
+    /// Full teardown: stop the VM, then kill the garden-daemon process.
+    ///
+    /// Mirrors the `docker compose down` pattern. Use this when you want to
+    /// reclaim the host port (9000/9001/10000/10001) bindings and start
+    /// from a clean slate. `garden stop` only stops the VM and leaves the
+    /// daemon running so subsequent `garden boot` calls are instant.
+    Down,
+
     /// Start the MCP server for AI client connections (stdio transport)
     Serve,
 }
@@ -291,6 +300,37 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("❌ {}", response.message);
                 std::process::exit(1);
             }
+        }
+        Commands::Down => {
+            // Step 1: ask the daemon to stop the VM cleanly if it's reachable.
+            // We don't bail on failure here — the daemon might already be
+            // half-dead and we still want to send SIGTERM in step 2.
+            match garden_common::daemon::daemon_service_client::DaemonServiceClient::connect("http://127.0.0.1:9000").await {
+                Ok(mut client) => {
+                    match client
+                        .stop_vm(tonic::Request::new(garden_common::daemon::StopVmRequest {}))
+                        .await
+                    {
+                        Ok(resp) => {
+                            let r = resp.into_inner();
+                            if r.success {
+                                println!("🌿 VM: {}", r.message);
+                            } else {
+                                eprintln!("⚠️  VM stop reported failure: {}", r.message);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("⚠️  VM stop RPC failed: {} (continuing with daemon kill)", e);
+                        }
+                    }
+                }
+                Err(_) => {
+                    println!("🌿 Daemon not reachable on :9000 — skipping VM stop.");
+                }
+            }
+
+            // Step 2: SIGTERM the garden-daemon process(es).
+            shutdown_garden_daemon()?;
         }
         Commands::Serve => {
             garden_mcp::server::start_server(garden_mcp::server::McpServerConfig::default())
@@ -482,6 +522,85 @@ async fn ensure_daemon_running() -> anyhow::Result<()> {
         "daemon failed to bind :9000 within 5s. Check {} for errors.",
         log_path
     )
+}
+
+/// SIGTERM every process whose command line contains "garden-daemon".
+///
+/// We deliberately don't trust `lsof -i :9000` alone — another process
+/// could be squatting on that port. Instead we list every garden-daemon
+/// pid via `pgrep -f garden-daemon`, verify the command via `ps -p <pid>
+/// -o command=`, and only then send SIGTERM. SIGKILL is a last resort
+/// after a 2-second grace period.
+fn shutdown_garden_daemon() -> anyhow::Result<()> {
+    let pgrep = std::process::Command::new("pgrep")
+        .arg("-f")
+        .arg("garden-daemon")
+        .output()?;
+
+    if !pgrep.status.success() {
+        // pgrep exits 1 when nothing matches — that's fine.
+        println!("🌿 No garden-daemon process found.");
+        return Ok(());
+    }
+
+    let pids: Vec<i32> = String::from_utf8_lossy(&pgrep.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<i32>().ok())
+        // Skip our own pid in case the user ever runs this from inside the
+        // daemon process (e.g. via `garden serve` self-call).
+        .filter(|pid| *pid != std::process::id() as i32)
+        .collect();
+
+    if pids.is_empty() {
+        println!("🌿 No garden-daemon process found.");
+        return Ok(());
+    }
+
+    for pid in &pids {
+        // Defence in depth: confirm this pid's command really is the
+        // daemon binary before we signal it.
+        let ps = std::process::Command::new("ps")
+            .arg("-p")
+            .arg(pid.to_string())
+            .arg("-o")
+            .arg("command=")
+            .output()?;
+        let cmdline = String::from_utf8_lossy(&ps.stdout);
+        if !cmdline.contains("garden-daemon") {
+            eprintln!("⚠️  Skipping pid {}: command line does not contain 'garden-daemon' ({})", pid, cmdline.trim());
+            continue;
+        }
+
+        let kill = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status()?;
+        if kill.success() {
+            println!("🌿 Sent SIGTERM to garden-daemon (pid {}).", pid);
+        } else {
+            eprintln!("⚠️  Failed to SIGTERM pid {}", pid);
+        }
+    }
+
+    // Wait for the daemon to release :9000. If it hasn't dropped the
+    // socket within 2 seconds, escalate to SIGKILL.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let still_bound = std::net::TcpStream::connect_timeout(
+        &"127.0.0.1:9000".parse().unwrap(),
+        std::time::Duration::from_millis(200),
+    )
+    .is_ok();
+    if still_bound {
+        eprintln!("⚠️  Daemon still bound to :9000 after 2s — escalating to SIGKILL.");
+        for pid in &pids {
+            let _ = std::process::Command::new("kill")
+                .arg("-KILL")
+                .arg(pid.to_string())
+                .status();
+        }
+    }
+
+    Ok(())
 }
 
 async fn run_agent_command(command: String, args: Vec<String>, privileged: bool) -> anyhow::Result<()> {
