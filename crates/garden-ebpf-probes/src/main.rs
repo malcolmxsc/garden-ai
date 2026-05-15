@@ -1010,7 +1010,13 @@ pub fn trace_tcp_recvmsg(ctx: RetProbeContext) -> u32 {
 }
 
 fn try_trace_tcp_recvmsg(ctx: &RetProbeContext) -> Result<(), c_long> {
-    let ret: i64 = ctx.ret().unwrap_or(0);
+    // tcp_recvmsg returns `int` (32-bit signed). On AArch64 the high 32
+    // bits of the return register are unspecified per AAPCS64 for sub-
+    // 64-bit returns, so reading ctx.ret() directly as i64 picks up
+    // garbage and an error code like -512 (0xFFFFFE00) reads as
+    // 4,294,966,784 — exactly the value that triggered the spurious
+    // 4.29 GB `large_download` violation. Read as i32 and sign-extend.
+    let ret: i32 = ctx.ret().unwrap_or(0);
     // Only emit if bytes > 0 (negative = error, 0 = EOF)
     if ret <= 0 {
         return Ok(());
@@ -1353,6 +1359,12 @@ fn is_proc_sensitive_leaf(n: &[u8; 16]) -> bool {
     // kcore
     if n[0] == b'k' && n[1] == b'c' && n[2] == b'o' && n[3] == b'r'
         && n[4] == b'e' && n[5] == 0 { return true; }
+    // vmlinux — /sys/kernel/btf/vmlinux is a complete BTF dump of every
+    // kernel struct/function. Leaks all offsets and signatures, valuable
+    // for sandbox-escape research. PID 1 reads this at agent startup; the
+    // PID == 1 fast-path at the top of try_lsm_file_open exempts that.
+    if n[0] == b'v' && n[1] == b'm' && n[2] == b'l' && n[3] == b'i'
+        && n[4] == b'n' && n[5] == b'u' && n[6] == b'x' && n[7] == 0 { return true; }
     false
 }
 

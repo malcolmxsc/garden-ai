@@ -210,7 +210,16 @@ fn detect_violation(event: &SecurityEvent) -> Option<Violation> {
                 && matches!(normalize_path(path).as_str(),
                     "/dev/mem" | "/dev/kmem" | "/dev/port"
                     | "/dev/kmsg" | "/proc/kallsyms" | "/proc/kcore"
-                    | "/proc/sysrq-trigger") =>
+                    | "/proc/sysrq-trigger"
+                    // /proc/sys/kernel/sysrq enables/disables the sysrq
+                    // mechanism — writing to it is the precursor to
+                    // exploiting /proc/sysrq-trigger. Same threat class,
+                    // not a generic "write_outside_workspace".
+                    | "/proc/sys/kernel/sysrq"
+                    // BTF dump leaks all kernel type info and offsets.
+                    // PID == 1 already exempted by the `event.pid != 1`
+                    // guard on this match arm.
+                    | "/sys/kernel/btf/vmlinux") =>
         {
             Some(Violation {
                 severity: "critical",
