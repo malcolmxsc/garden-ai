@@ -1,0 +1,143 @@
+import Foundation
+
+// ---------------------------------------------------------------------------
+// EventWireTypes — Decodable mirror of Rust SecurityEvent / SecurityEventKind
+// ---------------------------------------------------------------------------
+// Shared by TelemetryStream (live feed) and SessionsView (log file parsing).
+
+public struct WireEvent: Decodable {
+    public let timestamp_ns: UInt64
+    public let wall_time: Double?
+    public let pid: UInt32
+    public let comm: String
+    public let kind: WireKind
+    public let violation: WireViolation?
+
+    public init(timestamp_ns: UInt64, wall_time: Double?, pid: UInt32, comm: String, kind: WireKind, violation: WireViolation?) {
+        self.timestamp_ns = timestamp_ns
+        self.wall_time = wall_time
+        self.pid = pid
+        self.comm = comm
+        self.kind = kind
+        self.violation = violation
+    }
+}
+
+public struct WireViolation: Decodable {
+    public let severity: String
+    public let rule: String
+    public let message: String
+
+    public init(severity: String, rule: String, message: String) {
+        self.severity = severity
+        self.rule = rule
+        self.message = message
+    }
+}
+
+public struct WireKind: Decodable {
+    public let type: String
+    // file_access
+    public let path: String?
+    public let flags: UInt32?
+    public let allowed: Bool?
+    // network_connect
+    public let dest_ip: String?
+    public let dest_port: UInt16?
+    public let networkProtocol: String?
+    // process_exec
+    public let binary: String?
+    public let args: [String]?
+    // dns_query
+    public let server_ip: String?
+    public let domain: String?
+    // process_fork
+    public let parent_pid: UInt32?
+    public let child_pid: UInt32?
+    public let child_comm: String?
+    // process_exit
+    public let exit_status: UInt32?
+    public let exit_signal: UInt32?
+    // creds_changed
+    public let old_uid: UInt32?
+    public let new_uid: UInt32?
+    // tcp_send / tcp_recv
+    public let bytes: UInt64?
+    // mount_attempt
+    public let target: String?
+    public let source: String?
+    // bpf_syscall
+    public let cmd: UInt32?
+    // oom_kill
+    public let victim_pid: UInt32?
+    public let victim_comm: String?
+    // module_load
+    public let size: UInt32?
+    // syscall_trace
+    public let syscall_nr: UInt64?
+    public let syscall_name: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case type, path, flags, allowed
+        case dest_ip, dest_port
+        case networkProtocol = "protocol"
+        case binary, args
+        case server_ip, domain
+        case parent_pid, child_pid, child_comm
+        case exit_status, exit_signal
+        case old_uid, new_uid
+        case bytes
+        case target, source
+        case cmd
+        case victim_pid, victim_comm
+        case size
+        case syscall_nr, syscall_name
+    }
+}
+
+public extension WireEvent {
+    func toSecurityEvent() -> SecurityEvent? {
+        let k = kind
+        let eventKind: SecurityEvent.Kind
+        switch k.type {
+        case "file_access":
+            eventKind = .fileAccess(path: k.path ?? "?", allowed: k.allowed ?? true)
+        case "network_connect":
+            eventKind = .networkConnect(ip: k.dest_ip ?? "?", port: Int(k.dest_port ?? 0), allowed: k.allowed ?? true)
+        case "process_exec":
+            eventKind = .processExec(binary: k.binary ?? "?", allowed: k.allowed ?? true)
+        case "process_fork":
+            eventKind = .processFork(childPid: Int(k.child_pid ?? 0), childComm: k.child_comm ?? "?")
+        case "process_exit":
+            eventKind = .processExit(exitStatus: Int(k.exit_status ?? 0), exitSignal: Int(k.exit_signal ?? 0))
+        case "dns_query":
+            eventKind = .dnsQuery(domain: k.domain ?? "?")
+        case "creds_changed":
+            eventKind = .credsChanged(oldUID: Int(k.old_uid ?? 0), newUID: Int(k.new_uid ?? 0))
+        case "tcp_send":
+            eventKind = .tcpSend(bytes: Int(k.bytes ?? 0))
+        case "tcp_recv":
+            eventKind = .tcpRecv(bytes: Int(k.bytes ?? 0))
+        case "mount_attempt":
+            eventKind = .mountAttempt(source: k.source ?? "?", target: k.target ?? "?")
+        case "bpf_syscall":
+            eventKind = .bpfSyscall(cmd: Int(k.cmd ?? 0))
+        default:
+            return nil
+        }
+
+        // Use daemon's host-side violation detection (same rules as session log).
+        let isViolation = violation != nil
+        let violationMessage = violation.map { "[\($0.severity)] \($0.rule): \($0.message)" }
+
+        return SecurityEvent(
+            id: UUID(),
+            timestamp: wall_time.map { Date(timeIntervalSince1970: $0) } ?? Date(),
+            pid: Int(pid),
+            comm: comm,
+            kind: eventKind,
+            isViolation: isViolation,
+            violationMessage: violationMessage
+        )
+    }
+}
