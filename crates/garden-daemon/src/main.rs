@@ -49,12 +49,12 @@ impl DaemonService for DaemonServiceImpl {
         let req = request.into_inner();
 
         let kernel = if req.kernel_path.is_empty() {
-            "/Users/malcolmgriffin/.gemini/antigravity/scratch/garden-ai/guest/kernel/kernel".to_string()
+            "/Users/malcolmgriffin/Projects/garden-ai/guest/kernel/kernel".to_string()
         } else {
             req.kernel_path
         };
         let initrd = if req.initrd_path.is_empty() {
-            "/Users/malcolmgriffin/.gemini/antigravity/scratch/garden-ai/guest/kernel/garden-initrd.cpio.gz".to_string()
+            "/Users/malcolmgriffin/Projects/garden-ai/guest/kernel/garden-initrd.cpio.gz".to_string()
         } else {
             req.initrd_path
         };
@@ -763,8 +763,8 @@ async fn run_http_api(engine: &'static Virtualizer, state: Arc<VmState>) {
                     message: "VM is already running".into(),
                 });
             }
-            let kernel = "/Users/malcolmgriffin/.gemini/antigravity/scratch/garden-ai/guest/kernel/kernel".to_string();
-            let initrd  = "/Users/malcolmgriffin/.gemini/antigravity/scratch/garden-ai/guest/kernel/garden-initrd.cpio.gz".to_string();
+            let kernel = "/Users/malcolmgriffin/Projects/garden-ai/guest/kernel/kernel".to_string();
+            let initrd  = "/Users/malcolmgriffin/Projects/garden-ai/guest/kernel/garden-initrd.cpio.gz".to_string();
             if let Err(e) = engine.configure(&kernel, &initrd, 2, 512) {
                 return axum::Json(ApiActionResponse { success: false, message: format!("Configure failed: {}", e) });
             }
