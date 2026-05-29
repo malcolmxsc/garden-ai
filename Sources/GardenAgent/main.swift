@@ -25,7 +25,7 @@ func run() async {
 
     // 3. MLX Array initialization to verify MLX library integration
     print("🧠 Initializing MLX backend...")
-    let array = MLXArray([1.0, 2.0, 3.0, 4.0])
+    let array = MLXArray([Float32(1.0), Float32(2.0), Float32(3.0), Float32(4.0)])
     let sum = array.sum()
     print("🧠 MLX Test Array: \(array)")
     print("🧠 MLX Test Sum: \(sum.item(Float.self))")

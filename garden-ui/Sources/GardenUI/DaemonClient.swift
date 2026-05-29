@@ -1,4 +1,5 @@
 import Foundation
+import GardenTelemetry
 
 // ---------------------------------------------------------------------------
 // DaemonClient — thin URLSession wrapper for the daemon HTTP API at :9001

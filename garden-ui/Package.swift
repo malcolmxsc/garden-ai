@@ -1,16 +1,18 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 5.10
 import PackageDescription
-
-// Garden AI — macOS menu bar app.
-// Open this file directly in Xcode: `open Package.swift`
-// Then press Cmd+R to run.
 
 let package = Package(
     name: "GardenUI",
     platforms: [.macOS(.v14)],
+    dependencies: [
+        .package(path: "..")
+    ],
     targets: [
         .executableTarget(
             name: "GardenUI",
+            dependencies: [
+                .product(name: "GardenTelemetry", package: "garden-ai")
+            ],
             path: "Sources/GardenUI"
         )
     ]

@@ -8,9 +8,8 @@ fn main() {
     }
 
     // 1. Tell Cargo to re-run this build script if our Swift files change
-    println!("cargo:rerun-if-changed=src/swift/Virtualizer.swift");
-    println!("cargo:rerun-if-changed=src/swift/bridging_impl.swift");
-    println!("cargo:rerun-if-changed=src/swift/bridging.h");
+    println!("cargo:rerun-if-changed=../../Sources/GardenCore/Virtualizer.swift");
+    println!("cargo:rerun-if-changed=../../Sources/GardenCore/bridging_impl.swift");
 
     let out_dir = env::var("OUT_DIR").unwrap();
     let swift_header_path = format!("{}/Virtualizer-Swift.h", out_dir);
@@ -28,8 +27,8 @@ fn main() {
             "-o", &static_lib_path,
             "-framework", "Virtualization",
             "-framework", "Foundation",
-            "src/swift/Virtualizer.swift",
-            "src/swift/bridging_impl.swift",
+            "../../Sources/GardenCore/Virtualizer.swift",
+            "../../Sources/GardenCore/bridging_impl.swift",
         ])
         .status()
         .expect("Failed to execute swiftc compile command. Is swiftc installed?");
